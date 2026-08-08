@@ -173,8 +173,8 @@ func (h *SetupHandler) Initialize(c *gin.Context) {
 		maxActivations, maxSeats = 3, 10
 	}
 	if _, err := tx.NewRaw(
-		"INSERT INTO plans (id, product_id, name, slug, license_type, max_activations, max_seats, grace_days, active, created_at) VALUES (?, ?, 'Pro', 'pro', 'subscription', ?, ?, 7, true, now())",
-		planID, productID, maxActivations, maxSeats,
+		"INSERT INTO plans (id, product_id, name, slug, license_type, max_activations, max_seats, grace_days, active, checkout_id, created_at) VALUES (?, ?, 'Pro', 'pro', 'subscription', ?, ?, 7, true, ?, now())",
+		planID, productID, maxActivations, maxSeats, store.ShortID(),
 	).Exec(ctx); err != nil {
 		response.Internal(c)
 		return
