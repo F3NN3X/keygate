@@ -1112,11 +1112,30 @@ func (h *AdminHandler) SetLicenseValidUntil(c *gin.Context) {
 		return
 	}
 
+	// Stripe owns the expiry on billed licenses — the next renewal
+	// webhook overwrites whatever we set here, so accepting the edit
+	// would look like it worked and then silently revert. The dashboard
+	// hides the control; this closes the same door on the API, which
+	// licenses:write API keys also reach.
+	if lic.PaymentProvider == "stripe" {
+		response.Conflict(c, "STRIPE_MANAGED",
+			"expiry for Stripe-billed licenses is managed by the subscription", nil)
+		return
+	}
+
 	var validUntil *time.Time
 	if req.ValidUntil != "" {
 		ts, err := time.Parse(time.RFC3339, req.ValidUntil)
 		if err != nil {
 			response.BadRequest(c, "valid_until must be an RFC 3339 timestamp or empty")
+			return
+		}
+		// Same rule as CreateLicense. Back-dating is not an "expire now"
+		// shortcut: the grace-expiry sweep would pick the license up and
+		// email the customer that it expired, so a mistyped year turns
+		// into customer-facing mail. Use revoke/suspend to end a license.
+		if !ts.After(time.Now()) {
+			response.BadRequest(c, "valid_until must be in the future")
 			return
 		}
 		validUntil = &ts
@@ -1133,6 +1152,15 @@ func (h *AdminHandler) SetLicenseValidUntil(c *gin.Context) {
 		ActorType: "admin", ActorID: adminID(c),
 		Changes: map[string]any{"valid_until": req.ValidUntil},
 	})
+	if h.Webhook != nil {
+		// null valid_until means perpetual — send it explicitly so an
+		// integration can tell "cleared" apart from "field omitted".
+		payload := map[string]any{"license_id": id, "email": lic.Email, "valid_until": nil}
+		if validUntil != nil {
+			payload["valid_until"] = validUntil.Format(time.RFC3339)
+		}
+		h.Webhook.Dispatch(c, lic.ProductID, "license.expiry_changed", payload)
+	}
 	response.OK(c, lic)
 }
 
