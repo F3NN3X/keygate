@@ -78,6 +78,10 @@ func shortID() string {
 	return hex.EncodeToString(b)[:8]
 }
 
+// ShortID generates a URL-safe 8-character unique ID for checkout links.
+// Exported for use by the setup handler.
+func ShortID() string { return shortID() }
+
 func (s *Store) UpdatePlan(ctx context.Context, p *model.Plan) error {
 	_, err := s.DB.NewUpdate().Model(p).WherePK().Exec(ctx)
 	return err

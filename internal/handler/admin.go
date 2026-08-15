@@ -846,6 +846,10 @@ func (h *AdminHandler) CreateLicense(c *gin.Context) {
 		Notes               string `json:"notes"`
 		ExternalCustomerID  string `json:"external_customer_id"`
 		ExternalWorkspaceID string `json:"external_workspace_id"`
+		// ValidUntil sets an explicit expiry (RFC 3339). Empty means the
+		// plan decides: trial plans get now+trial_days, everything else
+		// is perpetual. When set it wins over the trial default.
+		ValidUntil string `json:"valid_until"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "product_id, plan_id, and email are required")
@@ -866,6 +870,20 @@ func (h *AdminHandler) CreateLicense(c *gin.Context) {
 	if len(req.ExternalWorkspaceID) > 256 {
 		response.BadRequest(c, "external_workspace_id must be ≤ 256 chars")
 		return
+	}
+
+	var validUntil *time.Time
+	if req.ValidUntil != "" {
+		ts, err := time.Parse(time.RFC3339, req.ValidUntil)
+		if err != nil {
+			response.BadRequest(c, "valid_until must be an RFC 3339 timestamp")
+			return
+		}
+		if !ts.After(time.Now()) {
+			response.BadRequest(c, "valid_until must be in the future")
+			return
+		}
+		validUntil = &ts
 	}
 
 	// Look up plan first to determine license type and set appropriate fields
@@ -906,8 +924,11 @@ func (h *AdminHandler) CreateLicense(c *gin.Context) {
 		ExternalWorkspaceID: req.ExternalWorkspaceID,
 	}
 
-	// Set valid_until for trial licenses
-	if plan.LicenseType == "trial" && plan.TrialDays > 0 {
+	// Set valid_until: an explicit request value wins, otherwise trial
+	// plans default to now+trial_days and other plans stay perpetual.
+	if validUntil != nil {
+		l.ValidUntil = validUntil
+	} else if plan.LicenseType == "trial" && plan.TrialDays > 0 {
 		until := time.Now().Add(time.Duration(plan.TrialDays) * 24 * time.Hour)
 		l.ValidUntil = &until
 	}
@@ -1065,6 +1086,82 @@ func (h *AdminHandler) ReinstateLicense(c *gin.Context) {
 		}
 	}
 	response.OK(c, gin.H{"status": "active"})
+}
+
+// SetLicenseValidUntil sets or clears a license's expiry date. An
+// empty valid_until makes the license perpetual. Extending an
+// already-expired license does not change its status — use
+// /reinstate for that (the two concerns stay separate so an
+// accidental date edit can't silently re-arm a revoked customer).
+func (h *AdminHandler) SetLicenseValidUntil(c *gin.Context) {
+	id := c.Param("id")
+	if !h.checkLicenseScope(c, id) {
+		return
+	}
+	var req struct {
+		ValidUntil string `json:"valid_until"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "invalid request body")
+		return
+	}
+
+	lic, err := h.Store.FindLicenseByID(c, id)
+	if err != nil {
+		response.NotFound(c, "license not found")
+		return
+	}
+
+	// Stripe owns the expiry on billed licenses — the next renewal
+	// webhook overwrites whatever we set here, so accepting the edit
+	// would look like it worked and then silently revert. The dashboard
+	// hides the control; this closes the same door on the API, which
+	// licenses:write API keys also reach.
+	if lic.PaymentProvider == "stripe" {
+		response.Conflict(c, "STRIPE_MANAGED",
+			"expiry for Stripe-billed licenses is managed by the subscription", nil)
+		return
+	}
+
+	var validUntil *time.Time
+	if req.ValidUntil != "" {
+		ts, err := time.Parse(time.RFC3339, req.ValidUntil)
+		if err != nil {
+			response.BadRequest(c, "valid_until must be an RFC 3339 timestamp or empty")
+			return
+		}
+		// Same rule as CreateLicense. Back-dating is not an "expire now"
+		// shortcut: the grace-expiry sweep would pick the license up and
+		// email the customer that it expired, so a mistyped year turns
+		// into customer-facing mail. Use revoke/suspend to end a license.
+		if !ts.After(time.Now()) {
+			response.BadRequest(c, "valid_until must be in the future")
+			return
+		}
+		validUntil = &ts
+	}
+
+	lic.ValidUntil = validUntil
+	if err := h.Store.UpdateLicense(c, lic, "valid_until"); err != nil {
+		response.Internal(c)
+		return
+	}
+
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "license", EntityID: id, Action: "valid_until_changed",
+		ActorType: "admin", ActorID: adminID(c),
+		Changes: map[string]any{"valid_until": req.ValidUntil},
+	})
+	if h.Webhook != nil {
+		// null valid_until means perpetual — send it explicitly so an
+		// integration can tell "cleared" apart from "field omitted".
+		payload := map[string]any{"license_id": id, "email": lic.Email, "valid_until": nil}
+		if validUntil != nil {
+			payload["valid_until"] = validUntil.Format(time.RFC3339)
+		}
+		h.Webhook.Dispatch(c, lic.ProductID, "license.expiry_changed", payload)
+	}
+	response.OK(c, lic)
 }
 
 func (h *AdminHandler) DeleteActivation(c *gin.Context) {
