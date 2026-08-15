@@ -130,6 +130,8 @@ const en = {
   "licenses.validUntilHint": "Leave empty for a perpetual license (trials still use the plan's trial days).",
   "licenses.validUntilEdit": "Edit expiry",
   "licenses.validUntilClear": "Leave empty to make the license perpetual.",
+  "licenses.validUntilExpiredHint":
+    "This license is expired — a new date alone won't reactivate it. Use Reinstate as well.",
   "licenses.empty": "No licenses found",
   "licenses.noProducts": "No products yet",
   "licenses.noProductsDesc": "Create a product and plan first before issuing licenses.",

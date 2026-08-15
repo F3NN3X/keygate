@@ -573,16 +573,18 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
                           >
                             {t("common.save")}
                           </Button>
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            className="h-7"
-                            onClick={() => setEditingValidUntil(null)}
-                          >
+                          <Button size="sm" variant="ghost" className="h-7" onClick={() => setEditingValidUntil(null)}>
                             {t("common.cancel")}
                           </Button>
                         </div>
                         <p className="text-xs text-muted-foreground">{t("licenses.validUntilClear")}</p>
+                        {/* An expired license stays dead no matter what date
+                            is set — assertUsable short-circuits on the status
+                            before it ever reads valid_until. Say so, or the
+                            admin walks away thinking the edit revived it. */}
+                        {lic.status === "expired" && (
+                          <p className="text-xs text-amber-600">{t("licenses.validUntilExpiredHint")}</p>
+                        )}
                       </div>
                     )}
                   </div>

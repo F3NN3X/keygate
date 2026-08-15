@@ -128,6 +128,7 @@ const zh = {
   "licenses.validUntilHint": "留空表示永久许可证（试用版仍按套餐的试用天数计算）。",
   "licenses.validUntilEdit": "编辑到期时间",
   "licenses.validUntilClear": "留空表示永久许可证。",
+  "licenses.validUntilExpiredHint": "此许可证已过期 — 仅修改日期不会重新激活，还需执行「恢复」。",
   "licenses.empty": "未找到许可证",
   "licenses.noProducts": "暂无产品",
   "licenses.noProductsDesc": "请先创建产品和方案，然后再签发许可证。",
