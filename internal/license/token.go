@@ -26,17 +26,30 @@ import (
 // arbitrary license tokens. Ed25519 puts the signing capability
 // behind a key that never leaves the server.
 type VerifyToken struct {
-	LicenseID   string         `json:"lid"`
-	ProductID   string         `json:"pid"`
-	PlanID      string         `json:"pln"`
-	Status      string         `json:"sts"`
-	Identifier  string         `json:"did"`
-	Features    map[string]any `json:"ftr,omitempty"`
-	IssuedAt    int64          `json:"iat"`
-	ExpiresAt   int64          `json:"exp"`
-	GraceDays   int            `json:"grc"`
-	Nonce       string         `json:"nce"`           // unique per-issuance to prevent replay
-	Fingerprint string         `json:"fpr,omitempty"` // SHA256(identifier+product_id) for binding
+	LicenseID  string         `json:"lid"`
+	ProductID  string         `json:"pid"`
+	PlanID     string         `json:"pln"`
+	Status     string         `json:"sts"`
+	Identifier string         `json:"did"`
+	Features   map[string]any `json:"ftr,omitempty"`
+	IssuedAt   int64          `json:"iat"`
+	// ExpiresAt is the token's own lifetime — how long a client may
+	// stay offline before it must check in again. It is NOT the
+	// license's end date; see ValidUntil.
+	ExpiresAt int64 `json:"exp"`
+	// ValidUntil is when the license itself lapses, as a unix second.
+	// Zero (field omitted) means perpetual.
+	//
+	// It has to be inside the signed payload: it used to travel only
+	// in the surrounding JSON envelope, which is unsigned, so an
+	// offline client had no way to tell a real end date from one a
+	// proxy rewrote on the way. exp alone cannot stand in for it —
+	// exp is a check-in interval and says nothing about the licence
+	// term.
+	ValidUntil  int64  `json:"vun,omitempty"`
+	GraceDays   int    `json:"grc"`
+	Nonce       string `json:"nce"`           // unique per-issuance to prevent replay
+	Fingerprint string `json:"fpr,omitempty"` // SHA256(identifier+product_id) for binding
 }
 
 // PrivateKeyFromHex parses a 32-byte ed25519 seed (64 hex chars) and

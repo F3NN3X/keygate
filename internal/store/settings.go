@@ -59,6 +59,14 @@ func (s *Store) SetSetting(ctx context.Context, key, value string) error {
 	return err
 }
 
+// DeleteSetting removes a row outright. Used to clear stored secrets:
+// blanking the value would leave a row that reads as "configured but
+// empty", which is a different state from "never set".
+func (s *Store) DeleteSetting(ctx context.Context, key string) error {
+	_, err := s.DB.NewDelete().Model((*Setting)(nil)).Where("key = ?", key).Exec(ctx)
+	return err
+}
+
 func (s *Store) SetSettings(ctx context.Context, settings map[string]string) error {
 	for key, value := range settings {
 		if err := s.SetSetting(ctx, key, value); err != nil {

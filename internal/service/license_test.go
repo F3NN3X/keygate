@@ -1,9 +1,11 @@
 package service
 
 import (
+	"crypto/ed25519"
 	"testing"
 	"time"
 
+	"github.com/tabloy/keygate/internal/license"
 	"github.com/tabloy/keygate/internal/model"
 )
 
@@ -189,5 +191,125 @@ func TestEntitlements(t *testing.T) {
 	emptyFeatures := svc.entitlements(nilLic)
 	if len(emptyFeatures) != 0 {
 		t.Error("nil plan should return empty features")
+	}
+}
+
+// A signed token must never outlive the licence it was issued for.
+// With a flat 7-day TTL a plan with a short grace period handed out
+// tokens that still verified offline after the licence was dead.
+func TestSignTokenClampsToLicenceDeadline(t *testing.T) {
+	seed := make([]byte, ed25519.SeedSize)
+	for i := range seed {
+		seed[i] = byte(i)
+	}
+	priv := ed25519.NewKeyFromSeed(seed)
+	svc := &LicenseService{signingKey: priv}
+
+	now := time.Now()
+	at := func(d time.Duration) *time.Time { t := now.Add(d); return &t }
+
+	tests := []struct {
+		name       string
+		status     string
+		validUntil *time.Time
+		graceDays  int
+		wantExp    time.Time
+		wantVun    bool
+	}{
+		{
+			// The case from the report: grace shorter than the TTL.
+			name: "short grace clamps the token", validUntil: at(24 * time.Hour), graceDays: 0,
+			wantExp: now.Add(24 * time.Hour), wantVun: true,
+		},
+		{
+			name: "grace inside the TTL still clamps", validUntil: at(24 * time.Hour), graceDays: 2,
+			wantExp: now.Add(72 * time.Hour), wantVun: true,
+		},
+		{
+			// Deadline beyond the TTL — the TTL wins, because exp is a
+			// check-in interval, not the licence term.
+			name: "distant expiry leaves the TTL alone", validUntil: at(365 * 24 * time.Hour), graceDays: 7,
+			wantExp: now.Add(tokenTTL), wantVun: true,
+		},
+		{
+			name: "perpetual licence keeps the full TTL", validUntil: nil, graceDays: 7,
+			wantExp: now.Add(tokenTTL), wantVun: false,
+		},
+		{
+			// A canceled licence runs out at ValidUntil — assertUsable
+			// gives it no grace, so neither may its token.
+			name: "canceled licence gets no grace", status: model.StatusCanceled,
+			validUntil: at(24 * time.Hour), graceDays: 7,
+			wantExp: now.Add(24 * time.Hour), wantVun: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status := tt.status
+			if status == "" {
+				status = model.StatusActive
+			}
+			lic := &model.License{
+				ID: "lic", ProductID: "prod", PlanID: "plan", Status: status,
+				ValidUntil: tt.validUntil,
+				Plan:       &model.Plan{GraceDays: tt.graceDays},
+			}
+			raw, err := svc.signToken(lic, "device-1")
+			if err != nil {
+				t.Fatalf("signToken: %v", err)
+			}
+			tok, err := license.Verify(raw, license.PublicKey(priv))
+			if err != nil {
+				t.Fatalf("verify: %v", err)
+			}
+
+			if diff := tok.ExpiresAt - tt.wantExp.Unix(); diff > 1 || diff < -1 {
+				t.Errorf("exp = %d, want ~%d (off by %ds)", tok.ExpiresAt, tt.wantExp.Unix(), diff)
+			}
+			if tt.wantVun {
+				if tok.ValidUntil != tt.validUntil.Unix() {
+					t.Errorf("vun = %d, want %d", tok.ValidUntil, tt.validUntil.Unix())
+				}
+			} else if tok.ValidUntil != 0 {
+				t.Errorf("vun = %d, want 0 for a perpetual licence", tok.ValidUntil)
+			}
+
+			// Whatever the clamp picks, the token must not outlive the
+			// licence — and the grace it reports is the grace it used,
+			// so a client recomputing vun+grc lands in the same place.
+			if tok.GraceDays != 0 && status == model.StatusCanceled {
+				t.Errorf("grc = %d, want 0 for a canceled licence", tok.GraceDays)
+			}
+			if tt.validUntil != nil {
+				deadline := tt.validUntil.Add(time.Duration(tok.GraceDays) * 24 * time.Hour).Unix()
+				if tok.ExpiresAt > deadline {
+					t.Errorf("token outlives the licence: exp %d > deadline %d", tok.ExpiresAt, deadline)
+				}
+			}
+		})
+	}
+}
+
+// The grace period appears in three places — the lifecycle check, the
+// signed token and the verify envelope — and a client that reads a
+// different number from any of them is told the licence lives longer
+// than the server will allow.
+func TestEffectiveGraceDays(t *testing.T) {
+	svc := &LicenseService{}
+	plan := &model.Plan{GraceDays: 7}
+
+	for _, status := range []string{model.StatusActive, model.StatusTrialing, model.StatusPastDue} {
+		lic := &model.License{Status: status, Plan: plan}
+		if got := svc.effectiveGraceDays(lic); got != 7 {
+			t.Errorf("%s: grace = %d, want the plan's 7", status, got)
+		}
+	}
+
+	// Canceled is paid up to ValidUntil and stops there — assertUsable
+	// gives it no grace, so nothing else may either.
+	lic := &model.License{Status: model.StatusCanceled, Plan: plan}
+	if got := svc.effectiveGraceDays(lic); got != 0 {
+		t.Errorf("canceled: grace = %d, want 0", got)
 	}
 }

@@ -54,6 +54,35 @@ const TIMEZONES = [
   { value: "Pacific/Auckland", label: "UTC +12:00", city: "Auckland" },
 ]
 
+// The keys this form owns. Save posts only these: the settings table
+// also holds rows the server writes for itself (Stripe webhook
+// credentials) and secrets the API never returns, and PUTing the whole
+// GET response back is what used to make every save fail once Stripe
+// was configured.
+//
+// `as const` is load-bearing — set() only accepts a key from this list,
+// so adding a field to the form without adding it here is a compile
+// error rather than a control that silently never saves.
+const FORM_KEYS = [
+  "site_name",
+  "timezone",
+  "signup_mode",
+  "brand_color",
+  "logo_url",
+  "smtp_host",
+  "smtp_port",
+  "smtp_username",
+  "smtp_password",
+  "smtp_from",
+  "rate_limit_api",
+  "rate_limit_admin",
+  "webhook_max_attempts",
+  "webhook_timeout",
+  "quota_warning_threshold",
+] as const
+
+type FormKey = (typeof FORM_KEYS)[number]
+
 export default function SettingsPage() {
   const { t, locale, setLocale } = useI18n()
   const qc = useQueryClient()
@@ -72,7 +101,8 @@ export default function SettingsPage() {
   }, [data])
 
   const saveMut = useMutation({
-    mutationFn: () => admin.updateSettings(form),
+    mutationFn: () =>
+      admin.updateSettings(Object.fromEntries(FORM_KEYS.filter((k) => k in form).map((k) => [k, form[k]]))),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["admin", "settings"] })
       setSaved(true)
@@ -82,6 +112,16 @@ export default function SettingsPage() {
 
   const testEmailMut = useMutation({
     mutationFn: admin.sendTestEmail,
+  })
+
+  // Blanking the field means "keep the stored password" — removing one
+  // has to say so explicitly.
+  const clearSecretMut = useMutation({
+    mutationFn: (key: string) => admin.clearSecretSetting(key),
+    onSuccess: () => {
+      setForm((f) => ({ ...f, smtp_password: "" }))
+      qc.invalidateQueries({ queryKey: ["admin", "settings"] })
+    },
   })
 
   const { data: versionData } = useQuery({
@@ -104,7 +144,7 @@ export default function SettingsPage() {
     queryFn: admin.getMigrations,
   })
 
-  const set = (key: string, value: string) => setForm((f) => ({ ...f, [key]: value }))
+  const set = (key: FormKey, value: string) => setForm((f) => ({ ...f, [key]: value }))
 
   if (isLoading) {
     return (
@@ -264,11 +304,27 @@ export default function SettingsPage() {
                 </div>
                 <div className="space-y-2">
                   <Label>{t("settings.smtpPassword")}</Label>
-                  <Input
-                    type="password"
-                    value={form.smtp_password || ""}
-                    onChange={(e) => set("smtp_password", e.target.value)}
-                  />
+                  {/* Never sent back by the API. Blank means "keep the
+                      stored one" — see settingsSecret on the server. */}
+                  <div className="flex items-center gap-2">
+                    <Input
+                      type="password"
+                      value={form.smtp_password || ""}
+                      onChange={(e) => set("smtp_password", e.target.value)}
+                      placeholder={data?.secrets_set?.smtp_password ? t("settings.smtpPasswordStored") : ""}
+                    />
+                    {data?.secrets_set?.smtp_password && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="shrink-0"
+                        disabled={clearSecretMut.isPending}
+                        onClick={() => clearSecretMut.mutate("smtp_password")}
+                      >
+                        {t("settings.smtpPasswordClear")}
+                      </Button>
+                    )}
+                  </div>
                 </div>
                 <div className="space-y-2 col-span-2">
                   <Label>{t("settings.smtpFrom")}</Label>
@@ -306,6 +362,24 @@ export default function SettingsPage() {
         </TabsContent>
 
         <TabsContent value="security" className="space-y-6">
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">{t("settings.signup")}</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              <Label>{t("settings.signupMode")}</Label>
+              <Select value={form.signup_mode || "open"} onValueChange={(v) => set("signup_mode", v)}>
+                <SelectTrigger className="w-72">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="open">{t("settings.signupOpen")}</SelectItem>
+                  <SelectItem value="licensed_only">{t("settings.signupLicensedOnly")}</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">{t("settings.signupModeDesc")}</p>
+            </CardContent>
+          </Card>
           <Card>
             <CardHeader>
               <CardTitle className="text-base">{t("settings.rateLimit")}</CardTitle>

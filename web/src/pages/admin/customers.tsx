@@ -255,8 +255,11 @@ function CustomerDetailDialog({
                           <Badge className={statusColor(l.status)}>{t(`status.${l.status}` as any)}</Badge>
                         </DataTableCell>
                         <DataTableCell>
+                          {/* Only the tail — the key itself is revealed
+                              one at a time from the licenses page, and
+                              each reveal is audited. */}
                           <code className="text-xs bg-muted px-1.5 py-0.5 rounded font-mono">
-                            {l.license_key.length > 16 ? `${l.license_key.slice(0, 16)}...` : l.license_key}
+                            {data?.license_key_hints?.[l.id] ? `KG-••••-${data.license_key_hints[l.id]}` : "••••"}
                           </code>
                         </DataTableCell>
                         <DataTableCell className="text-xs text-muted-foreground">

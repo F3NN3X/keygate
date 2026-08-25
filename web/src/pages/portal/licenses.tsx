@@ -22,7 +22,7 @@ import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useAuth } from "@/hooks/use-auth"
 import { useI18n } from "@/i18n"
-import { type Activation, type Entitlement, type License, portal, type Seat } from "@/lib/api"
+import { type Activation, type Entitlement, type PortalLicense, portal, type Seat } from "@/lib/api"
 import { cn, formatDate, statusColor } from "@/lib/utils"
 
 export default function PortalLicensesPage() {
@@ -70,7 +70,7 @@ export default function PortalLicensesPage() {
   )
 }
 
-function LicenseCard({ license: lic }: { license: License }) {
+function LicenseCard({ license: lic }: { license: PortalLicense }) {
   const { t } = useI18n()
   const [copied, setCopied] = useState(false)
   const [showInvoices, setShowInvoices] = useState(false)
@@ -224,7 +224,7 @@ function LicenseCard({ license: lic }: { license: License }) {
   )
 }
 
-function ActivationsSection({ license }: { license: License }) {
+function ActivationsSection({ license }: { license: PortalLicense }) {
   const { t } = useI18n()
   const { user } = useAuth()
   const qc = useQueryClient()
@@ -411,7 +411,7 @@ function EntitlementsSection({ entitlements }: { entitlements: Entitlement[] }) 
   )
 }
 
-function SeatsSection({ license }: { license: License }) {
+function SeatsSection({ license }: { license: PortalLicense }) {
   const { t } = useI18n()
   const { user } = useAuth()
   const qc = useQueryClient()
@@ -560,7 +560,7 @@ function SeatRow({
   )
 }
 
-function InviteSeatDialog({ license, onClose }: { license: License; onClose: () => void }) {
+function InviteSeatDialog({ license, onClose }: { license: PortalLicense; onClose: () => void }) {
   const { t } = useI18n()
   const qc = useQueryClient()
   const [email, setEmail] = useState("")
@@ -631,7 +631,7 @@ function InviteSeatDialog({ license, onClose }: { license: License; onClose: () 
   )
 }
 
-function QuotaUsageSection({ license }: { license: License }) {
+function QuotaUsageSection({ license }: { license: PortalLicense }) {
   const quotaEntitlements = (license.plan?.entitlements || []).filter((e) => e.value_type === "quota")
 
   if (quotaEntitlements.length === 0) {
@@ -810,7 +810,7 @@ function InvoicesDialog({ licenseId, onClose }: { licenseId: string; onClose: ()
   )
 }
 
-function ChangePlanDialog({ license, onClose }: { license: License; onClose: () => void }) {
+function ChangePlanDialog({ license, onClose }: { license: PortalLicense; onClose: () => void }) {
   const { t } = useI18n()
   const qc = useQueryClient()
 

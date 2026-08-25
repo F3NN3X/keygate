@@ -285,7 +285,7 @@ func (s *LicenseService) Verify(ctx context.Context, in VerifyInput) (*VerifyRes
 		ValidUntil:          lic.ValidUntil,
 		Features:            s.entitlements(lic),
 		Token:               token,
-		GraceDays:           s.graceDays(lic),
+		GraceDays:           s.effectiveGraceDays(lic),
 		Meta:                responseMeta(),
 		ExternalCustomerID:  lic.ExternalCustomerID,
 		ExternalWorkspaceID: lic.ExternalWorkspaceID,
@@ -448,7 +448,7 @@ func (s *LicenseService) assertUsable(lic *model.License) error {
 	switch lic.Status {
 	case model.StatusActive, model.StatusTrialing, model.StatusPastDue:
 		if lic.ValidUntil != nil && now.After(*lic.ValidUntil) {
-			grace := time.Duration(s.graceDays(lic)) * 24 * time.Hour
+			grace := time.Duration(s.effectiveGraceDays(lic)) * 24 * time.Hour
 			if now.After(lic.ValidUntil.Add(grace)) {
 				return apperr.New(403, "LICENSE_EXPIRED", "license has expired")
 			}
@@ -484,6 +484,23 @@ func (s *LicenseService) graceDays(lic *model.License) int {
 	return 7
 }
 
+// effectiveGraceDays is the grace this licence actually gets, which is
+// not always the plan's number: a canceled licence is paid up to
+// ValidUntil and stops dead there.
+//
+// assertUsable, the signed token and the verify envelope must all read
+// the same value. When they drift, the client is told a grace period
+// the server will not honour — it keeps working offline for a week
+// while every online call already returns LICENSE_CANCELED.
+func (s *LicenseService) effectiveGraceDays(lic *model.License) int {
+	switch lic.Status {
+	case model.StatusActive, model.StatusTrialing, model.StatusPastDue:
+		return s.graceDays(lic)
+	default:
+		return 0
+	}
+}
+
 func (s *LicenseService) entitlements(lic *model.License) map[string]any {
 	m := make(map[string]any)
 	if lic.Plan == nil {
@@ -504,8 +521,35 @@ func responseMeta() map[string]any {
 	return map[string]any{"server": branding.Project, "url": branding.URL}
 }
 
+// tokenTTL is how long a signed token stays usable offline before the
+// client has to verify again. It is a check-in interval, not a licence
+// term — see the clamp below.
+const tokenTTL = 7 * 24 * time.Hour
+
 func (s *LicenseService) signToken(lic *model.License, identifier string) (string, error) {
 	now := time.Now()
+
+	// A token must never outlive the licence it was issued for. With a
+	// flat 7-day TTL, a plan whose grace period is shorter than that
+	// handed out tokens that kept verifying offline after the licence
+	// was truly dead: valid_until tomorrow + grace_days 0 still bought
+	// six extra days. Clamp to whichever comes first.
+	expiresAt := now.Add(tokenTTL)
+
+	// Grace comes from effectiveGraceDays so the token, the envelope
+	// around it and assertUsable cannot disagree about when this
+	// licence dies.
+	grace := s.effectiveGraceDays(lic)
+
+	var validUntil int64
+	if lic.ValidUntil != nil {
+		validUntil = lic.ValidUntil.Unix()
+		deadline := lic.ValidUntil.Add(time.Duration(grace) * 24 * time.Hour)
+		if deadline.Before(expiresAt) {
+			expiresAt = deadline
+		}
+	}
+
 	t := &license.VerifyToken{
 		LicenseID:   lic.ID,
 		ProductID:   lic.ProductID,
@@ -514,8 +558,9 @@ func (s *LicenseService) signToken(lic *model.License, identifier string) (strin
 		Identifier:  identifier,
 		Features:    s.entitlements(lic),
 		IssuedAt:    now.Unix(),
-		ExpiresAt:   now.Add(7 * 24 * time.Hour).Unix(),
-		GraceDays:   s.graceDays(lic),
+		ExpiresAt:   expiresAt.Unix(),
+		ValidUntil:  validUntil,
+		GraceDays:   grace,
 		Fingerprint: license.Fingerprint(identifier, lic.ProductID),
 	}
 	return license.Sign(t, s.signingKey)

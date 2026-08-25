@@ -268,12 +268,18 @@ type Entitlement struct {
 type License struct {
 	bun.BaseModel `bun:"table:licenses"`
 
-	ID         string `bun:",pk" json:"id"`
-	ProductID  string `bun:",notnull" json:"product_id"`
-	PlanID     string `bun:",notnull" json:"plan_id"`
-	UserID     string `bun:",nullzero" json:"user_id,omitempty"`
-	Email      string `bun:",notnull" json:"email"`
-	LicenseKey string `bun:",notnull,unique" json:"license_key"`
+	ID        string `bun:",pk" json:"id"`
+	ProductID string `bun:",notnull" json:"product_id"`
+	PlanID    string `bun:",notnull" json:"plan_id"`
+	UserID    string `bun:",nullzero" json:"user_id,omitempty"`
+	Email     string `bun:",notnull" json:"email"`
+	// JSON-hidden on purpose. The key is a credential — it activates
+	// the product — so it must not ride along in every payload that
+	// happens to contain a license. The three places that legitimately
+	// hand it out opt in explicitly: the admin reveal endpoint, the
+	// create response (the admin just minted it), and the customer
+	// portal (it is their own key). Read it via store.DecryptLicenseKey.
+	LicenseKey string `bun:",notnull,unique" json:"-"`
 	KeyHash    string `bun:",notnull,default:''" json:"-"` // never exposed in API
 	// LicenseKeyEncrypted stores the license key encrypted at rest under
 	// HKDF("license-key") subkey of the master encryption key. Phase A:

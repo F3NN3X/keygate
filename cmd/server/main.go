@@ -232,6 +232,7 @@ func main() {
 		DownloadTTL: downloadTTL,
 	})
 	releaseSigningH := handler.NewReleaseSigningAdminHandler(releaseSigner, db)
+	publicPlansH := handler.NewPublicPlansHandler(db, logger)
 
 	// Sync ADMIN_EMAILS to database roles (backward compatibility / initial setup)
 	if len(cfg.AdminEmails) > 0 {
@@ -533,12 +534,29 @@ func main() {
 	auth := v1.Group("/auth", middleware.RateLimitByIP(cfg.RateLimitAuth, time.Minute))
 	{
 		auth.GET("/providers", authH.Providers)
-		auth.POST("/otp/send", authH.OTPSend)
+		// Its own bucket, an order of magnitude tighter than the group:
+		// this is the one endpoint that mails a caller-chosen address.
+		auth.POST("/otp/send",
+			middleware.RateLimitByIPScoped("otp_send", cfg.RateLimitOTPSend, time.Hour),
+			authH.OTPSend)
 		auth.POST("/otp/verify", authH.OTPVerify)
 		auth.POST("/dev-login", authH.DevLogin)
 		auth.POST("/logout", middleware.SessionAuth(cfg.JWTSecret, db.FindUserIsAdmin), authH.Logout)
 		auth.POST("/refresh", authH.Refresh)
 	}
+
+	// Anonymous plan catalogue for a pricing page — the visitor has no
+	// account yet, so /portal/plans (session-gated) can't serve them.
+	// Rate-limited because each plan may trigger a Stripe price lookup.
+	//
+	// Its own bucket: RateLimitByIP keys every route as "ip:<addr>",
+	// so an unscoped limiter here would spend the same counter the
+	// /auth group checks against its much lower budget — a pricing
+	// page busy enough behind one NAT would lock that office out of
+	// logging in.
+	v1.GET("/products/:product_slug/plans",
+		middleware.RateLimitByIPScoped("public_plans", cfg.RateLimitAPI, time.Minute),
+		publicPlansH.ListPlans)
 
 	v1.POST("/webhook/stripe", middleware.RateLimitByIP(60, time.Minute), stripeH.Webhook)
 	// Stripe verify is hit by every successful checkout return, so the
@@ -567,7 +585,21 @@ func main() {
 				response.Internal(c)
 				return
 			}
-			response.OK(c, gin.H{"licenses": licenses})
+			// model.License hides the key so it can't leak from admin
+			// payloads by accident. Here it is the customer's own
+			// credential and the portal genuinely needs it — it is
+			// both displayed and used to address the activation and
+			// seat endpoints — so re-attach it explicitly.
+			type portalLicense struct {
+				*model.License
+				LicenseKey string `json:"license_key"`
+			}
+			out := make([]portalLicense, 0, len(licenses))
+			for _, l := range licenses {
+				out = append(out, portalLicense{License: l, LicenseKey: db.DecryptLicenseKey(l)})
+			}
+			c.Header("Cache-Control", "no-store")
+			response.OK(c, gin.H{"licenses": out})
 		})
 		portal.PUT("/profile", func(c *gin.Context) {
 			userID, _ := c.Get("user_id")
@@ -840,6 +872,7 @@ func main() {
 		licWrite.GET("/licenses", adminH.ListLicenses)
 		licWrite.GET("/licenses/export", adminH.ExportLicenses)
 		licWrite.GET("/licenses/:id", adminH.GetLicense)
+		licWrite.GET("/licenses/:id/key", adminH.RevealLicenseKey)
 		licWrite.POST("/licenses", adminH.CreateLicense)
 		licWrite.POST("/licenses/:id/refund", adminH.RefundLicense)
 		licWrite.POST("/licenses/:id/revoke", adminH.RevokeLicense)
@@ -879,6 +912,7 @@ func main() {
 
 		admin.GET("/settings", adminH.GetSettings)
 		admin.PUT("/settings", adminH.UpdateSettings)
+		admin.DELETE("/settings/secrets/:key", adminH.ClearSecretSetting)
 		admin.POST("/settings/test-email", adminH.SendTestEmail)
 		admin.POST("/system/run-expiry-checks", adminH.RunExpiryChecks)
 		admin.POST("/system/run-metered-sync", adminH.RunMeteredSync)

@@ -624,6 +624,33 @@ func (s *Store) ListLicensesByEmail(ctx context.Context, email string) ([]*model
 	return out, err
 }
 
+// HasAccountOrLicense reports whether email already belongs to this
+// installation: an existing user, a license owner, or a live seat.
+//
+// The comparison is case-insensitive on purpose. Login lowercases what
+// the visitor types, but the addresses this checks against are typed by
+// someone else — an admin filling in the license form, or Stripe
+// echoing back whatever the customer entered at checkout — so
+// "Alice@example.com" on the license and "alice@example.com" at the
+// login box are routinely the same person. Comparing them literally
+// would lock that customer out of an installation that runs
+// signup_mode=licensed_only.
+func (s *Store) HasAccountOrLicense(ctx context.Context, email string) (bool, error) {
+	e := strings.ToLower(strings.TrimSpace(email))
+	if e == "" {
+		return false, nil
+	}
+	var exists bool
+	err := s.DB.NewRaw(`SELECT EXISTS (
+		SELECT 1 FROM users WHERE lower(email) = ?
+		UNION ALL
+		SELECT 1 FROM licenses WHERE lower(email) = ?
+		UNION ALL
+		SELECT 1 FROM seats WHERE lower(email) = ? AND removed_at IS NULL
+	)`, e, e, e).Scan(ctx, &exists)
+	return exists, err
+}
+
 // FindActiveLicenseByEmailAndProduct returns an active or trialing license
 // for the given email and product, or nil if none exists.
 func (s *Store) UpdateLicenseUser(ctx context.Context, licenseID, userID string) error {

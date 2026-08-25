@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -822,7 +823,16 @@ func (h *AdminHandler) ListLicenses(c *gin.Context) {
 		response.Internal(c)
 		return
 	}
-	response.OK(c, gin.H{"licenses": licenses, "total": total})
+	// Only the tail of each key travels with the list — enough for an
+	// admin to tell two rows apart, useless to anyone who intercepts
+	// the payload. The key itself comes from RevealLicenseKey.
+	hints := make(map[string]string, len(licenses))
+	for _, l := range licenses {
+		if hint := h.licenseKeyHint(l); hint != "" {
+			hints[l.ID] = hint
+		}
+	}
+	response.OK(c, gin.H{"licenses": licenses, "total": total, "license_key_hints": hints})
 }
 
 func (h *AdminHandler) GetLicense(c *gin.Context) {
@@ -835,7 +845,12 @@ func (h *AdminHandler) GetLicense(c *gin.Context) {
 	if !requireKeyProductScope(c, l.ProductID) {
 		return
 	}
-	response.OK(c, l)
+	// The licence's own fields stay at the top level — clients read
+	// .plan_id and .status straight off this object, and the only
+	// deliberate break here is that license_key is gone. The hint
+	// rides alongside them; the key itself is one explicit request
+	// away via RevealLicenseKey.
+	response.OK(c, licenseWithHint{License: l, LicenseKeyHint: h.licenseKeyHint(l)})
 }
 
 func (h *AdminHandler) CreateLicense(c *gin.Context) {
@@ -962,7 +977,75 @@ func (h *AdminHandler) CreateLicense(c *gin.Context) {
 		h.Email.SendLicenseCreated(req.Email, productName, plan.Name, l.LicenseKey)
 	}
 
-	response.Created(c, l)
+	// The key is returned exactly here: the admin explicitly created
+	// this license and needs to pass the key to the customer. Every
+	// later read goes through RevealLicenseKey and is audited.
+	c.Header("Cache-Control", "no-store")
+	response.Created(c, licenseWithKey{License: l, LicenseKey: h.Store.DecryptLicenseKey(l)})
+}
+
+// licenseWithKey re-attaches the credential to a license payload for
+// the few responses allowed to carry it. model.License hides the field
+// so it can never leak by accident; opting in is deliberate and local.
+type licenseWithKey struct {
+	*model.License
+	LicenseKey string `json:"license_key"`
+}
+
+// licenseWithHint is a licence payload with the last four characters of
+// its key attached, for the detail view.
+type licenseWithHint struct {
+	*model.License
+	LicenseKeyHint string `json:"license_key_hint"`
+}
+
+// licenseKeyHint is the last four characters of a key — a row label,
+// not a credential.
+func (h *AdminHandler) licenseKeyHint(l *model.License) string {
+	key := h.Store.DecryptLicenseKey(l)
+	r := []rune(key)
+	if len(r) <= 4 {
+		return string(r)
+	}
+	return string(r[len(r)-4:])
+}
+
+// RevealLicenseKey returns one plaintext license key.
+// GET /api/v1/admin/licenses/:id/key
+//
+// Split out from the list and detail payloads so that browsing the
+// dashboard, exporting a report, or holding a licenses:write API key
+// does not spray every customer's credential across logs, proxies and
+// browser caches. Each reveal is a deliberate act and is audited.
+func (h *AdminHandler) RevealLicenseKey(c *gin.Context) {
+	id := c.Param("id")
+	if !h.checkLicenseScope(c, id) {
+		return
+	}
+	l, err := h.Store.FindLicenseByID(c, id)
+	if err != nil {
+		response.NotFound(c, "license not found")
+		return
+	}
+
+	key := h.Store.DecryptLicenseKey(l)
+	if key == "" {
+		// Ciphertext unreadable or the master key is gone —
+		// DecryptLicenseKey has already logged it and bumped the metric.
+		response.Err(c, http.StatusServiceUnavailable, "LICENSE_KEY_UNAVAILABLE",
+			"license key could not be decrypted")
+		return
+	}
+
+	// The audit records that a reveal happened, never the key.
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "license", EntityID: l.ID, Action: "key_revealed",
+		ActorType: "admin", ActorID: adminID(c), IPAddress: c.ClientIP(),
+		Changes: map[string]any{"email": l.Email},
+	})
+
+	c.Header("Cache-Control", "no-store")
+	response.OK(c, gin.H{"license_key": key})
 }
 
 func (h *AdminHandler) RevokeLicense(c *gin.Context) {
@@ -1480,7 +1563,19 @@ func (h *AdminHandler) GetUserDetail(c *gin.Context) {
 		response.NotFound(c, "user not found")
 		return
 	}
-	response.OK(c, detail)
+	// Same rule as the licenses list: the customer view shows which
+	// license is which, not the credential itself. The detail keeps
+	// its existing shape and the hints ride alongside it.
+	hints := make(map[string]string, len(detail.Licenses))
+	for _, l := range detail.Licenses {
+		if hint := h.licenseKeyHint(l); hint != "" {
+			hints[l.ID] = hint
+		}
+	}
+	response.OK(c, struct {
+		*store.UserDetail
+		LicenseKeyHints map[string]string `json:"license_key_hints"`
+	}{UserDetail: detail, LicenseKeyHints: hints})
 }
 
 // ─── Addons ───
@@ -1730,13 +1825,84 @@ func (h *AdminHandler) ChangeLicensePlan(c *gin.Context) {
 
 // ─── Settings ───
 
+// settingsWritable lists the keys the dashboard may write. Anything
+// else is rejected so a typo can't quietly create a dead row.
+var settingsWritable = map[string]bool{
+	"site_name": true, "timezone": true, "language": true, "brand_color": true, "logo_url": true,
+	"signup_mode": true,
+	"smtp_host":   true, "smtp_port": true, "smtp_username": true,
+	"smtp_password": true, "smtp_from": true,
+	"rate_limit_api": true, "rate_limit_admin": true,
+	"webhook_max_attempts": true, "webhook_timeout": true,
+	"quota_warning_threshold":          true,
+	"setup_complete":                   true,
+	"email_template_license_created":   true,
+	"email_template_license_expiring":  true,
+	"email_template_license_expired":   true,
+	"email_template_trial_expired":     true,
+	"email_template_license_suspended": true,
+	"email_template_quota_warning":     true,
+	"email_template_seat_invite":       true,
+	"email_template_payment_failed":    true,
+}
+
+// settingsSecret lists keys that can be written but never read back.
+// GetSettings reports only whether a value is stored; a blank
+// submission means "leave it alone", because a form that cannot show
+// the current value would otherwise wipe it on every save.
+var settingsSecret = map[string]bool{
+	"smtp_password": true,
+}
+
+// settingsEnum lists the settings whose value is a fixed choice rather
+// than free text. Saving a typo here fails quietly and in the unsafe
+// direction: signupAllowed reads anything that is not exactly
+// "licensed_only" as open registration, so "licensedonly" would report
+// saved while leaving the endpoint open to strangers.
+var settingsEnum = map[string][]string{
+	"signup_mode": {"open", "licensed_only"},
+}
+
+// settingsServerOwned lists keys the server writes for itself — the
+// Stripe webhook auto-setup stores the endpoint id and signing secret
+// here. They are neither readable nor writable over the API.
+//
+// Leaving them in the GET response also broke saving outright: the
+// dashboard seeds its form from that response and PUTs the whole map
+// back, so once Stripe was configured every save failed with
+// "unknown setting: stripe_webhook_secret".
+var settingsServerOwned = map[string]bool{
+	"stripe_webhook_secret":      true,
+	"stripe_webhook_endpoint_id": true,
+}
+
 func (h *AdminHandler) GetSettings(c *gin.Context) {
 	settings, err := h.Store.GetSettings(c)
 	if err != nil {
 		response.Internal(c)
 		return
 	}
-	response.OK(c, gin.H{"settings": settings})
+
+	// An admin-scoped API key reaches this endpoint too, so the
+	// response must not double as a way to read secrets back out of
+	// the database.
+	out := make(map[string]string, len(settings))
+	secretsSet := make(map[string]bool, len(settingsSecret))
+	for k := range settingsSecret {
+		secretsSet[k] = false
+	}
+	for k, v := range settings {
+		switch {
+		case settingsServerOwned[k]:
+			continue
+		case settingsSecret[k]:
+			secretsSet[k] = v != ""
+		default:
+			out[k] = v
+		}
+	}
+
+	response.OK(c, gin.H{"settings": out, "secrets_set": secretsSet})
 }
 
 func (h *AdminHandler) UpdateSettings(c *gin.Context) {
@@ -1748,38 +1914,39 @@ func (h *AdminHandler) UpdateSettings(c *gin.Context) {
 		return
 	}
 
-	// Validate allowed keys
-	allowed := map[string]bool{
-		"site_name": true, "timezone": true, "language": true, "brand_color": true, "logo_url": true,
-		"smtp_host": true, "smtp_port": true, "smtp_username": true,
-		"smtp_password": true, "smtp_from": true,
-		"rate_limit_api": true, "rate_limit_admin": true,
-		"webhook_max_attempts": true, "webhook_timeout": true,
-		"quota_warning_threshold":          true,
-		"setup_complete":                   true,
-		"email_template_license_created":   true,
-		"email_template_license_expiring":  true,
-		"email_template_license_expired":   true,
-		"email_template_trial_expired":     true,
-		"email_template_license_suspended": true,
-		"email_template_quota_warning":     true,
-		"email_template_seat_invite":       true,
-		"email_template_payment_failed":    true,
-	}
-	for key := range req.Settings {
-		if !allowed[key] {
+	for key, val := range req.Settings {
+		if !settingsWritable[key] {
 			response.BadRequest(c, "unknown setting: "+key)
+			return
+		}
+		if allowed, ok := settingsEnum[key]; ok && !slices.Contains(allowed, val) {
+			response.BadRequest(c, "invalid value for "+key+": "+val)
 			return
 		}
 	}
 
-	if err := h.Store.SetSettings(c, req.Settings); err != nil {
+	// Blank secret means "unchanged", so an ordinary form save doesn't
+	// wipe a password the form was never able to display. Removing one
+	// is a separate, explicit call — see ClearSecretSetting.
+	writes := make(map[string]string, len(req.Settings))
+	for key, val := range req.Settings {
+		if settingsSecret[key] && val == "" {
+			continue
+		}
+		writes[key] = val
+	}
+	if len(writes) == 0 {
+		response.OK(c, gin.H{"status": "saved"})
+		return
+	}
+
+	if err := h.Store.SetSettings(c, writes); err != nil {
 		response.Internal(c)
 		return
 	}
 
-	keys := make([]string, 0, len(req.Settings))
-	for k := range req.Settings {
+	keys := make([]string, 0, len(writes))
+	for k := range writes {
 		keys = append(keys, k)
 	}
 	h.Store.Audit(c, &model.AuditLog{
@@ -1789,6 +1956,33 @@ func (h *AdminHandler) UpdateSettings(c *gin.Context) {
 	})
 
 	response.OK(c, gin.H{"status": "saved"})
+}
+
+// ClearSecretSetting removes a stored secret. UpdateSettings treats a
+// blank value as "leave it alone" — otherwise every save from a form
+// that cannot display the current value would wipe it — so deleting one
+// needs its own call. Restricted to settingsSecret: the server-owned
+// Stripe keys must not be clearable, since dropping the signing secret
+// would silently break webhook verification.
+func (h *AdminHandler) ClearSecretSetting(c *gin.Context) {
+	key := c.Param("key")
+	if !settingsSecret[key] {
+		response.NotFound(c, "no such secret setting")
+		return
+	}
+
+	if err := h.Store.DeleteSetting(c, key); err != nil {
+		response.Internal(c)
+		return
+	}
+
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "settings", EntityID: "system", Action: "secret_cleared",
+		ActorType: "admin", ActorID: adminID(c),
+		Changes: map[string]any{"key": key},
+	})
+
+	response.OK(c, gin.H{"status": "cleared", "key": key})
 }
 
 // RunMeteredSync triggers one drain pass of the Stripe meter-event
@@ -2076,6 +2270,19 @@ func (h *AdminHandler) ExportLicenses(c *gin.Context) {
 		response.Internal(c)
 		return
 	}
+
+	// The export deliberately carries plaintext keys — that is its
+	// purpose, e.g. migrating off Keygate. But it is a bulk credential
+	// dump, so unlike a single reveal it must leave a trace of who
+	// pulled it and how much.
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "license", EntityID: "export", Action: "keys_exported",
+		ActorType: "admin", ActorID: adminID(c), IPAddress: c.ClientIP(),
+		Changes: map[string]any{
+			"format": format, "count": len(licenses),
+			"product_id": c.Query("product_id"), "status": c.Query("status"),
+		},
+	})
 
 	dateStr := time.Now().Format("2006-01-02")
 
