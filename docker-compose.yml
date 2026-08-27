@@ -15,6 +15,9 @@ services:
       DATABASE_URL: postgres://keygate:${POSTGRES_PASSWORD}@postgres:5432/keygate?sslmode=disable
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in Dokploy env}
       LICENSE_SIGNING_KEY: ${LICENSE_SIGNING_KEY:?Set LICENSE_SIGNING_KEY in Dokploy env}
+      # AES-256 key (64 hex chars) that encrypts licence keys at rest. Optional, but without it
+      # keys are stored in plaintext (keygate logs a warning). Generate: openssl rand -hex 32
+      RELEASE_KEY_ENCRYPTION_KEY: ${RELEASE_KEY_ENCRYPTION_KEY:-}
       ADMIN_EMAILS: ${ADMIN_EMAILS:-}
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       SMTP_HOST: ${SMTP_HOST:-}
