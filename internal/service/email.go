@@ -40,6 +40,18 @@ type EmailService struct {
 
 func (s *EmailService) IsConfigured() bool { return s.enabled }
 
+// tlsClientConfig returns the TLS settings for both the implicit-TLS
+// dial (port 465) and the STARTTLS upgrade. Production leaves
+// s.tlsConfig nil so we verify the server's certificate chain against
+// the system roots; tests inject a config with InsecureSkipVerify to
+// trust an ephemeral self-signed cert.
+func (s *EmailService) tlsClientConfig() *tls.Config {
+	if s.tlsConfig != nil {
+		return s.tlsConfig
+	}
+	return &tls.Config{ServerName: s.host, MinVersion: tls.VersionTLS12}
+}
+
 func NewEmailService(host, port, username, password, from string, logger *slog.Logger, s *store.Store) *EmailService {
 	enabled := host != "" && from != ""
 	if !enabled {
@@ -163,7 +175,22 @@ func (s *EmailService) sendOnce(addr, to string, msg []byte) error {
 		return err
 	}
 
-	conn, err := net.DialTimeout("tcp", addr, 30*time.Second)
+	// Two submission modes:
+	//   - Implicit TLS / SMTPS (port 465): the socket is encrypted from
+	//     the first byte. No plaintext greeting, no STARTTLS. This is the
+	//     ONLY mode Cloudflare Email Service (smtp.mx.cloudflare.net:465)
+	//     offers — it does not do STARTTLS on 587.
+	//   - Plaintext submission (port 587/25): connect in the clear, then
+	//     upgrade with STARTTLS if the server advertises it.
+	implicit := s.port == "465"
+
+	var conn net.Conn
+	if implicit {
+		conn, err = tls.DialWithDialer(
+			&net.Dialer{Timeout: 30 * time.Second}, "tcp", addr, s.tlsClientConfig())
+	} else {
+		conn, err = net.DialTimeout("tcp", addr, 30*time.Second)
+	}
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
@@ -180,18 +207,22 @@ func (s *EmailService) sendOnce(addr, to string, msg []byte) error {
 
 	// STARTTLS upgrade if the server advertises it. (Client.StartTLS
 	// internally re-EHLOs so post-TLS extensions land in c.Extension.)
-	if ok, _ := c.Extension("STARTTLS"); ok {
-		cfg := s.tlsConfig
-		if cfg == nil {
-			cfg = &tls.Config{ServerName: s.host, MinVersion: tls.VersionTLS12}
-		}
-		if err := c.StartTLS(cfg); err != nil {
-			return fmt.Errorf("starttls: %w", err)
+	// Skipped for implicit TLS, where the connection is already secure.
+	if !implicit {
+		if ok, _ := c.Extension("STARTTLS"); ok {
+			if err := c.StartTLS(s.tlsClientConfig()); err != nil {
+				return fmt.Errorf("starttls: %w", err)
+			}
 		}
 	}
 
 	if s.username != "" {
-		auth, perr := pickAuth(c, s.host, s.username, s.password)
+		// `implicit` tells the auth mechanism the connection is already
+		// encrypted: Go's smtp.Client only sets ServerInfo.TLS after a
+		// STARTTLS it drove itself, never for a socket we dialled with
+		// tls.Dial — so without this the AUTH guards would wrongly
+		// refuse a perfectly secure SMTPS connection.
+		auth, perr := pickAuth(c, s.host, s.username, s.password, implicit)
 		if perr != nil {
 			return perr
 		}
@@ -231,7 +262,7 @@ func (s *EmailService) sendOnce(addr, to string, msg []byte) error {
 // Returns an error if the server requires AUTH but advertises neither
 // (typical for OAuth2-only endpoints — those need XOAUTH2 which is a
 // separate authentication flow).
-func pickAuth(c *smtp.Client, host, username, password string) (smtp.Auth, error) {
+func pickAuth(c *smtp.Client, host, username, password string, secure bool) (smtp.Auth, error) {
 	// Client.Extension returns (ok, params): ok = is the extension
 	// supported, params = the parameter string (for AUTH this is the
 	// space-separated list of mechanisms the server accepts).
@@ -242,12 +273,43 @@ func pickAuth(c *smtp.Client, host, username, password string) (smtp.Auth, error
 	mechs := strings.ToUpper(authExt)
 	switch {
 	case strings.Contains(mechs, "PLAIN"):
-		return smtp.PlainAuth("", username, password, host), nil
+		return &plainAuth{username: username, password: password, host: host, secure: secure}, nil
 	case strings.Contains(mechs, "LOGIN"):
-		return &loginAuth{username: username, password: password, host: host}, nil
+		return &loginAuth{username: username, password: password, host: host, secure: secure}, nil
 	default:
 		return nil, fmt.Errorf("smtp: no supported AUTH mechanism (server advertised: %q)", authExt)
 	}
+}
+
+// plainAuth implements SMTP AUTH PLAIN. We use our own rather than the
+// stdlib smtp.PlainAuth because that version authorises only when
+// ServerInfo.TLS is set — and Go's smtp.Client sets that flag ONLY
+// after a STARTTLS upgrade it performed itself, never for an
+// implicit-TLS (port 465) socket we dialled with tls.Dial. The
+// `secure` flag lets sendOnce assert the connection is already
+// encrypted; without it we still require server.TLS so a plaintext
+// port-25 misconfiguration can't leak the password onto the wire.
+type plainAuth struct {
+	username, password, host string
+	secure                   bool
+}
+
+func (a *plainAuth) Start(server *smtp.ServerInfo) (string, []byte, error) {
+	if !server.TLS && !a.secure {
+		return "", nil, errors.New("smtp: refusing PLAIN auth on unencrypted connection")
+	}
+	if server.Name != a.host {
+		return "", nil, errors.New("smtp: wrong host name")
+	}
+	// RFC 4616: authzid \x00 authcid \x00 passwd (empty authzid).
+	return "PLAIN", []byte("\x00" + a.username + "\x00" + a.password), nil
+}
+
+func (a *plainAuth) Next(fromServer []byte, more bool) ([]byte, error) {
+	if more {
+		return nil, errors.New("smtp: unexpected server challenge during PLAIN auth")
+	}
+	return nil, nil
 }
 
 // loginAuth implements RFC-less SMTP AUTH LOGIN. Microsoft 365 /
@@ -258,12 +320,17 @@ func pickAuth(c *smtp.Client, host, username, password string) (smtp.Auth, error
 // "Password:" (both base64-encoded over the wire, but Client.Auth
 // decodes before passing to Next). Some servers omit the trailing
 // colon, send lowercase, or use a different word — match leniently.
-type loginAuth struct{ username, password, host string }
+type loginAuth struct {
+	username, password, host string
+	secure                   bool
+}
 
 func (a *loginAuth) Start(server *smtp.ServerInfo) (string, []byte, error) {
 	// Only allow LOGIN over TLS. The credentials go on the wire in
 	// (base64 of) plaintext — anything else is a credential leak.
-	if !server.TLS {
+	// `secure` covers implicit TLS (port 465), where Go's smtp.Client
+	// leaves ServerInfo.TLS false even though the socket is encrypted.
+	if !server.TLS && !a.secure {
 		return "", nil, errors.New("smtp: refusing LOGIN auth on unencrypted connection")
 	}
 	if server.Name != a.host {

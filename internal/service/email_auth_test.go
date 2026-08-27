@@ -125,6 +125,84 @@ func TestSendOnce_AuthPickerMatrix(t *testing.T) {
 	}
 }
 
+// TestSendOnce_ImplicitTLS covers the SMTPS submission path (port 465):
+// the connection is TLS from the first byte with no STARTTLS. This is
+// the only mode Cloudflare Email Service offers. It also pins the
+// subtle part — Go's net/smtp does NOT set ServerInfo.TLS for a
+// self-dialled TLS socket, so this proves AUTH still succeeds via the
+// `secure` assertion rather than being wrongly refused.
+func TestSendOnce_ImplicitTLS(t *testing.T) {
+	srv := newMockSMTP(t, mockSMTPConfig{
+		advertiseAuth: "PLAIN LOGIN",
+		wantUsername:  "api_token", // Cloudflare's literal username
+		wantPassword:  "cf-api-token-value",
+		implicitTLS:   true,
+	})
+	defer srv.Close()
+
+	svc := &EmailService{
+		host:     "127.0.0.1",
+		port:     "465", // triggers the implicit-TLS branch in sendOnce
+		username: "api_token",
+		password: "cf-api-token-value",
+		from:     "noreply@keygate.test",
+		enabled:  true,
+		logger:   slog.Default(),
+		tlsConfig: &tls.Config{ServerName: "127.0.0.1", InsecureSkipVerify: true}, //nolint:gosec
+	}
+
+	// The mock listens on an ephemeral port; sendOnce takes the dial
+	// address explicitly while keying the implicit-TLS decision off
+	// s.port == "465".
+	addr := fmt.Sprintf("127.0.0.1:%d", srv.Port())
+	if err := svc.sendOnce(addr, "to@example.com",
+		[]byte("Subject: ok\r\n\r\nhi\r\n")); err != nil {
+		t.Fatalf("sendOnce over implicit TLS: %v", err)
+	}
+	if got := srv.SelectedMech(); got != "PLAIN" {
+		t.Errorf("auth mechanism: want PLAIN, got %q", got)
+	}
+	if !srv.AuthSucceeded() {
+		t.Error("server did not record successful auth over implicit TLS")
+	}
+}
+
+// TestPlainAuth_RefusesPlaintextConnection — like LOGIN, PLAIN puts the
+// password on the wire (base64), so it must refuse a truly unencrypted
+// connection (no server.TLS and no implicit-TLS assertion).
+func TestPlainAuth_RefusesPlaintextConnection(t *testing.T) {
+	a := &plainAuth{username: "u", password: "p", host: "example.com"}
+	if _, _, err := a.Start(&smtp.ServerInfo{TLS: false, Name: "example.com"}); err == nil {
+		t.Fatal("plainAuth.Start should refuse a non-TLS connection")
+	}
+}
+
+// TestPlainAuth_SecureBypassesTLSFlag — for implicit TLS the stdlib
+// client leaves ServerInfo.TLS false; the secure flag must let auth
+// proceed and produce the correct RFC 4616 response.
+func TestPlainAuth_SecureBypassesTLSFlag(t *testing.T) {
+	a := &plainAuth{username: "u", password: "p", host: "example.com", secure: true}
+	mech, resp, err := a.Start(&smtp.ServerInfo{TLS: false, Name: "example.com"})
+	if err != nil {
+		t.Fatalf("secure plainAuth should start over implicit TLS: %v", err)
+	}
+	if mech != "PLAIN" {
+		t.Errorf("mechanism: want PLAIN, got %q", mech)
+	}
+	if string(resp) != "\x00u\x00p" {
+		t.Errorf("PLAIN response = %q, want \\x00u\\x00p", resp)
+	}
+}
+
+// TestPlainAuth_WrongHostname mirrors the LOGIN guard: refuse to send
+// credentials if the TLS server identity isn't the configured host.
+func TestPlainAuth_WrongHostname(t *testing.T) {
+	a := &plainAuth{username: "u", password: "p", host: "expected.com", secure: true}
+	if _, _, err := a.Start(&smtp.ServerInfo{TLS: true, Name: "attacker.com"}); err == nil {
+		t.Fatal("plainAuth.Start should refuse a wrong host name")
+	}
+}
+
 // TestSendOnce_RejectsBadLoginCredentials covers the case where the
 // AUTH LOGIN mechanism is correctly selected but the credentials are
 // wrong — server must respond 535 and the client should surface a
@@ -274,6 +352,7 @@ type mockSMTPConfig struct {
 	advertiseAuth string // space-separated mechanisms
 	wantUsername  string
 	wantPassword  string
+	implicitTLS   bool // serve TLS from the first byte (SMTPS / port 465)
 }
 
 type mockSMTP struct {
@@ -333,9 +412,21 @@ func (s *mockSMTP) acceptLoop(cfg mockSMTPConfig) {
 //     AUTH LOGIN → 334 base64("Username:") → 334 base64("Password:") → 235/535
 //   - MAIL FROM / RCPT TO / DATA / . / QUIT
 func (s *mockSMTP) handle(c net.Conn, cfg mockSMTPConfig) {
+	inTLS := false
+	if cfg.implicitTLS {
+		// SMTPS: wrap the raw socket in TLS before the banner, mirroring
+		// smtp.mx.cloudflare.net:465. No STARTTLS is offered afterwards.
+		tlsConn := tls.Server(c, &tls.Config{
+			Certificates: []tls.Certificate{s.tlsCert},
+		})
+		if err := tlsConn.Handshake(); err != nil {
+			return
+		}
+		c = tlsConn
+		inTLS = true
+	}
 	fmt.Fprint(c, "220 mockSMTP ready\r\n")
 	r := bufio.NewReader(c)
-	var inTLS bool
 	for {
 		line, err := r.ReadString('\n')
 		if err != nil {
