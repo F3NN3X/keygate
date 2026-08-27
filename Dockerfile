@@ -14,15 +14,26 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 COPY --from=frontend /app/web/dist ./web/dist
+# Version metadata. These ARGs are fallbacks; when the build context
+# carries a .git directory (it does — see .dockerignore) we derive the
+# real values from git so Dokploy builds self-stamp the true commit
+# without any external wiring.
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
-RUN CGO_ENABLED=0 go build -trimpath \
-    -ldflags "-s -w \
-      -X github.com/tabloy/keygate/internal/version.Version=${VERSION} \
-      -X github.com/tabloy/keygate/internal/version.Commit=${COMMIT} \
-      -X github.com/tabloy/keygate/internal/version.BuildDate=${BUILD_DATE}" \
-    -o /keygate ./cmd/server
+RUN git config --global --add safe.directory /app 2>/dev/null || true; \
+    if [ -d .git ]; then \
+      VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo custom)"; \
+      COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
+      BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+    fi; \
+    echo "Building keygate VERSION=$VERSION COMMIT=$COMMIT BUILD_DATE=$BUILD_DATE"; \
+    CGO_ENABLED=0 go build -trimpath \
+      -ldflags "-s -w \
+        -X github.com/tabloy/keygate/internal/version.Version=${VERSION} \
+        -X github.com/tabloy/keygate/internal/version.Commit=${COMMIT} \
+        -X github.com/tabloy/keygate/internal/version.BuildDate=${BUILD_DATE}" \
+      -o /keygate ./cmd/server
 
 # ── Runtime ──
 FROM alpine:3.21
