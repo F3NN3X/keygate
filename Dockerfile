@@ -14,16 +14,17 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 COPY --from=frontend /app/web/dist ./web/dist
-# Version metadata. These ARGs are fallbacks; when the build context
-# carries a .git directory (it does — see .dockerignore) we derive the
-# real values from git so Dokploy builds self-stamp the true commit
-# without any external wiring.
+# Version metadata. VERSION comes from the repo's VERSION file so it is a
+# clean, deterministic semver (the update checker parses it, and Dokploy's
+# clone has no git tags, so `git describe` cannot be relied on). The commit
+# and build date are still derived from git when .git is in the context
+# (see .dockerignore). The ARGs remain fallbacks if either source is absent.
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
 RUN git config --global --add safe.directory /app 2>/dev/null || true; \
+    if [ -f VERSION ]; then VERSION="$(cat VERSION | tr -d '[:space:]')"; fi; \
     if [ -d .git ]; then \
-      VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo custom)"; \
       COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
       BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
     fi; \
