@@ -2,15 +2,17 @@ services:
   keygate:
     image: ghcr.io/tabloy/keygate:v0.1.3
     # build: .  # uncomment to build from source (switch to this once you edit code)
-    ports:
-      - "9000:9000"
+    # No host port published: Dokploy's Traefik reaches the container over the
+    # dokploy-network and terminates TLS for the domain below.
+    expose:
+      - "9000"
     environment:
       PORT: "9000"
       ENVIRONMENT: production
-      BASE_URL: http://localhost:9000
-      DATABASE_URL: postgres://keygate:keygate@postgres:5432/keygate?sslmode=disable
-      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
-      LICENSE_SIGNING_KEY: ${LICENSE_SIGNING_KEY:?Set LICENSE_SIGNING_KEY in .env}
+      BASE_URL: https://license.deckshot.app
+      DATABASE_URL: postgres://keygate:${POSTGRES_PASSWORD}@postgres:5432/keygate?sslmode=disable
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in Dokploy env}
+      LICENSE_SIGNING_KEY: ${LICENSE_SIGNING_KEY:?Set LICENSE_SIGNING_KEY in Dokploy env}
       ADMIN_EMAILS: ${ADMIN_EMAILS:-}
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       SMTP_HOST: ${SMTP_HOST:-}
@@ -28,12 +30,15 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    networks:
+      - default
+      - dokploy-network
 
   postgres:
     image: postgres:18-alpine
     environment:
       POSTGRES_USER: keygate
-      POSTGRES_PASSWORD: keygate
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in Dokploy env}
       POSTGRES_DB: keygate
     volumes:
       # postgres:18+ images expect the volume mounted at /var/lib/postgresql
@@ -46,6 +51,14 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    networks:
+      - default
 
 volumes:
   pgdata:
+
+networks:
+  # Dokploy creates this network; Traefik lives here and routes your domain
+  # to the keygate container. It already exists, so we mark it external.
+  dokploy-network:
+    external: true
