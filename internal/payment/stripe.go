@@ -202,7 +202,15 @@ func (h *StripeHandler) Webhook(c *gin.Context) {
 		response.BadRequest(c, "webhook not configured")
 		return
 	}
-	event, err := webhook.ConstructEvent(body, c.GetHeader("Stripe-Signature"), secret)
+	// IgnoreAPIVersionMismatch: the endpoint is auto-created with the Stripe
+	// account's default API version, which can be newer than the one this
+	// stripe-go pins — otherwise ConstructEvent hard-fails (e.g. account on
+	// 2026-08-26.dahlia vs library 2025-08-27.basil) and every webhook 400s.
+	// The HMAC signature is still verified; only the version check is relaxed.
+	// The fields we read (customer email, price/product, session id) are stable
+	// across these versions, and the livemode gate below still applies.
+	event, err := webhook.ConstructEventWithOptions(body, c.GetHeader("Stripe-Signature"), secret,
+		webhook.ConstructEventOptions{IgnoreAPIVersionMismatch: true})
 	if err != nil {
 		slog.Error("stripe webhook verification failed", "error", err.Error())
 		response.BadRequest(c, "invalid signature")
