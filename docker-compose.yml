@@ -1,7 +1,7 @@
 services:
   keygate:
-    image: ghcr.io/tabloy/keygate:latest
-    # build: .  # uncomment to build from source
+    image: ghcr.io/tabloy/keygate:v0.1.3
+    # build: .  # uncomment to build from source (switch to this once you edit code)
     ports:
       - "9000:9000"
     environment:
