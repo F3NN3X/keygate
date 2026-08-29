@@ -1525,7 +1525,13 @@ func (h *AdminHandler) AnalyticsActivationTrend(c *gin.Context) {
 		from, _ = time.Parse("2006-01-02", v)
 	}
 	if v := c.Query("to"); v != "" {
-		to, _ = time.Parse("2006-01-02", v)
+		if t, err := time.Parse("2006-01-02", v); err == nil {
+			// End-of-day: include the entire "to" date, matching analyticsFilter above.
+			// GetActivationTrend filters on `created_at <= to`, so a bare start-of-day
+			// ceiling drops every activation created later on the "to" day (typically
+			// today's), which is why a real activation reads as "no activation data".
+			to = t.Add(24*time.Hour - time.Nanosecond)
+		}
 	}
 	trend, err := h.Store.GetActivationTrend(c, productID, from, to)
 	if err != nil {
