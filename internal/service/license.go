@@ -521,10 +521,18 @@ func responseMeta() map[string]any {
 	return map[string]any{"server": branding.Project, "url": branding.URL}
 }
 
-// tokenTTL is how long a signed token stays usable offline before the
-// client has to verify again. It is a check-in interval, not a licence
-// term — see the clamp below.
+// tokenTTL is the default check-in interval: how long a signed token
+// stays usable offline before the client has to verify again. A plan
+// can override it with token_ttl_days. It is a check-in interval, not
+// a licence term — see the clamp below.
 const tokenTTL = 7 * 24 * time.Hour
+
+func (s *LicenseService) tokenTTLFor(lic *model.License) time.Duration {
+	if lic.Plan != nil && lic.Plan.TokenTTLDays > 0 {
+		return time.Duration(lic.Plan.TokenTTLDays) * 24 * time.Hour
+	}
+	return tokenTTL
+}
 
 func (s *LicenseService) signToken(lic *model.License, identifier string) (string, error) {
 	now := time.Now()
@@ -534,7 +542,7 @@ func (s *LicenseService) signToken(lic *model.License, identifier string) (strin
 	// handed out tokens that kept verifying offline after the licence
 	// was truly dead: valid_until tomorrow + grace_days 0 still bought
 	// six extra days. Clamp to whichever comes first.
-	expiresAt := now.Add(tokenTTL)
+	expiresAt := now.Add(s.tokenTTLFor(lic))
 
 	// Grace comes from effectiveGraceDays so the token, the envelope
 	// around it and assertUsable cannot disagree about when this

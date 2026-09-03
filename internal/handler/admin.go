@@ -157,6 +157,27 @@ func (h *AdminHandler) UpdateProduct(c *gin.Context) {
 				return
 			}
 		}
+		if !model.ProductSupports(req.Type, model.CapReleases) && req.Type != p.Type {
+			// Published releases cannot be deleted, so "no releases at
+			// all" would make the change impossible for any product
+			// that ever shipped. Yanked releases are withdrawn already;
+			// only live (published) and draft ones block.
+			total, err := h.Store.CountReleases(c, store.ReleaseFilter{ProductID: p.ID})
+			if err != nil {
+				response.Internal(c)
+				return
+			}
+			yanked, err := h.Store.CountReleases(c, store.ReleaseFilter{ProductID: p.ID, Status: model.ReleaseStatusYanked})
+			if err != nil {
+				response.Internal(c)
+				return
+			}
+			if n := total - yanked; n > 0 {
+				response.Err(c, http.StatusBadRequest, "INCOMPATIBLE_PRODUCT_TYPE",
+					fmt.Sprintf("cannot change type to %s: %d release(s) would become unreachable — delete draft releases and yank published ones first", req.Type, n))
+				return
+			}
+		}
 		p.Type = req.Type
 	}
 	if req.MinimumSupportedVersion != nil {
@@ -236,10 +257,14 @@ func (h *AdminHandler) CreatePlan(c *gin.Context) {
 		MaxActivations  int    `json:"max_activations"`
 		MaxSeats        int    `json:"max_seats"`
 		TrialDays       int    `json:"trial_days"`
-		GraceDays       int    `json:"grace_days"`
+		// Pointers so "omitted" (use the default) and an explicit 0
+		// ("no grace", "no timeout") stay distinguishable. Before, a
+		// zero-grace plan could only be made with a second PUT.
+		GraceDays       *int   `json:"grace_days"`
 		StripePriceID   string `json:"stripe_price_id"`
 		LicenseModel    string `json:"license_model"`
-		FloatingTimeout int    `json:"floating_timeout"`
+		FloatingTimeout *int   `json:"floating_timeout"`
+		TokenTTLDays    int    `json:"token_ttl_days"`
 		SortOrder       int    `json:"sort_order"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -263,19 +288,34 @@ func (h *AdminHandler) CreatePlan(c *gin.Context) {
 		return
 	}
 
+	graceDays := 7
+	if req.GraceDays != nil {
+		graceDays = *req.GraceDays
+	}
+	// grace_days keeps an explicit 0 (no grace); floating_timeout does
+	// not, because a zero session timeout is meaningless and the
+	// runtime substitutes 30 anyway — storing 0 would just make the
+	// plan page disagree with behaviour.
+	floatingTimeout := 30
+	if req.FloatingTimeout != nil {
+		if *req.FloatingTimeout < 0 {
+			response.BadRequest(c, "floating_timeout cannot be negative")
+			return
+		}
+		if *req.FloatingTimeout > 0 {
+			floatingTimeout = *req.FloatingTimeout
+		}
+	}
 	if err := validatePlanNumericBounds(planBounds{
 		MaxActivations:  req.MaxActivations,
 		MaxSeats:        req.MaxSeats,
 		TrialDays:       req.TrialDays,
-		GraceDays:       req.GraceDays,
-		FloatingTimeout: req.FloatingTimeout,
+		GraceDays:       graceDays,
+		FloatingTimeout: floatingTimeout,
+		TokenTTLDays:    req.TokenTTLDays,
 	}); err != nil {
 		response.BadRequest(c, err.Error())
 		return
-	}
-
-	if req.GraceDays <= 0 {
-		req.GraceDays = 7
 	}
 
 	licenseModel := req.LicenseModel
@@ -286,11 +326,6 @@ func (h *AdminHandler) CreatePlan(c *gin.Context) {
 		response.BadRequest(c, "license_model must be standard or floating")
 		return
 	}
-	floatingTimeout := req.FloatingTimeout
-	if floatingTimeout <= 0 {
-		floatingTimeout = 30
-	}
-
 	// Product-type capability gating. The product decides WHAT a plan
 	// can configure; price model (perpetual/subscription/trial) stays
 	// orthogonal. Example: a saas product's plan must not set
@@ -332,10 +367,11 @@ func (h *AdminHandler) CreatePlan(c *gin.Context) {
 		MaxActivations:  req.MaxActivations,
 		MaxSeats:        req.MaxSeats,
 		TrialDays:       req.TrialDays,
-		GraceDays:       req.GraceDays,
+		GraceDays:       graceDays,
 		StripePriceID:   req.StripePriceID,
 		LicenseModel:    licenseModel,
 		FloatingTimeout: floatingTimeout,
+		TokenTTLDays:    req.TokenTTLDays,
 		Active:          true,
 		SortOrder:       req.SortOrder,
 	}
@@ -372,6 +408,7 @@ func (h *AdminHandler) UpdatePlan(c *gin.Context) {
 		StripePriceID   *string `json:"stripe_price_id"`
 		LicenseModel    *string `json:"license_model"`
 		FloatingTimeout *int    `json:"floating_timeout"`
+		TokenTTLDays    *int    `json:"token_ttl_days"`
 		Active          *bool   `json:"active"`
 		SortOrder       *int    `json:"sort_order"`
 	}
@@ -429,6 +466,7 @@ func (h *AdminHandler) UpdatePlan(c *gin.Context) {
 		MaxActivations: p.MaxActivations, MaxSeats: p.MaxSeats,
 		TrialDays: p.TrialDays, GraceDays: p.GraceDays,
 		FloatingTimeout: p.FloatingTimeout,
+		TokenTTLDays:    p.TokenTTLDays,
 	}
 	if req.MaxActivations != nil {
 		check.MaxActivations = *req.MaxActivations
@@ -444,6 +482,9 @@ func (h *AdminHandler) UpdatePlan(c *gin.Context) {
 	}
 	if req.FloatingTimeout != nil {
 		check.FloatingTimeout = *req.FloatingTimeout
+	}
+	if req.TokenTTLDays != nil {
+		check.TokenTTLDays = *req.TokenTTLDays
 	}
 	if err := validatePlanNumericBounds(check); err != nil {
 		response.BadRequest(c, err.Error())
@@ -482,6 +523,9 @@ func (h *AdminHandler) UpdatePlan(c *gin.Context) {
 	}
 	if req.FloatingTimeout != nil {
 		p.FloatingTimeout = *req.FloatingTimeout
+	}
+	if req.TokenTTLDays != nil {
+		p.TokenTTLDays = *req.TokenTTLDays
 	}
 	if req.Active != nil {
 		p.Active = *req.Active
@@ -705,6 +749,7 @@ type planBounds struct {
 	TrialDays       int
 	GraceDays       int
 	FloatingTimeout int // minutes
+	TokenTTLDays    int // 0 = server default
 }
 
 func validatePlanNumericBounds(b planBounds) error {
@@ -729,6 +774,10 @@ func validatePlanNumericBounds(b planBounds) error {
 		return fmt.Errorf("floating_timeout cannot be negative")
 	case b.FloatingTimeout > 1440:
 		return fmt.Errorf("floating_timeout cannot exceed 1440 minutes (1 day)")
+	case b.TokenTTLDays < 0:
+		return fmt.Errorf("token_ttl_days cannot be negative")
+	case b.TokenTTLDays > 365:
+		return fmt.Errorf("token_ttl_days cannot exceed 365")
 	}
 	return nil
 }
@@ -1829,9 +1878,7 @@ func (h *AdminHandler) ChangeLicensePlan(c *gin.Context) {
 // else is rejected so a typo can't quietly create a dead row.
 var settingsWritable = map[string]bool{
 	"site_name": true, "timezone": true, "language": true, "brand_color": true, "logo_url": true,
-	"signup_mode": true,
-	"smtp_host":   true, "smtp_port": true, "smtp_username": true,
-	"smtp_password": true, "smtp_from": true,
+	"signup_mode":    true,
 	"rate_limit_api": true, "rate_limit_admin": true,
 	"webhook_max_attempts": true, "webhook_timeout": true,
 	"quota_warning_threshold":          true,
@@ -1850,9 +1897,13 @@ var settingsWritable = map[string]bool{
 // GetSettings reports only whether a value is stored; a blank
 // submission means "leave it alone", because a form that cannot show
 // the current value would otherwise wipe it on every save.
-var settingsSecret = map[string]bool{
-	"smtp_password": true,
-}
+//
+// Currently empty. SMTP used to live here, but the mailer only ever
+// read the environment, so the stored values were dead — the keys
+// were removed rather than wired up, and SMTP stays env-only like
+// the rest of the server config. The mechanism is kept for the next
+// secret that genuinely needs to be set from the dashboard.
+var settingsSecret = map[string]bool{}
 
 // settingsEnum lists the settings whose value is a fixed choice rather
 // than free text. Saving a typo here fails quietly and in the unsafe
@@ -1902,7 +1953,14 @@ func (h *AdminHandler) GetSettings(c *gin.Context) {
 		}
 	}
 
-	response.OK(c, gin.H{"settings": out, "secrets_set": secretsSet})
+	// SMTP is configured from the environment; the dashboard shows
+	// where mail goes so an admin can tell "not set up" from "set up
+	// but broken" before pressing the test button.
+	email := gin.H{"configured": false, "host": "", "from": ""}
+	if h.Email != nil {
+		email = gin.H{"configured": h.Email.IsConfigured(), "host": h.Email.Host(), "from": h.Email.From()}
+	}
+	response.OK(c, gin.H{"settings": out, "secrets_set": secretsSet, "email": email})
 }
 
 func (h *AdminHandler) UpdateSettings(c *gin.Context) {
@@ -2361,7 +2419,7 @@ func (h *AdminHandler) ExportLicenses(c *gin.Context) {
 		if l.ValidUntil != nil {
 			validUntil = l.ValidUntil.Format(time.RFC3339)
 		}
-		_ = w.Write([]string{
+		_ = w.Write(csvSafeRow([]string{
 			l.ID,
 			l.Email,
 			productName,
@@ -2371,6 +2429,23 @@ func (h *AdminHandler) ExportLicenses(c *gin.Context) {
 			l.ValidFrom.Format(time.RFC3339),
 			validUntil,
 			l.CreatedAt.Format(time.RFC3339),
-		})
+		}))
 	}
+}
+
+// csvSafeRow neutralises cells a spreadsheet would run as a formula.
+// Email, product and plan names are user-controlled, and "+foo@x.com"
+// is a perfectly valid address that Excel treats as =+foo@x.com. A
+// leading apostrophe makes the cell literal text.
+func csvSafeRow(cells []string) []string {
+	for i, c := range cells {
+		if c == "" {
+			continue
+		}
+		switch c[0] {
+		case '=', '+', '-', '@', '\t', '\r':
+			cells[i] = "'" + c
+		}
+	}
+	return cells
 }

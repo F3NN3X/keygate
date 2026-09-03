@@ -111,7 +111,10 @@ func (s *Store) RotateSigningKey(ctx context.Context, newKey *model.ReleaseSigni
 	// Per-product advisory lock — held until COMMIT. Two concurrent
 	// RotateSigningKey calls for the same product will serialise here.
 	lockKey := signingKeyRotateLockSeed ^ stringHash(newKey.ProductID)
-	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", lockKey); err != nil {
+	// Bun formats the query itself, so the placeholder is "?" — "$1"
+	// reaches Postgres verbatim and fails with "there is no parameter
+	// $1", which made every rotation a 500 until this was caught.
+	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(?)", lockKey); err != nil {
 		return fmt.Errorf("acquire rotate lock: %w", err)
 	}
 

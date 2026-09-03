@@ -315,6 +315,7 @@ function PlanDialog({
     grace_days: plan?.grace_days ?? 7,
     license_model: plan?.license_model || "standard",
     floating_timeout: plan?.floating_timeout ?? 30,
+    token_ttl_days: plan?.token_ttl_days ?? 0,
     active: plan?.active ?? true,
     stripe_price_id: plan?.stripe_price_id || "",
   })
@@ -341,6 +342,7 @@ function PlanDialog({
       payload.max_activations = 0
       payload.license_model = "standard"
       payload.floating_timeout = 0
+      payload.token_ttl_days = 0
     }
     if (!supports.seats) {
       payload.max_seats = 0
@@ -475,6 +477,19 @@ function PlanDialog({
                   value={form.floating_timeout}
                   onChange={(e) => set("floating_timeout", Number(e.target.value))}
                 />
+              </div>
+            )}
+            {supports.activations && (
+              <div className="space-y-2">
+                <Label>{t("plans.tokenTtlDays")}</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  max={365}
+                  value={form.token_ttl_days}
+                  onChange={(e) => set("token_ttl_days", Number(e.target.value))}
+                />
+                <p className="text-xs text-muted-foreground">{t("plans.tokenTtlDaysHint")}</p>
               </div>
             )}
             <div className="space-y-2">

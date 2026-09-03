@@ -29,9 +29,14 @@ type Config struct {
 	// (sk_live_ vs sk_test_) unless STRIPE_LIVEMODE is set explicitly.
 	StripeLivemode bool
 
-	WebhookMaxAttempts    int
-	WebhookRetryInterval  string
-	WebhookHTTPTimeout    string
+	WebhookMaxAttempts   int
+	WebhookRetryInterval string
+	WebhookHTTPTimeout   string
+	// WebhookAllowPrivate lets webhook deliveries reach loopback,
+	// private and link-local addresses. Off by default so an admin
+	// cannot point a webhook at the metadata service or an internal
+	// host; turn it on when the receiver lives on the same network.
+	WebhookAllowPrivate   bool
 	QuotaWarningThreshold float64
 
 	SMTPHost     string
@@ -80,6 +85,7 @@ type Config struct {
 	// Presigned URL TTLs.
 	StorageUploadTTL   string // default "1h"
 	StorageDownloadTTL string // default "10m"
+	StorageFeedURLTTL  string // default "24h"; lifetime of URLs inside public feeds
 
 	// ReleaseKeyEncryptionKey is a 64-char hex string (32 bytes) used as the
 	// AES-256-GCM master key for encrypting product release-signing private
@@ -131,7 +137,7 @@ func Load() (*Config, error) {
 
 	cfg.RateLimitAPI = envIntOr("RATE_LIMIT_API", 60)
 	cfg.RateLimitAdmin = envIntOr("RATE_LIMIT_ADMIN", 120)
-	cfg.RateLimitAuth = envIntOr("RATE_LIMIT_AUTH", 20)
+	cfg.RateLimitAuth = envIntOr("RATE_LIMIT_AUTH", 60)
 	cfg.RateLimitOTPSend = envIntOr("RATE_LIMIT_OTP_SEND", 30)
 	cfg.BFMaxFails = envIntOr("BF_MAX_FAILS", 5)
 	cfg.BFLockoutSeconds = envIntOr("BF_LOCKOUT_SECONDS", 30)
@@ -139,6 +145,7 @@ func Load() (*Config, error) {
 	cfg.WebhookMaxAttempts = envIntOr("WEBHOOK_MAX_ATTEMPTS", 5)
 	cfg.WebhookRetryInterval = envOr("WEBHOOK_RETRY_INTERVAL", "30s")
 	cfg.WebhookHTTPTimeout = envOr("WEBHOOK_HTTP_TIMEOUT", "10s")
+	cfg.WebhookAllowPrivate = strings.EqualFold(os.Getenv("WEBHOOK_ALLOW_PRIVATE"), "true")
 	cfg.QuotaWarningThreshold = envFloatOr("QUOTA_WARNING_THRESHOLD", 0.8)
 
 	if admins := os.Getenv("ADMIN_EMAILS"); admins != "" {
@@ -156,6 +163,7 @@ func Load() (*Config, error) {
 	cfg.StorageForcePathStyle = strings.EqualFold(os.Getenv("STORAGE_FORCE_PATH_STYLE"), "true")
 	cfg.StorageUploadTTL = envOr("STORAGE_UPLOAD_TTL", "1h")
 	cfg.StorageDownloadTTL = envOr("STORAGE_DOWNLOAD_TTL", "10m")
+	cfg.StorageFeedURLTTL = envOr("STORAGE_FEED_URL_TTL", "24h")
 	cfg.ReleaseKeyEncryptionKey = os.Getenv("RELEASE_KEY_ENCRYPTION_KEY")
 	cfg.MaxReleaseSignSize = int64(envIntOr("MAX_RELEASE_SIGN_SIZE_MB", 500)) * 1024 * 1024
 

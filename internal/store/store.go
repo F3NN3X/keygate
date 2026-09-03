@@ -204,9 +204,16 @@ func (s *Store) UpsertUser(ctx context.Context, u *model.User) error {
 	if u.ID == "" {
 		u.ID = newID()
 	}
+	// A blank incoming value means "the caller doesn't know", not "clear
+	// it". Login upserts the user with only an email — OTP has no name
+	// to offer, and neither does the Stripe checkout path — so writing
+	// EXCLUDED.name straight in wiped the display name its owner had
+	// set in the portal, on every single login.
 	_, err := s.DB.NewInsert().Model(u).
 		On("CONFLICT (email) DO UPDATE").
-		Set("name = EXCLUDED.name, avatar_url = EXCLUDED.avatar_url, updated_at = now()").
+		Set(`name = COALESCE(NULLIF(EXCLUDED.name, ''), "user".name),
+			avatar_url = COALESCE(NULLIF(EXCLUDED.avatar_url, ''), "user".avatar_url),
+			updated_at = now()`).
 		Exec(ctx)
 	return err
 }

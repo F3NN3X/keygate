@@ -179,7 +179,12 @@ func applyReleaseFilters(q *bun.SelectQuery, f ReleaseFilter) *bun.SelectQuery {
 //
 // On 0 rows affected, diagnoseUnpublishable inspects current state and
 // returns the most specific sentinel.
-func (s *Store) PublishRelease(ctx context.Context, id string, requireSignatures bool) error {
+// signingKeyID, when non-empty, is the key the caller signed with:
+// every artifact must carry a signature from exactly that key. Two
+// publishes overlapping a key rotation can otherwise interleave their
+// per-artifact signature writes and ship a release whose platforms
+// verify against different public keys.
+func (s *Store) PublishRelease(ctx context.Context, id string, requireSignatures bool, signingKeyID string) error {
 	res, err := s.DB.NewRaw(`
 		UPDATE releases
 		SET status = ?, published_at = now(), updated_at = now()
@@ -196,15 +201,16 @@ func (s *Store) PublishRelease(ctx context.Context, id string, requireSignatures
 		      OR NOT EXISTS (
 		          SELECT 1 FROM release_artifacts
 		          WHERE release_id = releases.id
-		            AND (ed25519_sig = '' OR signing_key_id IS NULL)
+		            AND (ed25519_sig = '' OR signing_key_id IS NULL
+		                 OR (? <> '' AND signing_key_id <> ?))
 		      )
 		  )
-	`, model.ReleaseStatusPublished, id, model.ReleaseStatusDraft, requireSignatures).Exec(ctx)
+	`, model.ReleaseStatusPublished, id, model.ReleaseStatusDraft, requireSignatures, signingKeyID, signingKeyID).Exec(ctx)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return s.diagnoseUnpublishable(ctx, id, requireSignatures)
+		return s.diagnoseUnpublishable(ctx, id, requireSignatures, signingKeyID)
 	}
 	return nil
 }
@@ -214,7 +220,7 @@ func (s *Store) PublishRelease(ctx context.Context, id string, requireSignatures
 // rows; the answer can be slightly stale (state may have moved again
 // between the UPDATE and these reads) but the user-facing error code is
 // still correct for "the gate rejected your request".
-func (s *Store) diagnoseUnpublishable(ctx context.Context, id string, requireSignatures bool) error {
+func (s *Store) diagnoseUnpublishable(ctx context.Context, id string, requireSignatures bool, signingKeyID string) error {
 	var status string
 	if err := s.DB.NewRaw(`SELECT status FROM releases WHERE id = ?`, id).
 		Scan(ctx, &status); err != nil {
@@ -253,7 +259,9 @@ func (s *Store) diagnoseUnpublishable(ctx context.Context, id string, requireSig
 	if requireSignatures {
 		var unsigned int
 		if err := s.DB.NewRaw(
-			`SELECT COUNT(*) FROM release_artifacts WHERE release_id = ? AND (ed25519_sig = '' OR signing_key_id IS NULL)`, id,
+			`SELECT COUNT(*) FROM release_artifacts WHERE release_id = ?
+			   AND (ed25519_sig = '' OR signing_key_id IS NULL OR (? <> '' AND signing_key_id <> ?))`,
+			id, signingKeyID, signingKeyID,
 		).Scan(ctx, &unsigned); err != nil {
 			return err
 		}
@@ -544,17 +552,78 @@ func (s *Store) UpdateArtifactFile(ctx context.Context, id, fileKey string, size
 // passes `requireSignatures=true`. So the worst outcome of a race here
 // is the publish UPDATE rejecting with ErrReleaseArtifactsNotSigned;
 // the caller (Publish) re-runs the sign loop and retries.
-func (s *Store) UpdateArtifactSignature(ctx context.Context, id, sig, signingKeyID string) error {
-	res, err := s.DB.NewUpdate().Model((*model.ReleaseArtifact)(nil)).
-		Set("ed25519_sig = ?, signing_key_id = ?, updated_at = now()", sig, signingKeyID).
-		Where("id = ?", id).Exec(ctx)
+// ClearReleaseSignatures drops every signature on a draft release. Used
+// when a release is deliberately published unsigned, so nothing from an
+// earlier signing attempt ships.
+//
+// Locks the release row first: under READ COMMITTED a plain UPDATE with
+// a status subquery can see "draft" while a concurrent publish is
+// committing, and then erase signatures from a release that is live.
+func (s *Store) ClearReleaseSignatures(ctx context.Context, releaseID string) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrArtifactNotFound
+	defer tx.Rollback() //nolint:errcheck
+
+	var status string
+	if err := tx.NewRaw(`SELECT status FROM releases WHERE id = ? FOR UPDATE`, releaseID).
+		Scan(ctx, &status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrReleaseNotFound
+		}
+		return err
 	}
-	return nil
+	if status != model.ReleaseStatusDraft {
+		return ErrReleaseNotPublishable
+	}
+	if _, err := tx.NewRaw(`
+		UPDATE release_artifacts
+		SET ed25519_sig = '', signing_key_id = NULL, updated_at = now()
+		WHERE release_id = ?
+	`, releaseID).Exec(ctx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// UpdateArtifactSignature writes a signature onto an artifact whose
+// release is still a draft. A shipped release's signatures are
+// immutable: a publish that lost the race to another publish (or ran
+// after a rotation) must not rewrite what clients already verify.
+//
+// Same shape as DeleteArtifact: FOR UPDATE on the parent release so this
+// waits behind an in-flight PublishRelease and then sees its committed
+// status, instead of racing it on an MVCC snapshot.
+func (s *Store) UpdateArtifactSignature(ctx context.Context, id, sig, signingKeyID string) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var releaseStatus string
+	if err := tx.NewRaw(`
+		SELECT r.status
+		FROM release_artifacts ra
+		JOIN releases r ON r.id = ra.release_id
+		WHERE ra.id = ?
+		FOR UPDATE OF r
+	`, id).Scan(ctx, &releaseStatus); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrArtifactNotFound
+		}
+		return err
+	}
+	if releaseStatus != model.ReleaseStatusDraft {
+		return ErrReleaseNotPublishable
+	}
+	if _, err := tx.NewUpdate().Model((*model.ReleaseArtifact)(nil)).
+		Set("ed25519_sig = ?, signing_key_id = ?, updated_at = now()", sig, signingKeyID).
+		Where("id = ?", id).Exec(ctx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // DeleteArtifact removes an artifact from a draft release. Returns the

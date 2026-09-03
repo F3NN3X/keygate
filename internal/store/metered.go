@@ -28,10 +28,16 @@ func (s *Store) InsertMeteredEvent(ctx context.Context, licenseID, feature, peri
 	return err
 }
 
-func (s *Store) ListUnsyncedMetered(ctx context.Context, limit int) ([]*model.MeteredBilling, error) {
+// ListUnsyncedMetered returns pending rows that still have attempts
+// left. Rows at the ceiling are excluded here, not just skipped by the
+// caller: they are never going to sync, and with created_at ordering
+// enough of them at the head of the queue would fill every batch and
+// starve rows that could.
+func (s *Store) ListUnsyncedMetered(ctx context.Context, limit, maxAttempts int) ([]*model.MeteredBilling, error) {
 	var out []*model.MeteredBilling
 	err := s.DB.NewSelect().Model(&out).
-		Where("synced = false").OrderExpr("created_at ASC").Limit(limit).Scan(ctx)
+		Where("synced = false AND attempts < ?", maxAttempts).
+		OrderExpr("created_at ASC").Limit(limit).Scan(ctx)
 	return out, err
 }
 

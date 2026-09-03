@@ -2,6 +2,8 @@ package store_test
 
 import (
 	"context"
+	"errors"
+	"math"
 	"os"
 	"sync"
 	"testing"
@@ -56,6 +58,31 @@ func createTestLicense(t *testing.T, s *store.Store, ctx context.Context) *model
 		t.Fatalf("create license: %v", err)
 	}
 	return lic
+}
+
+// A quantity big enough to wrap the counter used to go negative, pass
+// the limit check and then fail the BIGINT update with a 500.
+func TestIncrementUsageCounterWithLimit_Overflow(t *testing.T) {
+	s := setupTestDB(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	lic := createTestLicense(t, s, ctx)
+	defer func() {
+		_, _ = s.DB.NewRaw("DELETE FROM usage_counters WHERE license_id = ?", lic.ID).Exec(ctx)
+	}()
+
+	if _, accepted, err := s.IncrementUsageCounterWithLimit(ctx, lic.ID, "api_calls", "monthly", "2026-09", 10, 0); err != nil || !accepted {
+		t.Fatalf("seed increment: accepted=%v err=%v", accepted, err)
+	}
+	_, _, err := s.IncrementUsageCounterWithLimit(ctx, lic.ID, "api_calls", "monthly", "2026-09", math.MaxInt64, 0)
+	if !errors.Is(err, store.ErrUsageQuantityTooLarge) {
+		t.Fatalf("got %v, want ErrUsageQuantityTooLarge", err)
+	}
+	c, accepted, err := s.IncrementUsageCounterWithLimit(ctx, lic.ID, "api_calls", "monthly", "2026-09", 1, 0)
+	if err != nil || !accepted || c.Used != 11 {
+		t.Fatalf("counter after rejected overflow: used=%d accepted=%v err=%v, want 11", c.Used, accepted, err)
+	}
 }
 
 func TestIncrementUsageCounterWithLimit_Atomic(t *testing.T) {

@@ -91,7 +91,7 @@ func main() {
 		30*time.Minute,
 		5*time.Minute,
 	)
-	webhookSvc := service.NewWebhookService(db, logger, webhookHTTPTimeout, cfg.WebhookMaxAttempts)
+	webhookSvc := service.NewWebhookService(db, logger, webhookHTTPTimeout, cfg.WebhookMaxAttempts, cfg.WebhookAllowPrivate)
 	emailSvc := service.NewEmailService(cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUsername, cfg.SMTPPassword, cfg.SMTPFrom, logger, db)
 	// LICENSE_SIGNING_KEY is a 32-byte ed25519 seed in hex. Parsed
 	// once here so an invalid value fails fast at startup rather
@@ -140,6 +140,12 @@ func main() {
 		logger.Warn("storage: invalid STORAGE_DOWNLOAD_TTL, using service default",
 			"value", cfg.StorageDownloadTTL, "error", err)
 		downloadTTL = 0
+	}
+	feedTTL, err := time.ParseDuration(cfg.StorageFeedURLTTL)
+	if err != nil {
+		logger.Warn("storage: invalid STORAGE_FEED_URL_TTL, using service default",
+			"value", cfg.StorageFeedURLTTL, "error", err)
+		feedTTL = 0
 	}
 
 	// Master encryption key drives two independent features via HKDF:
@@ -230,6 +236,7 @@ func main() {
 		Logger:      logger,
 		BaseURL:     cfg.BaseURL,
 		DownloadTTL: downloadTTL,
+		FeedTTL:     feedTTL,
 	})
 	releaseSigningH := handler.NewReleaseSigningAdminHandler(releaseSigner, db)
 	publicPlansH := handler.NewPublicPlansHandler(db, logger)
@@ -453,15 +460,17 @@ func main() {
 	//
 	// Defenses kept:
 	//   - LicenseBruteForceGuard — per-IP throttle on failed verifies
-	//   - RateLimitByIP — aggregate request cap (raised because legitimate
-	//     SDK clients poll on a timer)
+	//   - RateLimitByIPScoped — per-route-family request cap (raised
+	//     because legitimate SDK clients poll on a timer). Every family
+	//     has its own bucket: SDK polling from an office NAT must not
+	//     eat the login budget of the people behind the same address.
 	//
 	// api_keys table + admin CRUD remain for server-to-server use cases
 	// (a customer's backend querying license state).
 	licRateLimit := max(cfg.RateLimitAPI*2, 120)
 	lic := v1.Group("/license",
 		middleware.LicenseBruteForceGuard(bf),
-		middleware.RateLimitByIP(licRateLimit, time.Minute))
+		middleware.RateLimitByIPScoped("license", licRateLimit, time.Minute))
 	{
 		// Idempotent-by-design endpoints (apply Idempotency-Key middleware
 		// to write paths only — read-style verifies are already idempotent).
@@ -496,7 +505,7 @@ func main() {
 	// guessing. Live outside /license/* on purpose: this endpoint
 	// has nothing to do with the SDK identity.
 	v1.POST("/invites/accept",
-		middleware.RateLimitByIP(60, time.Minute),
+		middleware.RateLimitByIPScoped("invites", 60, time.Minute),
 		authH.AcceptInvite(seatSvc))
 
 	// Release feed endpoints.
@@ -513,7 +522,7 @@ func main() {
 	// running multiple installed products doesn't trip the 60/min default.
 	feedRateLimit := max(cfg.RateLimitAPI*4, 240)
 	feedMW := []gin.HandlerFunc{
-		middleware.RateLimitByIP(feedRateLimit, time.Minute),
+		middleware.RateLimitByIPScoped("feed", feedRateLimit, time.Minute),
 	}
 	v1.GET("/releases/:product_slug/feed.xml", append(feedMW, releasePublicH.FeedSparkle)...)
 	v1.GET("/releases/:product_slug/feed.json", append(feedMW, releasePublicH.FeedVelopack)...)
@@ -531,7 +540,7 @@ func main() {
 	v1.GET("/releases/upgrade.json", feedGone)
 	v1.GET("/releases/feed", feedGone)
 
-	auth := v1.Group("/auth", middleware.RateLimitByIP(cfg.RateLimitAuth, time.Minute))
+	auth := v1.Group("/auth", middleware.RateLimitByIPScoped("auth", cfg.RateLimitAuth, time.Minute))
 	{
 		auth.GET("/providers", authH.Providers)
 		// Its own bucket, an order of magnitude tighter than the group:
@@ -558,13 +567,13 @@ func main() {
 		middleware.RateLimitByIPScoped("public_plans", cfg.RateLimitAPI, time.Minute),
 		publicPlansH.ListPlans)
 
-	v1.POST("/webhook/stripe", middleware.RateLimitByIP(60, time.Minute), stripeH.Webhook)
+	v1.POST("/webhook/stripe", middleware.RateLimitByIPScoped("stripe_webhook", 60, time.Minute), stripeH.Webhook)
 	// Stripe verify is hit by every successful checkout return, so the
 	// limit is generous, but the endpoint must NOT be naked: each call
 	// proxies to Stripe's API and an attacker could otherwise force us
 	// to burn rate-budget against Stripe.
 	v1.GET("/checkout/verify",
-		middleware.RateLimitByIP(60, time.Minute),
+		middleware.RateLimitByIPScoped("checkout_verify", 60, time.Minute),
 		stripeH.VerifyCheckoutSession)
 
 	// Unified checkout: GET /pay/:checkout_id → Stripe
@@ -835,7 +844,7 @@ func main() {
 	// product's release-signing identity.
 	baseAdminMW := []gin.HandlerFunc{
 		middleware.SessionOrAPIKey(cfg.JWTSecret, db, db.FindUserIsAdmin),
-		middleware.RateLimitByIP(cfg.RateLimitAdmin, time.Minute),
+		middleware.RateLimitByIPScoped("admin", cfg.RateLimitAdmin, time.Minute),
 	}
 	adminMW := append([]gin.HandlerFunc{}, baseAdminMW...)
 	adminMW = append(adminMW, middleware.RequireScope(model.ScopeAdmin))

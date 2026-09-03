@@ -19,8 +19,10 @@ func TestValidateVersion(t *testing.T) {
 		{"10.20.30", true, "multi-digit"},
 		{"1.2.3-alpha", true, "prerelease"},
 		{"1.2.3-alpha.1", true, "prerelease numeric"},
-		{"1.2.3-rc.1+build.42", true, "prerelease + build"},
-		{"1.2.3+build.42", true, "build only"},
+		// Build metadata is ignored by semver ordering, so two rows that
+		// differ only in "+..." would be indistinguishable to clients.
+		{"1.2.3-rc.1+build.42", false, "prerelease + build rejected"},
+		{"1.2.3+build.42", false, "build metadata rejected"},
 
 		{"1", false, "missing minor/patch"},
 		{"1.2", false, "missing patch"},
@@ -412,6 +414,22 @@ func TestSafeKeyComponentNoPathTraversal(t *testing.T) {
 		got := safeKeyComponent(in)
 		if strings.ContainsRune(got, '/') {
 			t.Errorf("safeKeyComponent(%q) = %q must not contain /", in, got)
+		}
+	}
+}
+
+func TestNormalizePlatform(t *testing.T) {
+	cases := map[string]string{
+		"darwin-aarch64": "darwin-arm64", // Tauri {{target}}-{{arch}}
+		"Darwin-AARCH64": "darwin-arm64",
+		"windows-x86_64": "windows-x64",
+		"linux-armv7":    "linux-armhf",
+		"darwin-arm64":   "darwin-arm64", // canonical passes through
+		"freebsd-x64":    "freebsd-x64",  // unknown: unchanged, validation rejects
+	}
+	for in, want := range cases {
+		if got := NormalizePlatform(in); got != want {
+			t.Errorf("NormalizePlatform(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

@@ -40,6 +40,10 @@ type EmailService struct {
 
 func (s *EmailService) IsConfigured() bool { return s.enabled }
 
+// Host and From are shown read-only in the dashboard.
+func (s *EmailService) Host() string { return s.host }
+func (s *EmailService) From() string { return s.from }
+
 func NewEmailService(host, port, username, password, from string, logger *slog.Logger, s *store.Store) *EmailService {
 	enabled := host != "" && from != ""
 	if !enabled {

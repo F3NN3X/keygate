@@ -255,7 +255,10 @@ export const admin = {
   },
   resendWebhookDelivery: (webhookId: string, deliveryId: string) =>
     post<WebhookDeliveryLog>(`/admin/webhooks/${webhookId}/deliveries/${deliveryId}/resend`),
-  testWebhook: (id: string) => post(`/admin/webhooks/${id}/test`),
+  testWebhook: (id: string) =>
+    post<{ status: string; delivery_id: string; response_code: number; response_body: string }>(
+      `/admin/webhooks/${id}/test`,
+    ),
 
   getLicenseUsage: (id: string, params?: { feature?: string; offset?: number; limit?: number }) => {
     const q = new URLSearchParams()
@@ -391,9 +394,12 @@ export const admin = {
 
   // Settings
   getSettings: () =>
-    get<{ settings: Record<string, string>; secrets_set?: Record<string, boolean> }>("/admin/settings"),
+    get<{
+      settings: Record<string, string>
+      secrets_set?: Record<string, boolean>
+      email?: { configured: boolean; host: string; from: string }
+    }>("/admin/settings"),
   updateSettings: (settings: Record<string, string>) => put<{ status: string }>("/admin/settings", { settings }),
-  clearSecretSetting: (key: string) => del<{ status: string; key: string }>(`/admin/settings/secrets/${key}`),
   sendTestEmail: () => post<{ status: string }>("/admin/settings/test-email"),
 
   // Email Templates
@@ -413,7 +419,6 @@ export const admin = {
       update_command?: string
       checked_at?: string
     }>("/admin/system/update-check"),
-  getMigrations: () => get<{ migrations: { filename: string; applied_at: string }[] }>("/admin/system/migrations"),
 
   // ─── Releases (industry-standard bundle model) ───
   listReleases: (params?: {
@@ -452,7 +457,7 @@ export const admin = {
       `/admin/releases/${releaseId}/artifacts`,
       data,
     ),
-  finalizeArtifact: (releaseId: string, artifactId: string, data: { sha256: string }) =>
+  finalizeArtifact: (releaseId: string, artifactId: string, data: { expected_sha256?: string }) =>
     post<ReleaseArtifact>(`/admin/releases/${releaseId}/artifacts/${artifactId}/finalize`, data),
   deleteArtifact: (releaseId: string, artifactId: string) =>
     del(`/admin/releases/${releaseId}/artifacts/${artifactId}`),
@@ -511,6 +516,7 @@ export interface Plan {
   max_activations: number
   license_model?: string
   floating_timeout?: number
+  token_ttl_days?: number
   max_seats: number
   trial_days: number
   grace_days: number

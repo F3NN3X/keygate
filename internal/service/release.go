@@ -187,6 +187,29 @@ func AllowedPlatforms() []string {
 	return out
 }
 
+// platformAliases maps identifiers that updaters produce on their own
+// ({{target}}-{{arch}} in Tauri, uname-style arch names) onto the
+// canonical list. Public endpoints normalise before validating; the
+// admin side keeps canonical names only.
+var platformAliases = map[string]string{
+	"darwin-aarch64":  "darwin-arm64",
+	"darwin-x86_64":   "darwin-x64",
+	"windows-x86_64":  "windows-x64",
+	"windows-aarch64": "windows-arm64",
+	"linux-x86_64":    "linux-x64",
+	"linux-aarch64":   "linux-arm64",
+	"linux-armv7":     "linux-armhf",
+}
+
+// NormalizePlatform returns the canonical identifier for p, or p
+// unchanged when there is no alias (validation then rejects it).
+func NormalizePlatform(p string) string {
+	if canon, ok := platformAliases[strings.ToLower(p)]; ok {
+		return canon
+	}
+	return p
+}
+
 // IsValidPlatform reports whether p is in the canonical platform list.
 // Handler-side validation calls this so feed/download endpoints reject
 // unknown platforms with 400 before reaching the service layer.
@@ -204,6 +227,11 @@ func validatePlatform(p string) error {
 // validateVersion combines our regex with semver.IsValid for full
 // SemVer 2.0 compliance (rejects leading zeros etc.).
 func validateVersion(v string) error {
+	// Build metadata is ignored by semver ordering, so "1.2.3" and
+	// "1.2.3+7" would be two rows that clients cannot tell apart.
+	if strings.Contains(v, "+") {
+		return errors.New("build metadata (+...) is not allowed in release versions")
+	}
 	if !semverPattern.MatchString(v) {
 		return ErrReleaseInvalidVersion
 	}
@@ -228,6 +256,13 @@ func (s *ReleaseService) CreateRelease(ctx context.Context, in CreateReleaseInpu
 	}
 	if !model.IsValidReleaseChannel(in.Channel) {
 		return nil, apperr.New(400, "INVALID_CHANNEL", ErrReleaseInvalidChannel.Error())
+	}
+	// Channel is what clients subscribe to and the version's prerelease
+	// tag is what they display; letting "2.0.0-beta.1" ship on stable
+	// would make it the stable channel's latest by semver.
+	if in.Channel == model.ReleaseChannelStable && semver.Prerelease("v"+in.Version) != "" {
+		return nil, apperr.New(400, "INVALID_VERSION",
+			"prerelease versions cannot ship on the stable channel — use beta, alpha or dev")
 	}
 	if in.ProductID == "" {
 		return nil, apperr.New(400, "MISSING_PRODUCT", "product_id is required")
@@ -282,15 +317,7 @@ func (s *ReleaseService) AddArtifact(ctx context.Context, in AddArtifactInput) (
 		return nil, apperr.New(409, "RELEASE_NOT_DRAFT", "artifacts can only be added to draft releases")
 	}
 
-	prod, err := s.store.FindProductByID(ctx, rel.ProductID)
-	if err != nil {
-		return nil, apperr.Internal(err)
-	}
-	slug := prod.Slug
-	if slug == "" {
-		slug = prod.ID
-	}
-	fileKey := buildFileKey(slug, in.Platform, rel.Version, in.Filename)
+	fileKey := buildFileKey(rel.ProductID, in.Platform, rel.Version, in.Filename)
 
 	artifact := &model.ReleaseArtifact{
 		ReleaseID:   in.ReleaseID,
@@ -388,6 +415,11 @@ func (s *ReleaseService) FinalizeArtifact(ctx context.Context, in FinalizeArtifa
 	if contentType == "" {
 		contentType = a.ContentType
 	}
+	// The uploader controls the bucket's Content-Type and the column
+	// has a 128-char CHECK; fall back rather than 500 on a long value.
+	if len(contentType) > 128 {
+		contentType = "application/octet-stream"
+	}
 
 	if err := s.store.UpdateArtifactFile(ctx, a.ID, a.FileKey, info.Size, computed, contentType); err != nil {
 		switch {
@@ -474,6 +506,13 @@ func (s *ReleaseService) Publish(ctx context.Context, releaseID string) (*model.
 		}
 		return nil, apperr.Internal(err)
 	}
+	// Check the state before doing any work. The publish UPDATE below
+	// enforces draft too, but only after the sign loop has already
+	// rewritten every artifact's signature — which, after a key
+	// rotation, silently re-signed shipped releases with the new key.
+	if rel.Status != model.ReleaseStatusDraft {
+		return nil, apperr.New(409, "NOT_PUBLISHABLE", "release must be a draft")
+	}
 	if len(rel.Artifacts) == 0 {
 		return nil, apperr.New(409, "NO_ARTIFACTS", ErrReleaseNoArtifacts.Error())
 	}
@@ -515,11 +554,16 @@ func (s *ReleaseService) Publish(ctx context.Context, releaseID string) (*model.
 		return nil, apperr.Internal(err)
 	}
 	signRelease := false
+	var signKey *model.ReleaseSigningKey
 	if s.signer != nil {
-		_, err := s.signer.GetActivePublicKey(ctx, rel.ProductID)
+		// Resolve the key once and sign every artifact with it — a
+		// rotation landing mid-loop must not leave a release whose
+		// platforms carry signatures from two different keys.
+		key, err := s.signer.ActiveKey(ctx, rel.ProductID)
 		switch {
 		case err == nil:
 			signRelease = true
+			signKey = key
 		case errors.Is(err, ErrSigningKeyMissing), errors.Is(err, ErrSigningDisabled):
 			// No active key. RequireSigning decides whether this is fatal.
 		default:
@@ -531,9 +575,22 @@ func (s *ReleaseService) Publish(ctx context.Context, releaseID string) (*model.
 			"this product requires release signing — generate a signing key, "+
 				"or set require_signing=false to ship unsigned releases")
 	}
+	if !signRelease {
+		// Shipping unsigned (require_signing=false, no active key): drop
+		// any signature a previous attempt left behind, so the feed does
+		// not advertise a signature from a retired key that clients
+		// then fail to verify. Signatures are frozen at publish.
+		if err := s.store.ClearReleaseSignatures(ctx, releaseID); err != nil {
+			if errors.Is(err, store.ErrReleaseNotPublishable) {
+				// A concurrent publish got there first.
+				return nil, apperr.New(409, "NOT_PUBLISHABLE", "release must be a draft")
+			}
+			return nil, apperr.Internal(err)
+		}
+	}
 	if signRelease {
 		for _, a := range rel.Artifacts {
-			result, err := s.signer.SignArtifact(ctx, rel, a)
+			result, err := s.signer.SignArtifactWith(ctx, rel, a, signKey)
 			if err != nil {
 				switch {
 				case errors.Is(err, ErrSigningKeyMissing):
@@ -541,6 +598,9 @@ func (s *ReleaseService) Publish(ctx context.Context, releaseID string) (*model.
 					// Abort rather than half-sign the release.
 					return nil, apperr.New(409, "SIGNING_KEY_MISSING",
 						"active signing key disappeared during publish; retry")
+				case errors.Is(err, ErrArtifactContentChanged):
+					return nil, apperr.New(409, "ARTIFACT_MODIFIED",
+						fmt.Sprintf("artifact for platform %q does not match the sha256 recorded at finalize — if it was just re-uploaded, retry publish; otherwise re-upload and finalize it", a.Platform))
 				case errors.Is(err, ErrArtifactTooLargeToSign):
 					return nil, apperr.New(413, "ARTIFACT_TOO_LARGE",
 						fmt.Sprintf("artifact for platform %q exceeds the configured signing size limit", a.Platform))
@@ -554,6 +614,10 @@ func (s *ReleaseService) Publish(ctx context.Context, releaseID string) (*model.
 				}
 			}
 			if storeErr := s.store.UpdateArtifactSignature(ctx, a.ID, result.Signature, result.SigningKeyID); storeErr != nil {
+				if errors.Is(storeErr, store.ErrReleaseNotPublishable) {
+					// Another publish won while we were signing.
+					return nil, apperr.New(409, "NOT_PUBLISHABLE", "release must be a draft")
+				}
 				s.logger.Error("publish: store artifact signature failed",
 					"release_id", rel.ID, "artifact_id", a.ID, "error", storeErr)
 				return nil, apperr.Internal(storeErr)
@@ -566,7 +630,11 @@ func (s *ReleaseService) Publish(ctx context.Context, releaseID string) (*model.
 	// fresh ed25519_sig + signing_key_id, otherwise we'd be shipping
 	// a release that lost a signature to a concurrent re-upload
 	// between our sign loop and the publish UPDATE.
-	if err := s.store.PublishRelease(ctx, releaseID, signRelease); err != nil {
+	signKeyID := ""
+	if signKey != nil {
+		signKeyID = signKey.ID
+	}
+	if err := s.store.PublishRelease(ctx, releaseID, signRelease, signKeyID); err != nil {
 		switch {
 		case errors.Is(err, store.ErrReleaseNotFound):
 			return nil, apperr.New(404, "RELEASE_NOT_FOUND", "release not found")
@@ -575,9 +643,10 @@ func (s *ReleaseService) Publish(ctx context.Context, releaseID string) (*model.
 		case errors.Is(err, store.ErrReleaseArtifactsNotReady):
 			return nil, apperr.New(409, "ARTIFACTS_NOT_READY", ErrReleaseArtifactsNotReady.Error())
 		case errors.Is(err, store.ErrReleaseArtifactsNotSigned):
-			// A concurrent UpdateArtifactFile cleared a signature
-			// after we signed but before we committed publish. Tell
-			// the caller to retry: re-running publish will re-sign.
+			// A concurrent UpdateArtifactFile cleared a signature, or a
+			// concurrent publish signed with a different key, after we
+			// signed but before we committed. Retrying re-signs every
+			// artifact with one key.
 			return nil, apperr.New(409, "ARTIFACTS_NOT_SIGNED",
 				"a concurrent upload cleared one or more signatures; retry publish")
 		case errors.Is(err, store.ErrReleaseNotPublishable):
@@ -618,6 +687,25 @@ func (s *ReleaseService) Yank(ctx context.Context, releaseID, reason string) (*m
 
 // Unyank yanked → published.
 func (s *ReleaseService) Unyank(ctx context.Context, releaseID string) (*model.Release, error) {
+	// The product may have changed type while this release was yanked
+	// (the type change is allowed once every release is yanked).
+	// Restoring it would put a published release on a product whose
+	// feeds and downloads 404 — the state that guard exists to prevent.
+	rel, err := s.store.FindReleaseByID(ctx, releaseID)
+	if err != nil {
+		if errors.Is(err, store.ErrReleaseNotFound) {
+			return nil, apperr.New(404, "RELEASE_NOT_FOUND", "release not found")
+		}
+		return nil, apperr.Internal(err)
+	}
+	prod, err := s.store.FindProductByID(ctx, rel.ProductID)
+	if err != nil {
+		return nil, apperr.Internal(err)
+	}
+	if !model.ProductSupports(prod.Type, model.CapReleases) {
+		return nil, apperr.New(409, "INCOMPATIBLE_PRODUCT_TYPE",
+			"release management is not available for "+prod.Type+" products; change the product type back before unyanking")
+	}
 	if err := s.store.UnyankRelease(ctx, releaseID); err != nil {
 		switch {
 		case errors.Is(err, store.ErrReleaseNotFound):
@@ -628,7 +716,7 @@ func (s *ReleaseService) Unyank(ctx context.Context, releaseID string) (*model.R
 			return nil, apperr.Internal(err)
 		}
 	}
-	rel, err := s.store.FindReleaseByID(ctx, releaseID)
+	rel, err = s.store.FindReleaseByID(ctx, releaseID)
 	if err != nil {
 		return nil, apperr.Internal(err)
 	}
@@ -663,6 +751,7 @@ func (s *ReleaseService) DeleteDraft(ctx context.Context, releaseID string) erro
 // GenerateDownload returns a license-gated presigned GET URL for the
 // (release, platform) artifact matching the request.
 func (s *ReleaseService) GenerateDownload(ctx context.Context, in DownloadInput) (*DownloadResult, error) {
+	in.Platform = NormalizePlatform(in.Platform)
 	if err := validatePlatform(in.Platform); err != nil {
 		return nil, apperr.New(400, "INVALID_PLATFORM", err.Error())
 	}
@@ -884,14 +973,18 @@ func (s *ReleaseService) ListForFeed(ctx context.Context, productID, channel, pl
 
 // buildFileKey produces the storage path for an artifact.
 //
-//	releases/{product_slug}/{version}/{platform}{ext}
-func buildFileKey(productSlug, platform, version, originalFilename string) string {
+//	releases/{product_id}/{version}/{platform}{ext}
+//
+// The product ID, not the slug: slugs can be renamed and reused, and
+// a second product taking over an old slug would otherwise presign
+// PUTs (and deletes) onto the first product's published binaries.
+func buildFileKey(productID, platform, version, originalFilename string) string {
 	ext := normalizeExt(originalFilename)
 	if !validExtension(ext) {
 		ext = ""
 	}
 	return fmt.Sprintf("releases/%s/%s/%s%s",
-		safeKeyComponent(productSlug),
+		safeKeyComponent(productID),
 		safeKeyComponent(version),
 		safeKeyComponent(platform),
 		ext)

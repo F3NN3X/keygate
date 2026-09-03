@@ -213,6 +213,7 @@ func TestSignTokenClampsToLicenceDeadline(t *testing.T) {
 		status     string
 		validUntil *time.Time
 		graceDays  int
+		ttlDays    int // plan token_ttl_days; 0 = default
 		wantExp    time.Time
 		wantVun    bool
 	}{
@@ -242,6 +243,17 @@ func TestSignTokenClampsToLicenceDeadline(t *testing.T) {
 			validUntil: at(24 * time.Hour), graceDays: 7,
 			wantExp: now.Add(24 * time.Hour), wantVun: true,
 		},
+		{
+			// A plan can lengthen the check-in interval for clients
+			// that stay offline a long time.
+			name: "plan TTL replaces the default", validUntil: nil, graceDays: 7, ttlDays: 30,
+			wantExp: now.Add(30 * 24 * time.Hour), wantVun: false,
+		},
+		{
+			// ...but the licence deadline still wins over a long plan TTL.
+			name: "plan TTL is still clamped", validUntil: at(24 * time.Hour), graceDays: 2, ttlDays: 30,
+			wantExp: now.Add(72 * time.Hour), wantVun: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -253,7 +265,7 @@ func TestSignTokenClampsToLicenceDeadline(t *testing.T) {
 			lic := &model.License{
 				ID: "lic", ProductID: "prod", PlanID: "plan", Status: status,
 				ValidUntil: tt.validUntil,
-				Plan:       &model.Plan{GraceDays: tt.graceDays},
+				Plan:       &model.Plan{GraceDays: tt.graceDays, TokenTTLDays: tt.ttlDays},
 			}
 			raw, err := svc.signToken(lic, "device-1")
 			if err != nil {

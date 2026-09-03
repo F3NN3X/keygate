@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -89,6 +91,10 @@ var (
 	ErrArtifactTooLargeToSign = errors.New("artifact exceeds the configured signing size limit")
 	ErrSigningKeyMissing      = errors.New("product has no active signing key — generate one before signing")
 	ErrArtifactNotInStorage   = errors.New("artifact bytes not found in storage; upload may not be finalized")
+	// ErrArtifactContentChanged means the bytes in storage no longer hash
+	// to the sha256 pinned at finalize — someone replayed the presigned
+	// PUT. Signing them would put a valid signature on tampered content.
+	ErrArtifactContentChanged = errors.New("artifact bytes in storage do not match the finalized sha256")
 )
 
 // ─── Key generation ───
@@ -280,7 +286,31 @@ type SignResult struct {
 //
 // Pure Ed25519 requires the entire message in memory. For artifacts larger
 // than maxSignSize this returns ErrArtifactTooLargeToSign.
+// ActiveKey returns the product's active signing key row so a caller
+// can pin one key across several SignArtifactWith calls.
+func (s *ReleaseSigningService) ActiveKey(ctx context.Context, productID string) (*model.ReleaseSigningKey, error) {
+	if s == nil || s.aead == nil {
+		return nil, ErrSigningDisabled
+	}
+	keyRow, err := s.store.FindActiveSigningKey(ctx, productID)
+	if err != nil {
+		if errors.Is(err, store.ErrActiveSigningKeyMissing) {
+			return nil, ErrSigningKeyMissing
+		}
+		return nil, err
+	}
+	return keyRow, nil
+}
+
+// SignArtifact signs with whatever key is active right now.
 func (s *ReleaseSigningService) SignArtifact(ctx context.Context, rel *model.Release, a *model.ReleaseArtifact) (*SignResult, error) {
+	return s.SignArtifactWith(ctx, rel, a, nil)
+}
+
+// SignArtifactWith signs a with keyRow (nil = resolve the active key).
+// The bytes are re-hashed and checked against the sha256 pinned at
+// finalize before anything is signed.
+func (s *ReleaseSigningService) SignArtifactWith(ctx context.Context, rel *model.Release, a *model.ReleaseArtifact, keyRow *model.ReleaseSigningKey) (*SignResult, error) {
 	if s == nil || s.aead == nil {
 		return nil, ErrSigningDisabled
 	}
@@ -303,12 +333,11 @@ func (s *ReleaseSigningService) SignArtifact(ctx context.Context, rel *model.Rel
 		return nil, ctx.Err()
 	}
 
-	keyRow, err := s.store.FindActiveSigningKey(ctx, rel.ProductID)
-	if err != nil {
-		if errors.Is(err, store.ErrActiveSigningKeyMissing) {
-			return nil, ErrSigningKeyMissing
+	if keyRow == nil {
+		var err error
+		if keyRow, err = s.ActiveKey(ctx, rel.ProductID); err != nil {
+			return nil, err
 		}
-		return nil, err
 	}
 
 	seed, err := s.aead.Decrypt(keyRow.PrivateKeyEncrypted, []byte(rel.ProductID))
@@ -340,6 +369,12 @@ func (s *ReleaseSigningService) SignArtifact(ctx context.Context, rel *model.Rel
 	}
 	if int64(len(buf)) > s.maxSignSize {
 		return nil, fmt.Errorf("%w (read=%d, limit=%d)", ErrArtifactTooLargeToSign, len(buf), s.maxSignSize)
+	}
+	if a.SHA256 != "" {
+		sum := sha256.Sum256(buf)
+		if hex.EncodeToString(sum[:]) != a.SHA256 {
+			return nil, ErrArtifactContentChanged
+		}
 	}
 
 	sig := ed25519.Sign(priv, buf)

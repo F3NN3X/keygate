@@ -1,6 +1,9 @@
 package handler
 
 import (
+	"errors"
+	"net/http"
+
 	"github.com/gin-gonic/gin"
 
 	"github.com/tabloy/keygate/internal/model"
@@ -56,6 +59,10 @@ func (h *WebhookAdminHandler) CreateWebhook(c *gin.Context) {
 		response.BadRequest(c, err.Message)
 		return
 	}
+	if err := h.Webhook.ValidateTarget(req.URL); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
 	if len(req.Events) == 0 {
 		response.BadRequest(c, "at least one event type is required")
 		return
@@ -108,6 +115,10 @@ func (h *WebhookAdminHandler) UpdateWebhook(c *gin.Context) {
 	if req.URL != nil {
 		if err := apperr.ValidateURL(*req.URL); err != nil {
 			response.BadRequest(c, err.Message)
+			return
+		}
+		if err := h.Webhook.ValidateTarget(*req.URL); err != nil {
+			response.BadRequest(c, err.Error())
 			return
 		}
 		w.URL = *req.URL
@@ -250,8 +261,19 @@ func (h *WebhookAdminHandler) TestWebhook(c *gin.Context) {
 	if !ok {
 		return
 	}
-	h.Webhook.Dispatch(c, w.ProductID, "webhook.test", map[string]any{
-		"webhook_id": w.ID, "message": "This is a test delivery from Keygate.",
+	d, err := h.Webhook.DeliverTest(c, w)
+	if err != nil {
+		if errors.Is(err, service.ErrWebhookInactive) {
+			response.Err(c, http.StatusConflict, "WEBHOOK_INACTIVE", "enable the webhook before testing it")
+			return
+		}
+		response.Internal(c)
+		return
+	}
+	response.OK(c, gin.H{
+		"status":        d.Status, // delivered | pending (retry scheduled) | failed
+		"delivery_id":   d.ID,
+		"response_code": d.ResponseCode,
+		"response_body": d.ResponseBody,
 	})
-	response.OK(c, gin.H{"status": "test dispatched"})
 }

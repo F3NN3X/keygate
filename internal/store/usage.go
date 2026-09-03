@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/tabloy/keygate/internal/model"
@@ -36,6 +38,9 @@ func (s *Store) IncrementUsageCounter(ctx context.Context, licenseID, feature, p
 	return s.GetUsageCounter(ctx, licenseID, feature, period, periodKey)
 }
 
+// ErrUsageQuantityTooLarge means the increment would overflow the counter.
+var ErrUsageQuantityTooLarge = errors.New("usage quantity too large")
+
 // IncrementUsageCounterWithLimit atomically increments the counter only if the new value
 // would not exceed the limit. Returns the updated counter and whether the increment was accepted.
 // Uses SELECT FOR UPDATE to prevent race conditions where concurrent requests could both
@@ -66,6 +71,12 @@ func (s *Store) IncrementUsageCounterWithLimit(ctx context.Context, licenseID, f
 		return nil, false, err
 	}
 
+	// currentUsed+quantity must not wrap: a huge quantity would go
+	// negative, sail past the limit check and then blow up the BIGINT
+	// in the UPDATE below.
+	if quantity > math.MaxInt64-currentUsed {
+		return nil, false, ErrUsageQuantityTooLarge
+	}
 	if limit > 0 && currentUsed+quantity > limit {
 		c := &model.UsageCounter{
 			LicenseID: licenseID,
