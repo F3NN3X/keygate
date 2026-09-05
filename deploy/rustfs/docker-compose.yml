@@ -1,0 +1,54 @@
+# RustFS — S3-compatible object storage for DeckShot release artifacts.
+#
+# A SEPARATE Dokploy application from keygate, deliberately. keygate reaches it over its public
+# hostname rather than the internal network, because presigned URLs bind the host into the SigV4
+# signature: a URL signed for `rustfs:9000` cannot be served from `s3.deckshot.app`, and keygate
+# reads STORAGE_PUBLIC_URL into config without ever using it, so there is no rewrite step. One
+# public endpoint for both the server-side calls and the browser's presigned upload/download is
+# the only arrangement that works — and it leaves storage's lifecycle independent of keygate's.
+#
+# What this needs before it will come up:
+#   1. A DNS record for the S3 domain pointing at this host.
+#   2. RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY set in Dokploy. Generate: openssl rand -hex 20
+#   3. A bucket. RustFS creates none on its own — see the runbook for the one-shot command.
+
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    # No published host port: Traefik reaches it over dokploy-network and terminates TLS.
+    expose:
+      - "9000"
+    environment:
+      # Single-node, single volume. The upstream sample uses four directories for erasure coding
+      # across disks; there is one disk here, so four would buy bookkeeping and no redundancy.
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      # The console is NOT routed publicly. It is an admin UI over the whole store, and the bucket
+      # it exists to create is a single command through the S3 API instead.
+      RUSTFS_CONSOLE_ENABLE: "false"
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?Set RUSTFS_ACCESS_KEY in Dokploy env}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?Set RUSTFS_SECRET_KEY in Dokploy env}
+    volumes:
+      # Named volumes, not bind mounts: the image runs as uid/gid 10001 and a host directory owned
+      # by root makes it fail at startup.
+      - rustfs-data:/data
+      - rustfs-logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    networks:
+      - default
+      - dokploy-network
+
+volumes:
+  rustfs-data:
+  rustfs-logs:
+
+networks:
+  # Dokploy creates this; Traefik lives here and routes the S3 domain to this container.
+  dokploy-network:
+    external: true
