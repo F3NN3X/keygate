@@ -31,6 +31,23 @@ services:
       WEBHOOK_ALLOW_PRIVATE: ${WEBHOOK_ALLOW_PRIVATE:-false}
       # Lifetime of artifact URLs inside public update feeds.
       STORAGE_FEED_URL_TTL: ${STORAGE_FEED_URL_TTL:-24h}
+      # Object storage for release artifacts (S3-compatible: R2, B2, MinIO, S3).
+      # RELEASE SIGNING NEEDS THESE. main.go only builds the signing service when
+      # IsStorageEnabled() is true — bucket + access key + secret key all non-empty — so without
+      # them the admin UI reports "RELEASE_KEY_ENCRYPTION_KEY missing" even when that key is set
+      # and working. STORAGE_ENDPOINT is required for anything that isn't AWS S3.
+      STORAGE_ENDPOINT: ${STORAGE_ENDPOINT:-}
+      STORAGE_REGION: ${STORAGE_REGION:-auto}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-}
+      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-}
+      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-}
+      # Where downloads are served from, when the bucket has a public domain in front of it.
+      STORAGE_PUBLIC_URL: ${STORAGE_PUBLIC_URL:-}
+      # MinIO and some self-hosted gateways need path-style addressing rather than virtual-host.
+      STORAGE_FORCE_PATH_STYLE: ${STORAGE_FORCE_PATH_STYLE:-false}
+      STORAGE_UPLOAD_TTL: ${STORAGE_UPLOAD_TTL:-1h}
+      STORAGE_DOWNLOAD_TTL: ${STORAGE_DOWNLOAD_TTL:-10m}
+      MAX_RELEASE_SIGN_SIZE_MB: ${MAX_RELEASE_SIGN_SIZE_MB:-500}
     depends_on:
       postgres:
         condition: service_healthy
