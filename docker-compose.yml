@@ -33,9 +33,9 @@ services:
       STORAGE_FEED_URL_TTL: ${STORAGE_FEED_URL_TTL:-24h}
       # Object storage for release artifacts (S3-compatible: R2, B2, MinIO, S3).
       # RELEASE SIGNING NEEDS THESE. main.go only builds the signing service when
-      # IsStorageEnabled() is true — bucket + access key + secret key all non-empty — so without
-      # them the admin UI reports "RELEASE_KEY_ENCRYPTION_KEY missing" even when that key is set
-      # and working. STORAGE_ENDPOINT is required for anything that isn't AWS S3.
+      # IsStorageEnabled() is true — bucket + access key + secret key all non-empty — so signing
+      # stays off until they are set, however good RELEASE_KEY_ENCRYPTION_KEY is.
+      # STORAGE_ENDPOINT is required for anything that isn't AWS S3.
       STORAGE_ENDPOINT: ${STORAGE_ENDPOINT:-}
       STORAGE_REGION: ${STORAGE_REGION:-auto}
       STORAGE_BUCKET: ${STORAGE_BUCKET:-}
