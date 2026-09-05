@@ -120,11 +120,15 @@ export default function WebhooksPage() {
   })
   const testMut = useMutation({
     mutationFn: (id: string) => admin.testWebhook(id),
-    onSuccess: () => {
-      // Surface feedback — without a toast the only signal was the
-      // button's brief disabled flicker, which read as "did anything
-      // happen?" especially when the receiver is slow.
-      showToast(t("webhooks.testQueued"), "success")
+    onSuccess: (res) => {
+      // The server waits for the receiver, so this is the real result,
+      // not "queued".
+      if (res.status === "delivered") {
+        showToast(t("webhooks.testDelivered", { code: res.response_code }), "success")
+      } else {
+        const detail = res.response_code ? `HTTP ${res.response_code}` : res.response_body || t("webhooks.testFailed")
+        showToast(t("webhooks.testFailedWith", { detail }), "error")
+      }
       qc.invalidateQueries({ queryKey: ["admin", "webhook-deliveries"] })
     },
     onError: (err: Error) => {

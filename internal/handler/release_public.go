@@ -41,6 +41,7 @@ type ReleasePublicHandler struct {
 	logger      *slog.Logger
 	baseURL     string
 	downloadTTL time.Duration
+	feedTTL     time.Duration
 }
 
 type ReleasePublicConfig struct {
@@ -50,6 +51,11 @@ type ReleasePublicConfig struct {
 	Logger      *slog.Logger
 	BaseURL     string
 	DownloadTTL time.Duration
+	// FeedTTL is the lifetime of enclosure URLs inside public feeds.
+	// Sparkle shows the appcast and the user may click Install much
+	// later, so this is deliberately long; the licence-gated
+	// /license/download keeps the short DownloadTTL.
+	FeedTTL time.Duration
 }
 
 func NewReleasePublicHandler(c ReleasePublicConfig) *ReleasePublicHandler {
@@ -62,6 +68,9 @@ func NewReleasePublicHandler(c ReleasePublicConfig) *ReleasePublicHandler {
 	if c.DownloadTTL <= 0 {
 		c.DownloadTTL = 10 * time.Minute
 	}
+	if c.FeedTTL <= 0 {
+		c.FeedTTL = 24 * time.Hour
+	}
 	return &ReleasePublicHandler{
 		svc:         c.Service,
 		store:       c.Store,
@@ -69,6 +78,7 @@ func NewReleasePublicHandler(c ReleasePublicConfig) *ReleasePublicHandler {
 		logger:      c.Logger,
 		baseURL:     c.BaseURL,
 		downloadTTL: c.DownloadTTL,
+		feedTTL:     c.FeedTTL,
 	}
 }
 
@@ -136,7 +146,7 @@ func (h *ReleasePublicHandler) parseFeedRequest(c *gin.Context) (req feedRequest
 		return
 	}
 
-	platform := c.Query("platform")
+	platform := service.NormalizePlatform(c.Query("platform"))
 	if platform == "" {
 		response.BadRequest(c, "platform is required")
 		return
@@ -196,7 +206,7 @@ func (h *ReleasePublicHandler) fetchPublishedFeedReleases(c *gin.Context, req fe
 			continue
 		}
 		url, err := h.storage.PresignedGet(c.Request.Context(), artifact.FileKey,
-			service.DownloadFilename(rel, artifact), h.downloadTTL)
+			service.DownloadFilename(rel, artifact), h.feedTTL)
 		if err != nil {
 			if errors.Is(err, storage.ErrStorageDisabled) {
 				response.Err(c, http.StatusServiceUnavailable, "STORAGE_DISABLED",
@@ -300,17 +310,11 @@ func (h *ReleasePublicHandler) FeedTauri(c *gin.Context) {
 	}
 	manifest := service.BuildTauri(h.feedInput(req, feedReleases))
 	if manifest.Version == "" {
-		// Even with no published release we want the policy fields to
-		// reach the client so it can enforce minimum_supported_version.
-		if req.product.MinimumSupportedVersion != "" {
-			h.writeFeedCacheHeaders(c, req.channel)
-			c.JSON(http.StatusOK, gin.H{
-				"version":                   "",
-				"minimum_supported_version": req.product.MinimumSupportedVersion,
-				"minimum_supported_message": req.product.MinimumSupportedMessage,
-			})
-			return
-		}
+		// 204 is Tauri's "no update" signal. A 200 with version "" used
+		// to be sent here to carry minimum_supported_version, but the
+		// updater parses version as semver and errors out on "" — and
+		// with nothing to update to there is nothing for the floor to
+		// gate anyway.
 		c.Status(http.StatusNoContent)
 		return
 	}

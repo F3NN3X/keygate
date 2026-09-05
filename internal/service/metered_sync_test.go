@@ -52,6 +52,15 @@ func setupMeteredTest(t *testing.T) (*meteredTestSetup, context.Context) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
+	// These tests assert exact push counts against a fake Stripe, so
+	// the queue must start empty. Rows left behind by e2e runs (the
+	// dev server pushes to real Stripe test mode and gets killed
+	// mid-queue) would otherwise be pushed too. TEST_DATABASE_URL is a
+	// disposable database by contract.
+	if _, err := s.DB.NewRaw("DELETE FROM metered_billing WHERE synced = false").Exec(context.Background()); err != nil {
+		t.Fatalf("clear metered queue: %v", err)
+	}
+
 	setup := &meteredTestSetup{store: s}
 	setup.syncer = &MeteredBillingSyncer{
 		store:       s,
@@ -285,5 +294,30 @@ func TestMeteredSync_LegacyEmptyIdentifier(t *testing.T) {
 	}
 	if len(tt.captured) != 0 {
 		t.Fatal("dispatcher must not be called for legacy rows")
+	}
+}
+
+// A row that has exhausted its attempts must not occupy a slot in the
+// batch: with created_at ordering, enough dead rows would starve every
+// live one behind them.
+func TestMeteredSync_DeadRowsDoNotStarveTheBatch(t *testing.T) {
+	tt, ctx := setupMeteredTest(t)
+	lic, _ := seedMeteredLicense(t, tt.store, ctx, "api_calls_meter", "cus_TEST_dead")
+
+	// Two dead rows first (attempts at the ceiling), then one live row.
+	for i := 0; i < 2; i++ {
+		if err := tt.store.InsertMeteredEvent(ctx, lic.ID, "api_calls", "2026-01", 1); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+	if _, err := tt.store.DB.NewRaw("UPDATE metered_billing SET attempts = ? WHERE license_id = ? AND synced = false", tt.syncer.maxAttempts, lic.ID).Exec(ctx); err != nil {
+		t.Fatalf("age rows: %v", err)
+	}
+	if err := tt.store.InsertMeteredEvent(ctx, lic.ID, "api_calls", "2026-02", 5); err != nil {
+		t.Fatalf("insert live: %v", err)
+	}
+
+	if pushed := tt.syncer.RunOnce(ctx, 2); pushed != 1 {
+		t.Fatalf("limit 2 with 2 dead rows ahead: pushed %d, want 1 (the live row)", pushed)
 	}
 }

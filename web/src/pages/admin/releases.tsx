@@ -675,6 +675,11 @@ function ArtifactRow({
       <span className="text-muted-foreground text-xs flex-1 truncate">
         {ready ? `${formatBytes(artifact.file_size)} · sha256:${artifact.sha256.slice(0, 12)}…` : "Not uploaded yet"}
       </span>
+      {ready && artifact.ed25519_sig && (
+        <Badge variant="outline" className="text-[10px]" title={artifact.signing_key_id}>
+          signed
+        </Badge>
+      )}
       {ready ? (
         <Badge className="bg-emerald-100 text-emerald-800 text-[10px]">ready</Badge>
       ) : (
@@ -702,6 +707,7 @@ function AddArtifactDialog({
   onClose: () => void
   onAdded: () => void
 }) {
+  const qc = useQueryClient()
   const [platform, setPlatform] = useState(availablePlatforms[0] || "")
   const [file, setFile] = useState<File | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -745,8 +751,11 @@ function AddArtifactDialog({
       }
 
       setProgress("finalizing")
-      const sha256 = await sha256Hex(file)
-      await admin.finalizeArtifact(release.id, init.artifact.id, { sha256 })
+      // The server hashes the object itself; the client hash is only a
+      // cross-check, and reading a multi-GB installer into memory to
+      // compute it fails in most browsers.
+      const expected_sha256 = file.size <= CLIENT_HASH_MAX_BYTES ? await sha256Hex(file) : undefined
+      await admin.finalizeArtifact(release.id, init.artifact.id, { expected_sha256 })
 
       showToast(`Artifact for ${platform} uploaded`, "success")
       onAdded()
@@ -754,6 +763,9 @@ function AddArtifactDialog({
       const msg = e instanceof Error ? e.message : String(e)
       setError(msg)
       setProgress("idle")
+      // The artifact row may already exist (pending) even though the
+      // upload failed; refresh so it shows and a retry doesn't hit 409.
+      qc.invalidateQueries({ queryKey: ["admin", "release", release.id] })
     }
   }
 
@@ -875,6 +887,8 @@ function formatBytes(n: number): string {
   if (n >= 1024) return `${(n / 1024).toFixed(1)} KB`
   return `${n} B`
 }
+
+const CLIENT_HASH_MAX_BYTES = 256 * 1024 * 1024
 
 async function sha256Hex(file: File): Promise<string> {
   const buf = await file.arrayBuffer()
@@ -1041,7 +1055,8 @@ function SigningKeysSection({ productId }: { productId: string }) {
             <KeyRound className="h-10 w-10 mx-auto text-muted-foreground mb-3" />
             <p className="font-medium">No active signing key</p>
             <p className="text-sm text-muted-foreground mb-4">
-              Releases for this product will be unsigned until you generate a key.
+              Publishing is blocked until you generate a key (or turn off require_signing on the product to ship
+              unsigned releases).
             </p>
             <Button onClick={() => generateMut.mutate()} disabled={generateMut.isPending}>
               <Plus className="h-4 w-4 mr-2" />
@@ -1212,8 +1227,9 @@ function DeactivateKeyDialog({ productId, onClose }: { productId: string; onClos
         <DialogHeader>
           <DialogTitle>Deactivate signing key?</DialogTitle>
           <DialogDescription>
-            Future releases will be UNSIGNED until you generate a new key. Sparkle / Tauri / Velopack clients with
-            strict signature checking will reject unsigned updates.
+            Already-published releases keep their signatures. New releases cannot be published until you generate a new
+            key, unless require_signing is off for the product — then they ship unsigned and clients with strict
+            signature checking will reject them.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-2 py-2">

@@ -43,7 +43,7 @@ func TestPublishRelease_RequireSignatures_Gate(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			relID, artID := setupSignedDraft(t, s, ctx, tc.setSignature)
-			err := s.PublishRelease(ctx, relID, tc.require)
+			err := s.PublishRelease(ctx, relID, tc.require, "")
 			if tc.wantErrSentinel != nil {
 				if !errors.Is(err, tc.wantErrSentinel) {
 					t.Fatalf("expected %v, got %v", tc.wantErrSentinel, err)
@@ -94,7 +94,7 @@ func TestPublishRelease_RaceUpdateArtifactFile(t *testing.T) {
 		// Goroutine A: publish with requireSignatures=true.
 		go func() {
 			defer wg.Done()
-			publishErr = s.PublishRelease(ctx, relID, true)
+			publishErr = s.PublishRelease(ctx, relID, true, "")
 		}()
 
 		// Goroutine B: concurrent re-upload, clears ed25519_sig.

@@ -229,16 +229,19 @@ type Plan struct {
 	// stored as the column default (e.g. 3). The DB column keeps its
 	// CREATE-TABLE default for legacy data, but the handler is now the
 	// sole source of truth for these values.
-	MaxActivations  int       `bun:",notnull" json:"max_activations"`
-	TrialDays       int       `bun:",notnull" json:"trial_days"`
-	GraceDays       int       `bun:",notnull" json:"grace_days"`
-	StripePriceID   string    `json:"stripe_price_id,omitempty"`
-	LicenseModel    string    `bun:",notnull" json:"license_model"` // standard | floating
-	FloatingTimeout int       `bun:",notnull" json:"floating_timeout"`
-	MaxSeats        int       `bun:",notnull" json:"max_seats"`
-	Active          bool      `bun:",notnull,default:true" json:"active"`
-	SortOrder       int       `bun:",default:0" json:"sort_order"`
-	CreatedAt       time.Time `bun:",nullzero,default:now()" json:"created_at"`
+	MaxActivations  int    `bun:",notnull" json:"max_activations"`
+	TrialDays       int    `bun:",notnull" json:"trial_days"`
+	GraceDays       int    `bun:",notnull" json:"grace_days"`
+	StripePriceID   string `json:"stripe_price_id,omitempty"`
+	LicenseModel    string `bun:",notnull" json:"license_model"` // standard | floating
+	FloatingTimeout int    `bun:",notnull" json:"floating_timeout"`
+	// TokenTTLDays is how long a signed token may be used offline
+	// before the client must verify again. 0 = server default.
+	TokenTTLDays int       `bun:",notnull" json:"token_ttl_days"`
+	MaxSeats     int       `bun:",notnull" json:"max_seats"`
+	Active       bool      `bun:",notnull,default:true" json:"active"`
+	SortOrder    int       `bun:",default:0" json:"sort_order"`
+	CreatedAt    time.Time `bun:",nullzero,default:now()" json:"created_at"`
 
 	Product      *Product       `bun:"rel:belongs-to,join:product_id=id" json:"product,omitempty"`
 	Entitlements []*Entitlement `bun:"rel:has-many,join:id=plan_id" json:"entitlements,omitempty"`

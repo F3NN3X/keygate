@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { ArrowUpCircle, Check, Database, Mail, RefreshCw, Send, Shield, Trash2, UserPlus } from "lucide-react"
+import { ArrowUpCircle, Check, Mail, RefreshCw, Send, Shield, Trash2, UserPlus } from "lucide-react"
 import { useEffect, useState } from "react"
 import {
   AlertDialog,
@@ -22,7 +22,6 @@ import { useAuth } from "@/hooks/use-auth"
 import { useI18n } from "@/i18n"
 import type { User } from "@/lib/api"
 import { admin } from "@/lib/api"
-import { formatDate } from "@/lib/utils"
 import EmailTemplatesManager from "@/pages/admin/email-templates"
 
 const TIMEZONES = [
@@ -69,11 +68,6 @@ const FORM_KEYS = [
   "signup_mode",
   "brand_color",
   "logo_url",
-  "smtp_host",
-  "smtp_port",
-  "smtp_username",
-  "smtp_password",
-  "smtp_from",
   "rate_limit_api",
   "rate_limit_admin",
   "webhook_max_attempts",
@@ -114,16 +108,6 @@ export default function SettingsPage() {
     mutationFn: admin.sendTestEmail,
   })
 
-  // Blanking the field means "keep the stored password" — removing one
-  // has to say so explicitly.
-  const clearSecretMut = useMutation({
-    mutationFn: (key: string) => admin.clearSecretSetting(key),
-    onSuccess: () => {
-      setForm((f) => ({ ...f, smtp_password: "" }))
-      qc.invalidateQueries({ queryKey: ["admin", "settings"] })
-    },
-  })
-
   const { data: versionData } = useQuery({
     queryKey: ["admin", "version"],
     queryFn: admin.getVersion,
@@ -137,11 +121,6 @@ export default function SettingsPage() {
     queryKey: ["admin", "update-check"],
     queryFn: admin.checkUpdate,
     staleTime: 60 * 60 * 1000, // cache 1 hour
-  })
-
-  const { data: migrationsData } = useQuery({
-    queryKey: ["admin", "migrations"],
-    queryFn: admin.getMigrations,
   })
 
   const set = (key: FormKey, value: string) => setForm((f) => ({ ...f, [key]: value }))
@@ -281,62 +260,25 @@ export default function SettingsPage() {
               <CardTitle className="text-base">{t("settings.email")}</CardTitle>
             </CardHeader>
             <CardContent className="space-y-6">
-              <div className="grid grid-cols-2 gap-6">
-                <div className="space-y-2">
-                  <Label>{t("settings.smtpHost")}</Label>
-                  <Input
-                    value={form.smtp_host || ""}
-                    onChange={(e) => set("smtp_host", e.target.value)}
-                    placeholder="smtp.example.com"
-                  />
+              {/* SMTP is env-only (SMTP_HOST, SMTP_PORT, SMTP_USERNAME,
+                  SMTP_PASSWORD, SMTP_FROM). The dashboard just reports
+                  what the server is using. */}
+              {data?.email?.configured ? (
+                <div className="space-y-2 text-sm">
+                  <p className="flex items-center gap-2 text-emerald-600">
+                    <Check className="h-4 w-4" /> {t("settings.emailConfigured")}
+                  </p>
+                  <dl className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-1 text-muted-foreground">
+                    <dt>{t("settings.emailHost")}</dt>
+                    <dd className="font-mono text-foreground">{data.email.host}</dd>
+                    <dt>{t("settings.emailFrom")}</dt>
+                    <dd className="font-mono text-foreground">{data.email.from}</dd>
+                  </dl>
                 </div>
-                <div className="space-y-2">
-                  <Label>{t("settings.smtpPort")}</Label>
-                  <Input
-                    value={form.smtp_port || ""}
-                    onChange={(e) => set("smtp_port", e.target.value)}
-                    placeholder="587"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label>{t("settings.smtpUsername")}</Label>
-                  <Input value={form.smtp_username || ""} onChange={(e) => set("smtp_username", e.target.value)} />
-                </div>
-                <div className="space-y-2">
-                  <Label>{t("settings.smtpPassword")}</Label>
-                  {/* Never sent back by the API. Blank means "keep the
-                      stored one" — see settingsSecret on the server. */}
-                  <div className="flex items-center gap-2">
-                    <Input
-                      type="password"
-                      value={form.smtp_password || ""}
-                      onChange={(e) => set("smtp_password", e.target.value)}
-                      placeholder={data?.secrets_set?.smtp_password ? t("settings.smtpPasswordStored") : ""}
-                    />
-                    {data?.secrets_set?.smtp_password && (
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="shrink-0"
-                        disabled={clearSecretMut.isPending}
-                        onClick={() => clearSecretMut.mutate("smtp_password")}
-                      >
-                        {t("settings.smtpPasswordClear")}
-                      </Button>
-                    )}
-                  </div>
-                </div>
-                <div className="space-y-2 col-span-2">
-                  <Label>{t("settings.smtpFrom")}</Label>
-                  <Input
-                    type="email"
-                    value={form.smtp_from || ""}
-                    onChange={(e) => set("smtp_from", e.target.value)}
-                    placeholder="noreply@example.com"
-                  />
-                  <p className="text-xs text-muted-foreground">{t("settings.smtpFromDesc")}</p>
-                </div>
-              </div>
+              ) : (
+                <p className="text-sm text-muted-foreground">{t("settings.emailNotConfigured")}</p>
+              )}
+              <p className="text-xs text-muted-foreground">{t("settings.emailEnvHint")}</p>
               <div className="flex items-center gap-4 pt-2">
                 <Button variant="outline" onClick={() => testEmailMut.mutate()} disabled={testEmailMut.isPending}>
                   <Send className="h-4 w-4 mr-2" />
@@ -510,33 +452,6 @@ export default function SettingsPage() {
                     {updateData.changelog}
                   </pre>
                 </div>
-              )}
-            </CardContent>
-          </Card>
-
-          {/* Database Migrations */}
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base flex items-center gap-2">
-                <Database className="h-4 w-4" />
-                {t("settings.migrations")}
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              {migrationsData?.migrations && migrationsData.migrations.length > 0 ? (
-                <div className="space-y-1">
-                  {migrationsData.migrations.map((m) => (
-                    <div
-                      key={m.filename}
-                      className="flex items-center justify-between text-sm py-1.5 border-b last:border-0"
-                    >
-                      <code className="text-xs">{m.filename}</code>
-                      <span className="text-xs text-muted-foreground">{formatDate(m.applied_at)}</span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-sm text-muted-foreground">{t("common.noData")}</p>
               )}
             </CardContent>
           </Card>

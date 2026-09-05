@@ -107,7 +107,7 @@ func (m *MeteredBillingSyncer) RunOnce(ctx context.Context, limit int) (pushed i
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := m.store.ListUnsyncedMetered(ctx, limit)
+	rows, err := m.store.ListUnsyncedMetered(ctx, limit, m.maxAttempts)
 	if err != nil {
 		m.logger.Error("metered: list unsynced failed", "error", err)
 		return 0

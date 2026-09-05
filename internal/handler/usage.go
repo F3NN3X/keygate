@@ -26,6 +26,12 @@ func (h *UsageHandler) RecordUsage(c *gin.Context) {
 		response.BadRequest(c, "license_key and feature are required")
 		return
 	}
+	// 0 (omitted) means one unit; a negative number is a client bug,
+	// not a refund — silently counting it as 1 would hide that.
+	if req.Quantity < 0 {
+		response.BadRequest(c, "quantity cannot be negative")
+		return
+	}
 
 	productID, _ := c.Get("product_id")
 	result, err := h.svc.RecordUsage(c.Request.Context(), service.RecordUsageInput{

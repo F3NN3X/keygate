@@ -33,7 +33,6 @@ func TestSettingsMapsAreConsistent(t *testing.T) {
 func TestGetSettingsOutputIsWritableBack(t *testing.T) {
 	stored := map[string]string{
 		"site_name":                  "Acme",
-		"smtp_password":              "hunter2",
 		"stripe_webhook_secret":      "whsec_live",
 		"stripe_webhook_endpoint_id": "we_1",
 	}
@@ -47,7 +46,7 @@ func TestGetSettingsOutputIsWritableBack(t *testing.T) {
 		}
 	}
 
-	for _, key := range []string{"smtp_password", "stripe_webhook_secret", "stripe_webhook_endpoint_id"} {
+	for _, key := range []string{"stripe_webhook_secret", "stripe_webhook_endpoint_id"} {
 		if !settingsSecret[key] && !settingsServerOwned[key] {
 			t.Errorf("%q must never be returned by GetSettings", key)
 		}

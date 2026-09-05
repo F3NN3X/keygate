@@ -43,9 +43,10 @@ type FeedInput struct {
 	Releases    []*FeedRelease
 
 	// MinimumSupportedVersion: optional product-level version floor.
-	// Embedded in formats that allow extension (Tauri). Sparkle's strict
-	// XML schema and Velopack's array shape don't carry it; clients on
-	// those formats consult the dedicated policy endpoint.
+	// Only the Tauri-style JSON feed carries it (that format tolerates
+	// extra fields). Sparkle's XML schema and Velopack's array shape
+	// have no place for it, so clients on those formats never see the
+	// floor — the server does not enforce it either.
 	MinimumSupportedVersion string
 	MinimumSupportedMessage string
 }

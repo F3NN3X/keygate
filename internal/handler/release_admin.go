@@ -142,7 +142,7 @@ func (h *ReleaseAdminHandler) AddArtifact(c *gin.Context) {
 		response.BadRequest(c, "filename too long")
 		return
 	}
-	if len(req.ContentType) > 256 {
+	if len(req.ContentType) > 128 {
 		response.BadRequest(c, "content_type too long")
 		return
 	}

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strconv"
 
@@ -78,6 +79,9 @@ func (s *UsageService) RecordUsage(ctx context.Context, in RecordUsageInput) (*R
 	// Atomically check limit and increment in a single transaction to prevent race conditions.
 	// This ensures two concurrent requests cannot both pass the limit check.
 	updated, accepted, err := s.store.IncrementUsageCounterWithLimit(ctx, lic.ID, in.Feature, period, periodKey, in.Quantity, limit)
+	if errors.Is(err, store.ErrUsageQuantityTooLarge) {
+		return nil, apperr.New(400, "INVALID_INPUT", "quantity too large")
+	}
 	if err != nil {
 		return nil, apperr.Internal(err)
 	}
