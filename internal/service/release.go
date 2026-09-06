@@ -613,7 +613,7 @@ func (s *ReleaseService) Publish(ctx context.Context, releaseID string) (*model.
 					return nil, apperr.Internal(err)
 				}
 			}
-			if storeErr := s.store.UpdateArtifactSignature(ctx, a.ID, result.Signature, result.SigningKeyID); storeErr != nil {
+			if storeErr := s.store.UpdateArtifactSignature(ctx, a.ID, result.Signature, result.GlobalSignature, result.SigningKeyID); storeErr != nil {
 				if errors.Is(storeErr, store.ErrReleaseNotPublishable) {
 					// Another publish won while we were signing.
 					return nil, apperr.New(409, "NOT_PUBLISHABLE", "release must be a draft")

@@ -34,7 +34,7 @@ func TestPublishRelease_PinsSigningKeyAndFreezesSignatures(t *testing.T) {
 
 	// The slower publisher now tries to write its signature onto the
 	// shipped release.
-	if err := s.UpdateArtifactSignature(ctx, artID, "late-sig", keyID); !errors.Is(err, store.ErrReleaseNotPublishable) {
+	if err := s.UpdateArtifactSignature(ctx, artID, "late-sig", "late-global", keyID); !errors.Is(err, store.ErrReleaseNotPublishable) {
 		t.Fatalf("signature write on a published release: got %v, want ErrReleaseNotPublishable", err)
 	}
 	var sigAfter string
@@ -44,7 +44,7 @@ func TestPublishRelease_PinsSigningKeyAndFreezesSignatures(t *testing.T) {
 	if sigAfter != sigBefore {
 		t.Fatalf("shipped signature changed: %q -> %q", sigBefore, sigAfter)
 	}
-	if err := s.UpdateArtifactSignature(ctx, "no-such-artifact", "x", keyID); !errors.Is(err, store.ErrArtifactNotFound) {
+	if err := s.UpdateArtifactSignature(ctx, "no-such-artifact", "x", "g", keyID); !errors.Is(err, store.ErrArtifactNotFound) {
 		t.Fatalf("unknown artifact: got %v, want ErrArtifactNotFound", err)
 	}
 }
@@ -110,7 +110,7 @@ func TestUpdateArtifactSignature_WaitsForInFlightPublish(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- s.UpdateArtifactSignature(ctx, artID, "late-sig", keyID) }()
+	go func() { done <- s.UpdateArtifactSignature(ctx, artID, "late-sig", "late-global", keyID) }()
 	select {
 	case err := <-done:
 		t.Fatalf("signature write did not wait for the publish lock (returned %v)", err)

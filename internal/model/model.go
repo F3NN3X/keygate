@@ -628,7 +628,11 @@ type ReleaseArtifact struct {
 	FileSize    int64  `bun:",notnull,default:0" json:"file_size"`
 	SHA256      string `bun:",notnull,default:''" json:"sha256"`
 	Ed25519Sig  string `bun:",notnull,default:''" json:"ed25519_sig"`
-	ContentType string `bun:",notnull,nullzero,default:'application/octet-stream'" json:"content_type"`
+	// Ed25519GlobalSig is the base64 minisign "global" signature — ed25519(raw_sig || trusted_comment)
+	// — needed to assemble the full 4-line minisign .sig the Tauri updater's verifier demands. Empty for
+	// unsigned artifacts and for ones signed before this existed. Sparkle/Velopack don't use it.
+	Ed25519GlobalSig string `bun:",notnull,default:''" json:"ed25519_global_sig"`
+	ContentType      string `bun:",notnull,nullzero,default:'application/octet-stream'" json:"content_type"`
 
 	// SigningKeyID identifies which signing key produced Ed25519Sig.
 	// Nullable when the artifact was published without signing.

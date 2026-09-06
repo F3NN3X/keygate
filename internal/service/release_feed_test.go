@@ -1,6 +1,8 @@
 package service
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
@@ -208,86 +210,109 @@ func TestBuildTauriEmpty(t *testing.T) {
 	}
 }
 
-// TestTauriSignatureEnvelopeMatchesVerifier verifies the wire shape
-// against Tauri's actual verifier behavior:
-//
-//	signature.lines().nth(1) → base64
-//	decoded[0..2]   == "Ed"
-//	decoded[2..10]  == 8-byte key_id (= pubkey[2..10] for the same key)
-//	decoded[10..74] == 64-byte ed25519 sig
-//
-// Anything else makes Tauri silently reject the update — and we'd see
-// no signal in our tests until production users complained.
-func TestTauriSignatureEnvelopeMatchesVerifier(t *testing.T) {
-	rawSig := make([]byte, 64)
-	for i := range rawSig {
-		rawSig[i] = byte(i + 100)
-	}
-	rawPub := make([]byte, 32)
-	for i := range rawPub {
-		rawPub[i] = byte(i + 1)
-	}
-	sigB64 := base64.StdEncoding.EncodeToString(rawSig)
-	pubB64 := base64.StdEncoding.EncodeToString(rawPub)
-
-	envelope := TauriSignatureEnvelope(sigB64, pubB64)
-	lines := strings.Split(envelope, "\n")
-	if len(lines) < 2 {
-		t.Fatalf("envelope must have at least 2 lines, got %d:\n%s", len(lines), envelope)
-	}
-	if !strings.HasPrefix(lines[0], "untrusted comment:") {
-		t.Errorf("line 1 must start with 'untrusted comment:', got %q", lines[0])
-	}
-	decoded, err := base64.StdEncoding.DecodeString(lines[1])
+// TestTauriEnvelopeVerifiesLikeTauri reproduces exactly what tauri-plugin-updater's verifier does with
+// the feed's `signature` and the config `pubkey` — base64-DECODE each into minisign file text, parse a
+// full 4-line signature, and verify BOTH the file signature and the global signature — and asserts our
+// envelopes pass. This is the check the previous version of this test got wrong: it asserted a raw
+// two-line envelope "matched the verifier", which the real verifier rejects at the base64-decode step
+// (that shipped the field bug where every self-update failed with "signature could not be decoded").
+func TestTauriEnvelopeVerifiesLikeTauri(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		t.Fatalf("line 2 must decode as base64: %v", err)
+		t.Fatalf("generate key: %v", err)
 	}
-	if len(decoded) != 2+8+64 {
-		t.Fatalf("decoded blob must be 74 bytes (algo+key_id+sig), got %d", len(decoded))
-	}
-	if string(decoded[0:2]) != "Ed" {
-		t.Errorf("algo prefix must be 'Ed', got %q", decoded[0:2])
-	}
+	message := []byte("the installer bytes")
+	rawSig := ed25519.Sign(priv, message)
+	// The global signature keygate must also produce: ed25519(raw_sig || trusted_comment_body).
+	globalSig := ed25519.Sign(priv, append(append([]byte{}, rawSig...), []byte(tauriTrustedComment)...))
 
-	// Pubkey envelope's key_id MUST match the sig envelope's key_id.
+	pubB64 := base64.StdEncoding.EncodeToString(pub)
+	envelope := TauriSignatureEnvelope(
+		base64.StdEncoding.EncodeToString(rawSig),
+		base64.StdEncoding.EncodeToString(globalSig),
+		pubB64,
+	)
 	tauriPub := TauriPublicKey(pubB64)
-	pubDecoded, err := base64.StdEncoding.DecodeString(tauriPub)
+
+	// ── what tauri's base64_to_string does: base64-decode the field into the minisign file text ──
+	pubText, err := base64.StdEncoding.DecodeString(tauriPub)
 	if err != nil {
-		t.Fatalf("tauri pubkey must decode: %v", err)
+		t.Fatalf("pubkey field must base64-decode (tauri base64_to_string): %v", err)
 	}
-	if len(pubDecoded) != 2+8+32 {
-		t.Fatalf("pubkey blob must be 42 bytes, got %d", len(pubDecoded))
+	sigText, err := base64.StdEncoding.DecodeString(envelope)
+	if err != nil {
+		t.Fatalf("signature field must base64-decode (tauri base64_to_string): %v", err)
 	}
-	if string(decoded[2:10]) != string(pubDecoded[2:10]) {
-		t.Errorf("sig key_id must equal pubkey key_id; sig=%x pub=%x",
-			decoded[2:10], pubDecoded[2:10])
+
+	// ── PublicKey::decode: 2 lines; line 2 = base64("Ed"+key_id+32-byte key) ──
+	pubLines := strings.Split(string(pubText), "\n")
+	if len(pubLines) < 2 || !strings.HasPrefix(pubLines[0], "untrusted comment:") {
+		t.Fatalf("pubkey file must be 'untrusted comment:'+key line, got %q", pubText)
 	}
-	if string(decoded[10:74]) != string(rawSig) {
-		t.Errorf("decoded[10:74] must equal raw signature bytes")
+	pubBlob, err := base64.StdEncoding.DecodeString(pubLines[1])
+	if err != nil || len(pubBlob) != 42 || string(pubBlob[0:2]) != "Ed" {
+		t.Fatalf("pubkey line 2 must decode to 42-byte 'Ed'-prefixed blob, got %d bytes err=%v", len(pubBlob), err)
 	}
-	if string(pubDecoded[10:42]) != string(rawPub) {
-		t.Errorf("decoded[10:42] of pubkey must equal raw public key bytes")
+	pubKeyID, pubKey := pubBlob[2:10], pubBlob[10:42]
+
+	// ── Signature::decode: 4 lines (comment, 74-byte sig blob, trusted comment, 64-byte global sig) ──
+	sigLines := strings.Split(string(sigText), "\n")
+	if len(sigLines) != 4 {
+		t.Fatalf("signature file must have 4 lines, got %d:\n%s", len(sigLines), sigText)
+	}
+	sigBlob, err := base64.StdEncoding.DecodeString(sigLines[1])
+	if err != nil || len(sigBlob) != 74 || string(sigBlob[0:2]) != "Ed" {
+		t.Fatalf("sig line 2 must decode to 74-byte 'Ed'-prefixed blob, got %d bytes err=%v", len(sigBlob), err)
+	}
+	if !strings.HasPrefix(sigLines[2], "trusted comment: ") {
+		t.Fatalf("sig line 3 must start with 'trusted comment: ', got %q", sigLines[2])
+	}
+	globalBlob, err := base64.StdEncoding.DecodeString(sigLines[3])
+	if err != nil || len(globalBlob) != 64 {
+		t.Fatalf("sig line 4 must decode to a 64-byte global signature, got %d bytes err=%v", len(globalBlob), err)
+	}
+
+	// key_id must match between pubkey and signature, or tauri returns UnexpectedKeyId.
+	if string(pubKeyID) != string(sigBlob[2:10]) {
+		t.Errorf("sig key_id must equal pubkey key_id; sig=%x pub=%x", sigBlob[2:10], pubKeyID)
+	}
+	// The two verifications tauri's verify_ed25519 performs, against the parsed public key.
+	if !ed25519.Verify(pubKey, message, sigBlob[10:74]) {
+		t.Error("file signature must verify over the message with the parsed public key")
+	}
+	trustedBody := sigLines[2][len("trusted comment: "):]
+	global := append(append([]byte{}, sigBlob[10:74]...), []byte(trustedBody)...)
+	if !ed25519.Verify(pubKey, global, globalBlob) {
+		t.Error("global signature must verify over (file_sig || trusted_comment)")
 	}
 }
 
 func TestTauriEnvelopeEmptyOnUnsigned(t *testing.T) {
-	if got := TauriSignatureEnvelope("", "anything"); got != "" {
+	if got := TauriSignatureEnvelope("", "g", "anything"); got != "" {
 		t.Errorf("unsigned artifact must produce empty envelope, got %q", got)
 	}
-	if got := TauriSignatureEnvelope("anything", ""); got != "" {
+	if got := TauriSignatureEnvelope("s", "g", ""); got != "" {
 		t.Errorf("missing pubkey must produce empty envelope, got %q", got)
+	}
+	if got := TauriSignatureEnvelope("s", "", "anything"); got != "" {
+		t.Errorf("missing global signature must produce empty envelope, got %q", got)
 	}
 }
 
 func TestTauriEnvelopeRejectsMalformedInputs(t *testing.T) {
+	good64 := base64.StdEncoding.EncodeToString(make([]byte, 64))
+	pub := base64.StdEncoding.EncodeToString(make([]byte, 32))
 	// 32-byte sig (too short) → empty
 	short := base64.StdEncoding.EncodeToString(make([]byte, 32))
-	pub := base64.StdEncoding.EncodeToString(make([]byte, 32))
-	if got := TauriSignatureEnvelope(short, pub); got != "" {
+	if got := TauriSignatureEnvelope(short, good64, pub); got != "" {
 		t.Errorf("short sig must produce empty envelope, got %q", got)
 	}
+	// short global sig → empty
+	if got := TauriSignatureEnvelope(good64, short, pub); got != "" {
+		t.Errorf("short global sig must produce empty envelope, got %q", got)
+	}
 	// non-base64 → empty
-	if got := TauriSignatureEnvelope("!!!not base64!!!", pub); got != "" {
+	if got := TauriSignatureEnvelope("!!!not base64!!!", good64, pub); got != "" {
 		t.Errorf("malformed base64 must produce empty envelope, got %q", got)
 	}
 }

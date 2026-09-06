@@ -314,7 +314,7 @@ func BuildTauri(in FeedInput) TauriManifest {
 		m := TauriManifest{
 			Version:                 rel.Version,
 			URL:                     r.DownloadURL,
-			Signature:               TauriSignatureEnvelope(a.Ed25519Sig, r.SigningPublicKey),
+			Signature:               TauriSignatureEnvelope(a.Ed25519Sig, a.Ed25519GlobalSig, r.SigningPublicKey),
 			Notes:                   rel.ReleaseNotes,
 			MinimumSupportedVersion: in.MinimumSupportedVersion,
 			MinimumSupportedMessage: in.MinimumSupportedMessage,
@@ -327,26 +327,37 @@ func BuildTauri(in FeedInput) TauriManifest {
 	return TauriManifest{}
 }
 
-// TauriSignatureEnvelope wraps a raw-base64 ed25519 signature in the
-// minisign-format string Tauri's updater expects:
+// tauriTrustedComment is the body of the minisign signature's "trusted comment: " line — the text the
+// global signature is computed over (see SignArtifactWith). It is a fixed string so sign-time and
+// feed-time agree without storing it; minisign-verify treats the content as opaque.
+const tauriTrustedComment = "keygate release"
+
+// TauriSignatureEnvelope builds the signature string the Tauri v2 updater consumes.
 //
-//	untrusted comment: signature from keygate
-//	<base64(2-byte algo "Ed" + 8-byte key_id + 64-byte raw sig)>
+// Tauri's verifier (tauri-plugin-updater ≥2 / minisign-verify) does NOT read the raw minisign text: it
+// base64-DECODES the whole `signature` field into the .sig file's text, then parses a FULL minisign
+// signature — four lines, including a `trusted comment:` and a 64-byte GLOBAL signature over
+// (raw_sig || trusted_comment). The older two-line envelope (comment + one base64 line) fails to
+// base64-decode and never reaches the parser. So this returns:
 //
-// Tauri's verifier:
+//	base64(
+//	  "untrusted comment: signature from keygate\n" +
+//	  base64("Ed" + key_id + raw_sig) + "\n" +          // 74 bytes
+//	  "trusted comment: " + tauriTrustedComment + "\n" +
+//	  globalSigB64                                       // base64 of the 64-byte global sig
+//	)
 //
-//	let sig = base64::decode(signature.lines().nth(1)?)?;
-//	if &sig[0..2] != b"Ed" { return Err }
-//	ed25519::verify(&sig[10..74], msg, &pubkey[10..42])
-//
-// Returns "" if either rawSigB64 or rawPubKeyB64 is empty (unsigned
-// artifact, or pubkey could not be resolved).
-func TauriSignatureEnvelope(rawSigB64, rawPubKeyB64 string) string {
-	if rawSigB64 == "" || rawPubKeyB64 == "" {
+// Returns "" when any input is empty or malformed (unsigned artifact, a pre-global-sig artifact, or an
+// unresolved pubkey) so the feed simply omits the signature rather than shipping a broken one.
+func TauriSignatureEnvelope(rawSigB64, globalSigB64, rawPubKeyB64 string) string {
+	if rawSigB64 == "" || globalSigB64 == "" || rawPubKeyB64 == "" {
 		return ""
 	}
 	rawSig, err := base64.StdEncoding.DecodeString(rawSigB64)
 	if err != nil || len(rawSig) != 64 {
+		return ""
+	}
+	if gs, err := base64.StdEncoding.DecodeString(globalSigB64); err != nil || len(gs) != 64 {
 		return ""
 	}
 	rawPub, err := base64.StdEncoding.DecodeString(rawPubKeyB64)
@@ -358,14 +369,18 @@ func TauriSignatureEnvelope(rawSigB64, rawPubKeyB64 string) string {
 	blob = append(blob, 'E', 'd')
 	blob = append(blob, keyID[:]...)
 	blob = append(blob, rawSig...)
-	encoded := base64.StdEncoding.EncodeToString(blob)
-	return "untrusted comment: signature from keygate\n" + encoded
+	sigFile := "untrusted comment: signature from keygate\n" +
+		base64.StdEncoding.EncodeToString(blob) + "\n" +
+		"trusted comment: " + tauriTrustedComment + "\n" +
+		globalSigB64
+	return base64.StdEncoding.EncodeToString([]byte(sigFile))
 }
 
-// TauriPublicKey wraps a raw 32-byte ed25519 public key in the format
-// Tauri's verifier expects (`base64(2-byte algo "Ed" + 8-byte key_id + 32-byte raw key)`).
-// Use this when emitting public keys for Tauri devs to embed in their
-// app's Tauri config — the raw Sparkle-shape pubkey will not work there.
+// TauriPublicKey emits the public key in the form the Tauri v2 updater's config `pubkey` expects: the
+// verifier base64-DECODES it into a minisign `.pub` file's text and parses two lines (untrusted
+// comment, then base64("Ed" + key_id + raw 32-byte key)). So this returns base64 of that two-line file,
+// NOT the bare base64("Ed"+key_id+key) blob — pasting the bare blob fails the verifier's decode step
+// (it is not valid UTF-8) before any signature is checked.
 func TauriPublicKey(rawPubKeyB64 string) string {
 	if rawPubKeyB64 == "" {
 		return ""
@@ -379,7 +394,8 @@ func TauriPublicKey(rawPubKeyB64 string) string {
 	blob = append(blob, 'E', 'd')
 	blob = append(blob, keyID[:]...)
 	blob = append(blob, rawPub...)
-	return base64.StdEncoding.EncodeToString(blob)
+	pubFile := "untrusted comment: minisign public key\n" + base64.StdEncoding.EncodeToString(blob)
+	return base64.StdEncoding.EncodeToString([]byte(pubFile))
 }
 
 // tauriKeyID derives the 8-byte minisign-style key_id deterministically

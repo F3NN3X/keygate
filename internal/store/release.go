@@ -595,7 +595,7 @@ func (s *Store) ClearReleaseSignatures(ctx context.Context, releaseID string) er
 // Same shape as DeleteArtifact: FOR UPDATE on the parent release so this
 // waits behind an in-flight PublishRelease and then sees its committed
 // status, instead of racing it on an MVCC snapshot.
-func (s *Store) UpdateArtifactSignature(ctx context.Context, id, sig, signingKeyID string) error {
+func (s *Store) UpdateArtifactSignature(ctx context.Context, id, sig, globalSig, signingKeyID string) error {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -619,7 +619,7 @@ func (s *Store) UpdateArtifactSignature(ctx context.Context, id, sig, signingKey
 		return ErrReleaseNotPublishable
 	}
 	if _, err := tx.NewUpdate().Model((*model.ReleaseArtifact)(nil)).
-		Set("ed25519_sig = ?, signing_key_id = ?, updated_at = now()", sig, signingKeyID).
+		Set("ed25519_sig = ?, ed25519_global_sig = ?, signing_key_id = ?, updated_at = now()", sig, globalSig, signingKeyID).
 		Where("id = ?", id).Exec(ctx); err != nil {
 		return err
 	}
