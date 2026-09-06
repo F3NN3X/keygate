@@ -167,9 +167,11 @@ func applyReleaseFilters(q *bun.SelectQuery, f ReleaseFilter) *bun.SelectQuery {
 //   - the release has at least one artifact
 //   - every artifact has non-empty file_key AND non-empty sha256
 //   - when requireSignatures is true, every artifact has non-empty
-//     ed25519_sig AND signing_key_id (defends the race where a
-//     concurrent UpdateArtifactFile cleared a signature between
-//     the service-layer sign loop and this commit)
+//     ed25519_sig AND ed25519_global_sig AND signing_key_id (defends the
+//     race where a concurrent UpdateArtifactFile cleared a signature
+//     between the service-layer sign loop and this commit). The global sig
+//     is in the invariant because a missing one makes TauriSignatureEnvelope
+//     return "" — a "signed" release that ships an unverifiable Tauri feed.
 //
 // Concurrent AddArtifact / FinalizeArtifact / DeleteArtifact requests
 // committed before this UPDATE evaluates are visible to the subqueries;
@@ -201,7 +203,7 @@ func (s *Store) PublishRelease(ctx context.Context, id string, requireSignatures
 		      OR NOT EXISTS (
 		          SELECT 1 FROM release_artifacts
 		          WHERE release_id = releases.id
-		            AND (ed25519_sig = '' OR signing_key_id IS NULL
+		            AND (ed25519_sig = '' OR ed25519_global_sig = '' OR signing_key_id IS NULL
 		                 OR (? <> '' AND signing_key_id <> ?))
 		      )
 		  )
@@ -260,7 +262,7 @@ func (s *Store) diagnoseUnpublishable(ctx context.Context, id string, requireSig
 		var unsigned int
 		if err := s.DB.NewRaw(
 			`SELECT COUNT(*) FROM release_artifacts WHERE release_id = ?
-			   AND (ed25519_sig = '' OR signing_key_id IS NULL OR (? <> '' AND signing_key_id <> ?))`,
+			   AND (ed25519_sig = '' OR ed25519_global_sig = '' OR signing_key_id IS NULL OR (? <> '' AND signing_key_id <> ?))`,
 			id, signingKeyID, signingKeyID,
 		).Scan(ctx, &unsigned); err != nil {
 			return err
@@ -532,7 +534,7 @@ func (s *Store) UpdateArtifactFile(ctx context.Context, id, fileKey string, size
 	if _, err := tx.NewRaw(`
 		UPDATE release_artifacts
 		SET file_key = ?, file_size = ?, sha256 = ?, content_type = ?,
-		    ed25519_sig = '', signing_key_id = NULL, updated_at = now()
+		    ed25519_sig = '', ed25519_global_sig = '', signing_key_id = NULL, updated_at = now()
 		WHERE id = ?
 	`, fileKey, size, sha256, contentType, id).Exec(ctx); err != nil {
 		return err
@@ -579,7 +581,7 @@ func (s *Store) ClearReleaseSignatures(ctx context.Context, releaseID string) er
 	}
 	if _, err := tx.NewRaw(`
 		UPDATE release_artifacts
-		SET ed25519_sig = '', signing_key_id = NULL, updated_at = now()
+		SET ed25519_sig = '', ed25519_global_sig = '', signing_key_id = NULL, updated_at = now()
 		WHERE release_id = ?
 	`, releaseID).Exec(ctx); err != nil {
 		return err
@@ -595,7 +597,7 @@ func (s *Store) ClearReleaseSignatures(ctx context.Context, releaseID string) er
 // Same shape as DeleteArtifact: FOR UPDATE on the parent release so this
 // waits behind an in-flight PublishRelease and then sees its committed
 // status, instead of racing it on an MVCC snapshot.
-func (s *Store) UpdateArtifactSignature(ctx context.Context, id, sig, signingKeyID string) error {
+func (s *Store) UpdateArtifactSignature(ctx context.Context, id, sig, globalSig, signingKeyID string) error {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -619,7 +621,7 @@ func (s *Store) UpdateArtifactSignature(ctx context.Context, id, sig, signingKey
 		return ErrReleaseNotPublishable
 	}
 	if _, err := tx.NewUpdate().Model((*model.ReleaseArtifact)(nil)).
-		Set("ed25519_sig = ?, signing_key_id = ?, updated_at = now()", sig, signingKeyID).
+		Set("ed25519_sig = ?, ed25519_global_sig = ?, signing_key_id = ?, updated_at = now()", sig, globalSig, signingKeyID).
 		Where("id = ?", id).Exec(ctx); err != nil {
 		return err
 	}

@@ -208,7 +208,7 @@ func setupSignedDraft(t *testing.T, s *store.Store, ctx context.Context, signed 
 		if err := s.CreateSigningKey(ctx, key); err != nil {
 			t.Fatalf("create signing key: %v", err)
 		}
-		if err := s.UpdateArtifactSignature(ctx, art.ID, "sig-"+suffix, key.ID); err != nil {
+		if err := s.UpdateArtifactSignature(ctx, art.ID, "sig-"+suffix, "gsig-"+suffix, key.ID); err != nil {
 			t.Fatalf("set signature: %v", err)
 		}
 	}

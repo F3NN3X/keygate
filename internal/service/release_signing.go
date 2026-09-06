@@ -274,8 +274,9 @@ func (s *ReleaseSigningService) ExportPublicKeyPEM(ctx context.Context, productI
 // AND the ID of the signing key that produced it. Callers MUST persist both
 // atomically — a sig without a key_id is unverifiable after rotation.
 type SignResult struct {
-	Signature    string // base64-encoded raw 64-byte signature
-	SigningKeyID string // FK to release_signing_keys.id
+	Signature       string // base64-encoded raw 64-byte signature (over the file bytes)
+	GlobalSignature string // base64 ed25519(raw_sig || tauriTrustedComment) — the minisign "global" sig
+	SigningKeyID    string // FK to release_signing_keys.id
 }
 
 // SignArtifact signs the bytes of a single release artifact and returns
@@ -380,9 +381,19 @@ func (s *ReleaseSigningService) SignArtifactWith(ctx context.Context, rel *model
 	}
 
 	sig := ed25519.Sign(priv, buf)
+
+	// The minisign "global" signature the Tauri verifier also checks: ed25519 over the raw signature
+	// concatenated with the trusted-comment text (the part after "trusted comment: "). It can only be
+	// made here, with the private key in hand; the feed assembles the 4-line envelope from both sigs.
+	globalMsg := make([]byte, 0, len(sig)+len(tauriTrustedComment))
+	globalMsg = append(globalMsg, sig...)
+	globalMsg = append(globalMsg, []byte(tauriTrustedComment)...)
+	globalSig := ed25519.Sign(priv, globalMsg)
+
 	return &SignResult{
-		Signature:    base64.StdEncoding.EncodeToString(sig),
-		SigningKeyID: keyRow.ID,
+		Signature:       base64.StdEncoding.EncodeToString(sig),
+		GlobalSignature: base64.StdEncoding.EncodeToString(globalSig),
+		SigningKeyID:    keyRow.ID,
 	}, nil
 }
 
