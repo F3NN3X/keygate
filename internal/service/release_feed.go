@@ -300,10 +300,12 @@ type TauriManifest struct {
 // is expected to be the latest after semver sort). Returns a zero value when
 // no releases are present — callers should 204/404 in that case.
 //
-// The Signature field is wrapped in minisign envelope format because that
-// is what Tauri's updater verifier consumes. Raw ed25519 base64 (the
-// Sparkle convention we store) would fail Tauri's `signature[0..2] == "Ed"`
-// + 8-byte key_id check.
+// The Signature field is the base64-wrapped full minisign .sig file
+// TauriSignatureEnvelope produces, because that is what Tauri v2's verifier
+// consumes: it base64-DECODES the whole `signature` string into minisign file
+// text, then parses and verifies a 4-line signature (file sig + global sig).
+// The raw ed25519 base64 we store for Sparkle, or an un-wrapped envelope,
+// fails at that base64-decode step before any signature is checked.
 func BuildTauri(in FeedInput) TauriManifest {
 	for _, r := range in.Releases {
 		if r == nil || r.Release == nil || r.Artifact == nil {
