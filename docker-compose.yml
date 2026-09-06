@@ -48,6 +48,16 @@ services:
       STORAGE_UPLOAD_TTL: ${STORAGE_UPLOAD_TTL:-1h}
       STORAGE_DOWNLOAD_TTL: ${STORAGE_DOWNLOAD_TTL:-10m}
       MAX_RELEASE_SIGN_SIZE_MB: ${MAX_RELEASE_SIGN_SIZE_MB:-500}
+    # keygate calls the object store server-side (finalize HEADs the object, publish reads it back to
+    # re-hash before signing) at the SAME public hostname the browser uploads to — presigned URLs bind
+    # the host into the SigV4 signature, so it cannot use an internal name for its own calls.
+    #
+    # That hostname resolves to this host's public IP, and a container reaching its own host's public
+    # address hairpins and times out: finalize returned INTERNAL_ERROR while the object sat in the
+    # bucket. host-gateway points it back at the host's Traefik, which terminates TLS for the real
+    # certificate and routes to RustFS — same URL, same signature, a path that exists.
+    extra_hosts:
+      - "s3.deckshot.app:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
