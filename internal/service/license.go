@@ -35,10 +35,11 @@ type LicenseService struct {
 	logger     *slog.Logger
 	failures   FailureTracker
 	webhook    *WebhookService
+	baseURL    string // public origin of THIS instance (e.g. https://license.deckshot.app), surfaced in response meta
 }
 
-func NewLicenseService(s *store.Store, signingKey licenseSigningKey, logger *slog.Logger, failures FailureTracker, webhook *WebhookService) *LicenseService {
-	return &LicenseService{store: s, signingKey: signingKey, logger: logger, failures: failures, webhook: webhook}
+func NewLicenseService(s *store.Store, signingKey licenseSigningKey, logger *slog.Logger, failures FailureTracker, webhook *WebhookService, baseURL string) *LicenseService {
+	return &LicenseService{store: s, signingKey: signingKey, logger: logger, failures: failures, webhook: webhook, baseURL: baseURL}
 }
 
 // SigningPublicKey returns the ed25519 public key that pairs with
@@ -123,7 +124,7 @@ func (s *LicenseService) Activate(ctx context.Context, in ActivateInput) (*Activ
 		return &ActivateResult{
 			Status: "already_activated", LicenseID: lic.ID,
 			Token: token,
-			Meta:  responseMeta(),
+			Meta:  s.responseMeta(),
 		}, nil
 	}
 
@@ -175,7 +176,7 @@ func (s *LicenseService) Activate(ctx context.Context, in ActivateInput) (*Activ
 	return &ActivateResult{
 		Status: "activated", LicenseID: lic.ID,
 		Token: token,
-		Meta:  responseMeta(),
+		Meta:  s.responseMeta(),
 	}, nil
 }
 
@@ -308,7 +309,7 @@ func (s *LicenseService) Verify(ctx context.Context, in VerifyInput) (*VerifyRes
 		Features:            s.entitlements(lic),
 		Token:               token,
 		GraceDays:           s.effectiveGraceDays(lic),
-		Meta:                responseMeta(),
+		Meta:                s.responseMeta(),
 		ExternalCustomerID:  lic.ExternalCustomerID,
 		ExternalWorkspaceID: lic.ExternalWorkspaceID,
 		Email:               lic.Email,
@@ -542,8 +543,16 @@ func (s *LicenseService) entitlements(lic *model.License) map[string]any {
 	return m
 }
 
-func responseMeta() map[string]any {
-	return map[string]any{"server": branding.Project, "url": branding.URL}
+// responseMeta carries the AGPL §7(b) attribution (server / url — the "Powered by Keygate" identity,
+// see internal/branding) plus, when configured, this deployment's own public origin as instance. The
+// attribution stays; instance is additive so a client (or a human reading /verify) can see which
+// instance answered without the attribution being repurposed as the instance URL.
+func (s *LicenseService) responseMeta() map[string]any {
+	m := map[string]any{"server": branding.Project, "url": branding.URL}
+	if s.baseURL != "" {
+		m["instance"] = s.baseURL
+	}
+	return m
 }
 
 // tokenTTL is the default check-in interval: how long a signed token

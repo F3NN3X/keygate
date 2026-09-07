@@ -23,6 +23,13 @@ Grouped by area, newest first within each group. SHAs are the `custom` commits a
 
 ### API — licence SDK
 
+- **Response `meta.instance` = this deployment's public origin** — 2026-09-07. `responseMeta` (activate /
+  verify) now adds `instance` = `cfg.BaseURL` (e.g. `https://license.deckshot.app`) alongside the existing
+  `server` / `url`. The AGPL §7(b) attribution (`server` = "Keygate", `url` = keygate.app, from
+  `internal/branding`) is **kept unchanged** — `instance` is additive so a caller can see which deployment
+  answered without the attribution being repurposed. `LicenseService` gained a `baseURL` field, wired from
+  config in `cmd/server/main.go`. Files: `internal/service/license.go`, `cmd/server/main.go`.
+
 - **`/license/verify` returns owner email + activation usage** — `b5e3d33` (2026-09-07).
   Adds `email`, `activations_used`, `max_activations` to the `VerifyResult` so an SDK client can show a
   "2 / 3 devices · owner@…" summary from the refresh it already makes. Additive and backward-compatible;

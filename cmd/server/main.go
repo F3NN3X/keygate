@@ -100,7 +100,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("LICENSE_SIGNING_KEY: %v", err)
 	}
-	licenseSvc := service.NewLicenseService(db, licenseSigningPriv, logger, bf, webhookSvc)
+	licenseSvc := service.NewLicenseService(db, licenseSigningPriv, logger, bf, webhookSvc, cfg.BaseURL)
 	usageSvc := service.NewUsageService(db, webhookSvc, emailSvc, logger, cfg.QuotaWarningThreshold)
 	seatSvc := service.NewSeatService(db, webhookSvc, emailSvc, logger, cfg.BaseURL)
 	entitlementSvc := service.NewEntitlementService(db, logger)
