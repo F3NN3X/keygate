@@ -880,6 +880,29 @@ components:
               type: string
             grace_days:
               type: integer
+            email:
+              type: string
+              nullable: true
+              description: |
+                FORK ADDITION (F3NN3X/keygate `custom`, 2026-09-07). The licence owner's email,
+                so an SDK client can show "you@example.com" on its licence screen without a
+                second call. Omitted when the licence has no email. Safe to return on this
+                endpoint specifically: verify only reaches a success response for a caller that
+                already holds a real license_key AND an activated device (see the FindActivation
+                gate), so it is the owner reading their own summary — not a key-existence oracle.
+                See docs/verify-owner-and-activation-fields.md.
+            activations_used:
+              type: integer
+              description: |
+                FORK ADDITION (2026-09-07). How many device slots this licence currently
+                occupies. Best-effort: a failed count degrades to 0 rather than failing an
+                otherwise-valid verify. Pair with max_activations for a "2 / 3 devices" summary.
+            max_activations:
+              type: integer
+              description: |
+                FORK ADDITION (2026-09-07). The plan's device-slot cap (the same value enforced
+                on activate; 3 for the DeckShot plan). The per-device LIST stays behind the
+                session-auth portal — only these counts ride the credential-free SDK.
 
     EntitlementResponse:
       type: object
