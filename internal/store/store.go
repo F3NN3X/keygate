@@ -575,13 +575,32 @@ func (s *Store) FindLicenseByStripeSubscription(ctx context.Context, subID strin
 	return l, s.DB.NewSelect().Model(l).Where("stripe_subscription_id = ?", subID).Scan(ctx)
 }
 
-func (s *Store) FindLicenseByStripeCustomer(ctx context.Context, customerID string) (*model.License, error) {
+// IsCheckoutSessionConflict recognises the unique index on
+// licenses.stripe_checkout_session_id: a second license for one paid
+// checkout session.
+func IsCheckoutSessionConflict(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "idx_licenses_stripe_checkout_session")
+}
+
+func (s *Store) FindLicenseByStripeCheckoutSession(ctx context.Context, sessionID string) (*model.License, error) {
 	l := new(model.License)
-	return l, s.DB.NewSelect().Model(l).
-		Relation("Plan").Relation("Product").
-		Where("license.stripe_customer_id = ?", customerID).
-		OrderExpr("license.created_at DESC").Limit(1).
+	return l, s.DB.NewSelect().Model(l).Where("stripe_checkout_session_id = ?", sessionID).Scan(ctx)
+}
+
+func (s *Store) FindLicenseByStripePaymentIntent(ctx context.Context, paymentIntentID string) (*model.License, error) {
+	l := new(model.License)
+	return l, s.DB.NewSelect().Model(l).Where("stripe_payment_intent_id = ?", paymentIntentID).Scan(ctx)
+}
+
+// ListLicensesByStripeCustomer returns every license bought under a
+// Stripe customer, newest first.
+func (s *Store) ListLicensesByStripeCustomer(ctx context.Context, customerID string) ([]*model.License, error) {
+	var ls []*model.License
+	err := s.DB.NewSelect().Model(&ls).
+		Where("stripe_customer_id = ?", customerID).
+		OrderExpr("created_at DESC").
 		Scan(ctx)
+	return ls, err
 }
 
 func (s *Store) UpdateLicense(ctx context.Context, l *model.License, cols ...string) error {
@@ -658,25 +677,12 @@ func (s *Store) HasAccountOrLicense(ctx context.Context, email string) (bool, er
 	return exists, err
 }
 
-// FindActiveLicenseByEmailAndProduct returns an active or trialing license
-// for the given email and product, or nil if none exists.
 func (s *Store) UpdateLicenseUser(ctx context.Context, licenseID, userID string) error {
 	_, err := s.DB.NewUpdate().Model((*model.License)(nil)).
 		Set("user_id = ?", userID).
 		Where("id = ?", licenseID).
 		Exec(ctx)
 	return err
-}
-
-func (s *Store) FindActiveLicenseByEmailAndProduct(ctx context.Context, email, productID string) *model.License {
-	var lic model.License
-	err := s.DB.NewSelect().Model(&lic).
-		Where("email = ? AND product_id = ? AND status IN (?, ?)", email, productID, "active", "trialing").
-		Limit(1).Scan(ctx)
-	if err != nil {
-		return nil
-	}
-	return &lic
 }
 
 // LicenseListFilter narrows ListLicenses queries. New filters slot
@@ -1043,14 +1049,128 @@ func (s *Store) CleanExpiredOTPs(ctx context.Context) {
 // TryRecordProcessedEvent atomically records a processed event.
 // Returns true if this is the first time the event was recorded (should be processed).
 // Returns false if the event was already recorded (should be skipped).
+// IsEventProcessed reports whether a marker exists; a database error
+// reads as "no". Use HasProcessedEvent where the difference matters.
+func (s *Store) IsEventProcessed(ctx context.Context, provider, eventID string) bool {
+	exists, err := s.HasProcessedEvent(ctx, provider, eventID)
+	return err == nil && exists
+}
+
+// HasProcessedEvent reports whether a marker exists, keeping database
+// failures apart from a missing row: a takeover decision must not be
+// made on a lookup that did not run.
+func (s *Store) HasProcessedEvent(ctx context.Context, provider, eventID string) (bool, error) {
+	return s.DB.NewSelect().TableExpr("processed_events").
+		Where("provider = ? AND event_id = ?", provider, eventID).Exists(ctx)
+}
+
+// CompleteProcessedEvent removes the in-flight marker of a claim; the
+// reservation row (written under the name older binaries use) stays
+// as the done marker, so one row per event remains.
+func (s *Store) CompleteProcessedEvent(ctx context.Context, claimProvider, eventID string) error {
+	return s.DeleteProcessedEvent(ctx, claimProvider, eventID)
+}
+
+// WithAdvisoryLock runs fn while holding a session-level advisory
+// lock on a pinned connection, serialising the section across every
+// replica that shares the database. The lock is released when fn
+// returns, or by Postgres if the process dies.
+func (s *Store) WithAdvisoryLock(ctx context.Context, key int64, fn func(ctx context.Context) error) error {
+	conn, err := s.DB.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.NewRaw("SELECT pg_advisory_lock(?)", key).Exec(ctx); err != nil {
+		return err
+	}
+	defer func() {
+		_, _ = conn.NewRaw("SELECT pg_advisory_unlock(?)", key).Exec(context.Background())
+	}()
+	return fn(ctx)
+}
+
+// DeleteProcessedEvent forgets a recorded event.
+func (s *Store) DeleteProcessedEvent(ctx context.Context, provider, eventID string) error {
+	_, err := s.DB.NewDelete().TableExpr("processed_events").
+		Where("provider = ? AND event_id = ?", provider, eventID).Exec(ctx)
+	return err
+}
+
+// PendingCheckoutSession is one row of the delayed-payment backlog.
+type PendingCheckoutSession struct {
+	SessionID string    `bun:"event_id"`
+	CreatedAt time.Time `bun:"created_at"`
+}
+
+// ListPendingCheckoutSessions pages through Stripe checkout sessions
+// that completed unpaid (recorded under stripe_pending_session) and
+// were not fulfilled since, oldest first, no older than maxAge. Pass
+// the last row of the previous page as `after` to continue; a nil
+// `after` starts from the beginning. Keyset paging means a round
+// visits every row once, so a stuck batch never hides newer rows.
+func (s *Store) ListPendingCheckoutSessions(ctx context.Context, maxAge time.Duration, after *PendingCheckoutSession, limit int) ([]PendingCheckoutSession, error) {
+	var rows []PendingCheckoutSession
+	q := s.DB.NewSelect().TableExpr("processed_events AS p").
+		ColumnExpr("p.event_id, p.created_at").
+		Where("p.provider = 'stripe_pending_session'").
+		Where("p.created_at > now() - make_interval(secs => ?)", int(maxAge.Seconds())).
+		// A license, not a claim, is what ends a pending session: a
+		// claim can be stale (its owner died) and the sync must keep
+		// coming back so fulfilment can take it over.
+		Where("NOT EXISTS (SELECT 1 FROM licenses l WHERE l.stripe_checkout_session_id = p.event_id)")
+	if after != nil {
+		q = q.Where("(p.created_at, p.event_id) > (?, ?)", after.CreatedAt, after.SessionID)
+	}
+	err := q.OrderExpr("p.created_at ASC, p.event_id ASC").Limit(limit).Scan(ctx, &rows)
+	return rows, err
+}
+
+// DeleteFulfilledPendingSessions removes pending-session markers for
+// sessions that already produced a license.
+func (s *Store) DeleteFulfilledPendingSessions(ctx context.Context) error {
+	_, err := s.DB.NewDelete().TableExpr("processed_events AS p").
+		Where("p.provider = 'stripe_pending_session'").
+		Where("EXISTS (SELECT 1 FROM licenses l WHERE l.stripe_checkout_session_id = p.event_id)").
+		Exec(ctx)
+	return err
+}
+
+// ReleaseStaleProcessedEvent drops a recorded event older than
+// maxAge. Used for fulfilment claims whose owner died mid-way.
+func (s *Store) ReleaseStaleProcessedEvent(ctx context.Context, provider, eventID string, maxAge time.Duration) (bool, error) {
+	res, err := s.DB.NewDelete().TableExpr("processed_events").
+		Where("provider = ? AND event_id = ?", provider, eventID).
+		Where("created_at < now() - make_interval(secs => ?)", int(maxAge.Seconds())).
+		Exec(ctx)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 func (s *Store) TryRecordProcessedEvent(ctx context.Context, provider, eventID string) bool {
+	claimed, err := s.ClaimProcessedEvent(ctx, provider, eventID)
+	return err == nil && claimed
+}
+
+// ClaimProcessedEvent atomically records an event. claimed is false
+// when the event was already recorded; err reports a database failure,
+// which callers must not confuse with "already processed".
+func (s *Store) ClaimProcessedEvent(ctx context.Context, provider, eventID string) (claimed bool, err error) {
 	var id string
-	err := s.DB.NewRaw(
+	err = s.DB.NewRaw(
 		"INSERT INTO processed_events (id, provider, event_id) VALUES (?, ?, ?) ON CONFLICT (provider, event_id) DO NOTHING RETURNING id",
 		newID(), provider, eventID,
 	).Scan(ctx, &id)
-	// If id is empty, the insert was a no-op (already exists) → skip
-	return err == nil && id != ""
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil // conflict: DO NOTHING returned no row
+	}
+	if err != nil {
+		return false, err
+	}
+	return id != "", nil
 }
 
 // ─── Transactional Activation ───

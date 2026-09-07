@@ -2,12 +2,15 @@ package payment
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +20,7 @@ import (
 	"github.com/stripe/stripe-go/v82/checkout/session"
 	stripecustomer "github.com/stripe/stripe-go/v82/customer"
 	stripeinvoice "github.com/stripe/stripe-go/v82/invoice"
+	"github.com/stripe/stripe-go/v82/invoicepayment"
 	stripeprice "github.com/stripe/stripe-go/v82/price"
 	"github.com/stripe/stripe-go/v82/subscription"
 	"github.com/stripe/stripe-go/v82/webhook"
@@ -40,8 +44,35 @@ type StripeHandler struct {
 	// secret leaking + replay into prod, or vice versa).
 	Livemode bool
 
+	// pendingAfter is where the last SyncPendingCheckouts round
+	// stopped when it hit its per-round cap; nil starts from the oldest
+	// row. pendingBatchLimit overrides the cap (tests); 0 = default.
+	pendingAfter      *store.PendingCheckoutSession
+	pendingBatchLimit int
+
 	mu            sync.RWMutex
 	webhookSecret string // runtime-updatable, guarded by mu
+	// prevWebhookSecret is accepted alongside webhookSecret until
+	// prevSecretUntil, while a replaced endpoint drains its queue.
+	prevWebhookSecret string
+	prevSecretUntil   time.Time
+}
+
+// SetPreviousWebhookSecret keeps an older signing secret valid until
+// `until`, so deliveries still queued for a replaced endpoint verify.
+func (h *StripeHandler) SetPreviousWebhookSecret(secret string, until time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.prevWebhookSecret, h.prevSecretUntil = secret, until
+}
+
+func (h *StripeHandler) previousWebhookSecret() (string, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.prevWebhookSecret == "" || time.Now().After(h.prevSecretUntil) {
+		return "", false
+	}
+	return h.prevWebhookSecret, true
 }
 
 // GetWebhookSecret returns the current webhook signing secret (thread-safe).
@@ -202,18 +233,33 @@ func (h *StripeHandler) Webhook(c *gin.Context) {
 		response.BadRequest(c, "webhook not configured")
 		return
 	}
-	// IgnoreAPIVersionMismatch: the endpoint is auto-created with the Stripe
-	// account's default API version, which can be newer than the one this
-	// stripe-go pins — otherwise ConstructEvent hard-fails (e.g. account on
-	// 2026-08-26.dahlia vs library 2025-08-27.basil) and every webhook 400s.
-	// The HMAC signature is still verified; only the version check is relaxed.
-	// The fields we read (customer email, price/product, session id) are stable
-	// across these versions, and the livemode gate below still applies.
-	event, err := webhook.ConstructEventWithOptions(body, c.GetHeader("Stripe-Signature"), secret,
-		webhook.ConstructEventOptions{IgnoreAPIVersionMismatch: true})
+	// Signature check here; the API version is checked below against
+	// the shapes this build parses. stripe-go's own guard would refuse
+	// every pre-2025 event, silently disabling billing for accounts
+	// whose endpoint predates the release trains — exactly the installs
+	// that set STRIPE_WEBHOOK_SECRET by hand.
+	opts := webhook.ConstructEventOptions{IgnoreAPIVersionMismatch: true}
+	event, err := webhook.ConstructEventWithOptions(body, c.GetHeader("Stripe-Signature"), secret, opts)
+	if err != nil {
+		// A replaced endpoint keeps delivering (and retrying) with its
+		// old secret for a while; accept it during the drain period.
+		if prev, ok := h.previousWebhookSecret(); ok {
+			event, err = webhook.ConstructEventWithOptions(body, c.GetHeader("Stripe-Signature"), prev, opts)
+		}
+	}
 	if err != nil {
 		slog.Error("stripe webhook verification failed", "error", err.Error())
 		response.BadRequest(c, "invalid signature")
+		return
+	}
+	if !supportedAPIVersion(event.APIVersion) {
+		// Not recorded as processed: once the endpoint is recreated on
+		// a supported version (or this build upgraded) Stripe's retry
+		// of the event will be applied.
+		slog.Error("stripe webhook: unsupported API version, event not applied",
+			"event_id", event.ID, "event_version", event.APIVersion, "sdk_version", stripe.APIVersion)
+		response.Err(c, http.StatusBadRequest, "UNSUPPORTED_API_VERSION",
+			"webhook endpoint API version "+event.APIVersion+" is not supported by this build; recreate the endpoint on "+stripe.APIVersion)
 		return
 	}
 
@@ -223,6 +269,7 @@ func (h *StripeHandler) Webhook(c *gin.Context) {
 	// doesn't carry environment info — we check the event flag
 	// against our configured mode. Without this, a leaked test secret
 	// could replay arbitrary forged events at the production endpoint.
+	ctx := c.Request.Context()
 	if event.Livemode != h.Livemode {
 		slog.Error("stripe webhook livemode mismatch",
 			"event_id", event.ID, "event_livemode", event.Livemode,
@@ -231,18 +278,41 @@ func (h *StripeHandler) Webhook(c *gin.Context) {
 		return
 	}
 
-	// Idempotency: atomically check+record to prevent race conditions
-	if !h.Store.TryRecordProcessedEvent(c, "stripe", event.ID) {
-		c.JSON(http.StatusOK, gin.H{"received": true, "skipped": true})
+	// Idempotency. A claim is taken before handling and a done marker
+	// written after; a claim without a done marker that is older than
+	// staleClaimAge is taken over, so an event whose handling failed
+	// (and whose claim could not be released) is not mistaken for a
+	// completed one when Stripe retries it.
+	claimed, done, err := h.claimEvent(ctx, event.ID)
+	if err != nil {
+		slog.Error("stripe webhook: failed to claim event", "id", event.ID, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"received": false, "retry": true})
+		return
+	}
+	if !claimed {
+		if done {
+			c.JSON(http.StatusOK, gin.H{"received": true, "skipped": true})
+			return
+		}
+		// Another delivery of this event is being handled right now
+		// (or failed moments ago and could not release its claim). A
+		// 2xx would end Stripe's retries; ask it to come back instead.
+		c.JSON(http.StatusServiceUnavailable, gin.H{"received": false, "retry": true, "in_progress": true})
 		return
 	}
 
-	ctx := c.Request.Context()
 	slog.Info("stripe webhook received", "type", event.Type, "id", event.ID)
 
+	// Handlers that talk to Stripe report transient failures; the
+	// event claim is then released and Stripe asked to retry, so a
+	// lookup that failed once does not mean a paid customer without a
+	// license or a refunded one that stays active.
+	var herr error
 	switch event.Type {
-	case "checkout.session.completed":
-		h.onCheckoutCompleted(ctx, event.Data.Raw)
+	case "checkout.session.completed", "checkout.session.async_payment_succeeded":
+		herr = h.onCheckoutCompleted(ctx, event.Data.Raw)
+	case "checkout.session.async_payment_failed":
+		h.onAsyncPaymentFailed(ctx, event.Data.Raw)
 	case "invoice.paid":
 		h.onInvoicePaid(ctx, event.Data.Raw)
 	case "customer.subscription.updated":
@@ -252,7 +322,7 @@ func (h *StripeHandler) Webhook(c *gin.Context) {
 	case "invoice.payment_failed":
 		h.onPaymentFailed(ctx, event.Data.Raw)
 	case "charge.refunded":
-		h.onChargeRefunded(ctx, event.Data.Raw)
+		herr = h.onChargeRefunded(ctx, event.Data.Raw)
 	case "charge.dispute.created":
 		h.onDisputeCreated(ctx, event.Data.Raw)
 	case "charge.dispute.closed":
@@ -272,71 +342,305 @@ func (h *StripeHandler) Webhook(c *gin.Context) {
 	default:
 		slog.Warn("stripe webhook: unhandled event type", "type", event.Type)
 	}
+	if herr != nil {
+		slog.Warn("stripe webhook: transient failure, asking Stripe to retry", "type", event.Type, "id", event.ID, "error", herr)
+		// Best effort: if this fails the claim goes stale and the
+		// retry takes it over once it is old enough.
+		if err := h.release(ctx, processedEventDoneProvider, processedEventClaimProvider, event.ID); err != nil {
+			slog.Error("stripe webhook: failed to release event claim", "id", event.ID, "error", err)
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"received": false, "retry": true})
+		return
+	}
+	// Dropping the in-flight marker is what makes a later resend skip.
+	// If that fails, do not tell Stripe the event is delivered: its
+	// retry finds the marker and comes back until it is gone.
+	if err := h.Store.CompleteProcessedEvent(ctx, processedEventClaimProvider, event.ID); err != nil {
+		slog.Error("stripe webhook: failed to record completion", "id", event.ID, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"received": false, "retry": true})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"received": true})
 }
 
-func (h *StripeHandler) onCheckoutCompleted(ctx context.Context, raw json.RawMessage) {
+// Stripe events use two rows while a delivery is in flight and one
+// once it is done:
+//
+//   - the reservation, under the provider name every binary so far has
+//     used ("stripe"). Older binaries during a rolling upgrade see it
+//     as their own idempotency row and skip the event; rows they write
+//     read as done here, never as stale claims.
+//   - the in-flight marker ("stripe_claim"), removed on completion.
+//     While it exists the event is being handled (or its handler died:
+//     after staleClaimAge it is taken over).
+const (
+	processedEventClaimProvider = "stripe_claim"
+	processedEventDoneProvider  = "stripe"
+)
+
+// claimEvent takes the processing claim for a Stripe event. claimed
+// is false when the event is done (done=true) or another handler
+// holds a fresh claim (done=false); a stale claim without a done
+// marker is taken over.
+func (h *StripeHandler) claimEvent(ctx context.Context, eventID string) (claimed, done bool, err error) {
+	return h.reserve(ctx, processedEventDoneProvider, processedEventClaimProvider, eventID, nil)
+}
+
+// reserve implements the two-row claim for events and sessions.
+// claimed: this caller now handles it. done: nothing to do (finished,
+// or an older binary has it). Neither: another caller is mid-way, or
+// (with err) the state could not be established. fulfilled, when
+// given, is an extra "already done" check — a license row for a
+// session — consulted before taking over a stale in-flight marker.
+func (h *StripeHandler) reserve(ctx context.Context, doneProvider, claimProvider, id string, fulfilled func() (bool, error)) (claimed, done bool, err error) {
+	reserved, err := h.Store.ClaimProcessedEvent(ctx, doneProvider, id)
+	if err != nil {
+		return false, false, err
+	}
+	if reserved {
+		// Ours. An in-flight marker without a reservation can only be
+		// an orphan of a failed release; replace it.
+		_ = h.Store.DeleteProcessedEvent(ctx, claimProvider, id)
+		claimed, err = h.Store.ClaimProcessedEvent(ctx, claimProvider, id)
+		if err != nil || !claimed {
+			_ = h.Store.DeleteProcessedEvent(ctx, doneProvider, id)
+			return false, false, err
+		}
+		return true, false, nil
+	}
+	inflight, err := h.Store.HasProcessedEvent(ctx, claimProvider, id)
+	if err != nil {
+		return false, false, err
+	}
+	if !inflight {
+		return false, true, nil // reservation without marker: done
+	}
+	if fulfilled != nil {
+		if ok, err := fulfilled(); err != nil || ok {
+			return false, ok, err
+		}
+	}
+	released, err := h.Store.ReleaseStaleProcessedEvent(ctx, claimProvider, id, staleClaimAge)
+	if err != nil || !released {
+		return false, false, err // fresh: someone is on it
+	}
+	slog.Warn("stripe: took over a stale in-flight claim", "provider", claimProvider, "id", id)
+	claimed, err = h.Store.ClaimProcessedEvent(ctx, claimProvider, id)
+	return claimed, false, err
+}
+
+// release undoes a reservation after a failed handling so a retry
+// can claim it. The reservation goes first: if only the marker were
+// removed the event would read as done and never be retried.
+func (h *StripeHandler) release(ctx context.Context, doneProvider, claimProvider, id string) error {
+	if err := h.Store.DeleteProcessedEvent(ctx, doneProvider, id); err != nil {
+		return err
+	}
+	return h.Store.DeleteProcessedEvent(ctx, claimProvider, id)
+}
+
+// onCheckoutCompleted handles checkout.session.completed and
+// checkout.session.async_payment_succeeded. Delayed payment methods
+// (bank debits, vouchers) complete the session before the money
+// arrives; the session is then still unpaid and must not produce a
+// license. Nothing is claimed for it, so the later
+// async_payment_succeeded event fulfils it through this same path.
+func (h *StripeHandler) onCheckoutCompleted(ctx context.Context, raw json.RawMessage) error {
 	var data struct {
-		ID            string            `json:"id"`
-		CustomerEmail string            `json:"customer_email"`
+		ID              string `json:"id"`
+		CustomerEmail   string `json:"customer_email"`
+		CustomerDetails *struct {
+			Email string `json:"email"`
+		} `json:"customer_details"`
 		Customer      string            `json:"customer"`
 		Subscription  string            `json:"subscription"`
 		PaymentIntent string            `json:"payment_intent"`
+		PaymentStatus string            `json:"payment_status"`
 		Mode          string            `json:"mode"`
 		Metadata      map[string]string `json:"metadata"`
 	}
 	if json.Unmarshal(raw, &data) != nil {
-		return
+		return nil
+	}
+	if !sessionPaid(data.PaymentStatus) {
+		// Remember it: if async_payment_succeeded is lost, the
+		// periodic SyncPendingCheckouts still picks the session up.
+		// That marker is the whole point of this branch, so failing
+		// to write it fails the event.
+		if _, err := h.Store.ClaimProcessedEvent(ctx, pendingSessionProvider, data.ID); err != nil {
+			return fmt.Errorf("record pending session %s: %w", data.ID, err)
+		}
+		slog.Info("stripe checkout: session not paid yet, waiting", "session_id", data.ID, "payment_status", data.PaymentStatus)
+		return nil
+	}
+	email := data.CustomerEmail
+	if email == "" && data.CustomerDetails != nil {
+		email = data.CustomerDetails.Email
 	}
 	if data.Metadata == nil {
 		data.Metadata = map[string]string{}
 	}
 	data.Metadata["session_id"] = data.ID
-	h.fulfillCheckout(ctx, data.CustomerEmail, data.Customer, data.Subscription, data.Metadata, "webhook")
+	ok, err := h.fulfillCheckout(ctx, email, data.Customer, data.Subscription, data.PaymentIntent, data.Metadata, "webhook")
+	if !ok {
+		// Not fulfilled here — a transient failure, another worker
+		// mid-way, or a plan/email the operator still has to fix. The
+		// pending marker keeps the session in SyncPendingCheckouts for
+		// 30 days; on an error Stripe also retries meanwhile.
+		if _, perr := h.Store.ClaimProcessedEvent(ctx, pendingSessionProvider, data.ID); perr != nil {
+			return fmt.Errorf("record pending session %s: %w", data.ID, perr)
+		}
+	}
+	return err
 }
 
-// fulfillCheckout creates a license for a completed checkout session.
-// Idempotent: skips if an active license already exists for this email+product.
-// Called by webhook, success page verification, and periodic sync.
-func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, subscriptionID string, metadata map[string]string, source string) {
-	// Idempotency: use Stripe session ID if available to prevent duplicate processing
-	if metadata != nil && metadata["session_id"] != "" {
-		if !h.Store.TryRecordProcessedEvent(ctx, "stripe_fulfill", metadata["session_id"]) {
-			return
+// supportedAPIVersion reports whether this build parses events
+// rendered at the given Stripe API version. The handlers read two
+// layouts: the pre-2025-03-31 one (dotless date versions and the
+// Acacia train) and the Basil one the SDK is pinned to. Any other
+// train may carry fields in places the parsers do not look, and must
+// not be acknowledged as applied.
+func supportedAPIVersion(v string) bool {
+	if v == "" {
+		return false
+	}
+	i := strings.Index(v, ".")
+	if i < 0 {
+		return true // yyyy-MM-dd: legacy layout
+	}
+	switch v[i+1:] {
+	case "acacia":
+		return true // last pre-Basil train, legacy layout
+	}
+	return sameReleaseTrain(v, stripe.APIVersion)
+}
+
+// pendingSessionProvider keys processed_events rows for sessions that
+// completed before their delayed payment settled.
+const pendingSessionProvider = "stripe_pending_session"
+
+func (h *StripeHandler) onAsyncPaymentFailed(ctx context.Context, raw json.RawMessage) {
+	var data struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(raw, &data) != nil || data.ID == "" {
+		return
+	}
+	_ = h.Store.DeleteProcessedEvent(ctx, pendingSessionProvider, data.ID)
+	slog.Info("stripe checkout: delayed payment failed, session dropped", "session_id", data.ID)
+}
+
+func sessionPaid(status string) bool {
+	return status == "paid" || status == "no_payment_required"
+}
+
+// sessionEmail prefers the email Stripe attached to the session and
+// falls back to the address typed during Checkout — guest checkouts
+// on Payment Links carry only the latter.
+func sessionEmail(sess *stripe.CheckoutSession) string {
+	if sess.CustomerEmail != "" {
+		return sess.CustomerEmail
+	}
+	if sess.CustomerDetails != nil {
+		return sess.CustomerDetails.Email
+	}
+	return ""
+}
+
+// fulfillCheckout creates a license for a completed checkout session
+// and reports whether the session is fulfilled (now or earlier).
+// Idempotent per session: the session ID is claimed atomically right
+// before the license is written, so the webhook, success-page
+// verification and periodic sync can all see the same session and
+// only one license comes out. A customer who completes a second
+// checkout for the same product gets a second license — one paid
+// session, one license.
+//
+// The bool says whether the session is fulfilled (now or earlier). A
+// non-nil error is a transient failure (Stripe or database) — the
+// caller should retry later; permanent conditions (unknown plan, no
+// email) return false with no error.
+func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, subscriptionID, paymentIntentID string, metadata map[string]string, source string) (bool, error) {
+	sessionID := ""
+	if metadata != nil {
+		sessionID = metadata["session_id"]
+	}
+	if sessionID != "" {
+		done, err := h.sessionFulfilled(ctx, sessionID)
+		if err != nil {
+			return false, fmt.Errorf("check session: %w", err)
+		}
+		if done {
+			return true, nil
 		}
 	}
 	var plan *model.Plan
+	var err error
 
 	if subscriptionID != "" {
-		plan = h.resolvePlan(ctx, subscriptionID)
+		if plan, err = h.resolvePlan(ctx, subscriptionID); err != nil {
+			return false, fmt.Errorf("resolve plan from subscription: %w", err)
+		}
 	}
 	if plan == nil && metadata != nil && metadata["plan_id"] != "" {
-		plan, _ = h.Store.FindPlanByID(ctx, metadata["plan_id"])
+		// FindPlanByID hands back a non-nil empty plan together with
+		// the error; a deleted plan must read as "no plan", a database
+		// failure as transient — never as an empty plan to insert.
+		switch p, err := h.Store.FindPlanByID(ctx, metadata["plan_id"]); {
+		case err == nil:
+			plan = p
+		case !errors.Is(err, sql.ErrNoRows):
+			return false, fmt.Errorf("find plan %s: %w", metadata["plan_id"], err)
+		}
+	}
+	// Sessions created outside Keygate (Stripe Payment Links, the
+	// merchant's own integration) carry no plan_id metadata, and a
+	// one-time payment has no subscription to look up. The line items
+	// still say which price was bought — resolve the plan from that.
+	if plan == nil && sessionID != "" {
+		if plan, err = h.resolvePlanFromLineItems(ctx, sessionID); err != nil {
+			return false, fmt.Errorf("resolve plan from line items: %w", err)
+		}
 	}
 	if plan == nil {
 		slog.Warn("stripe checkout: could not resolve plan", "subscription_id", subscriptionID, "metadata", metadata, "source", source)
-		return
+		return false, nil
 	}
 
 	// Resolve email from Stripe Customer (authoritative source)
 	if customerID != "" {
-		if cust, err := stripecustomer.Get(customerID, nil); err == nil && cust.Email != "" {
+		cust, err := stripecustomer.Get(customerID, nil)
+		switch {
+		case err == nil && cust.Email != "":
 			email = cust.Email
+		case err != nil && !stripeNotFound(err):
+			return false, fmt.Errorf("fetch customer: %w", err)
 		}
 	}
 
 	if email == "" {
 		slog.Warn("stripe checkout: no customer email, skipping", "customer_id", customerID, "source", source)
-		return
+		return false, nil
 	}
 
-	// Prevent duplicate
-	{
-		if existing := h.Store.FindActiveLicenseByEmailAndProduct(ctx, email, plan.ProductID); existing != nil {
-			slog.Info("stripe checkout: license already exists",
-				"email", email, "product_id", plan.ProductID, "existing_license", existing.ID, "source", source)
-			return
+	// Claim the session only now, after every Stripe lookup succeeded:
+	// a transient API error above must leave the session unclaimed so
+	// the success page or the periodic sync can pick it up. The insert
+	// is atomic, so concurrent callers still produce a single license.
+	if sessionID != "" {
+		claimed, err := h.claimSession(ctx, sessionID)
+		if err != nil {
+			return false, fmt.Errorf("claim session: %w", err)
+		}
+		if !claimed {
+			// Fulfilled meanwhile, or claimed by a caller still
+			// running. Only the former is a completed fulfilment.
+			done, err := h.sessionFulfilled(ctx, sessionID)
+			if err != nil {
+				return false, fmt.Errorf("check session: %w", err)
+			}
+			return done, nil
 		}
 	}
 
@@ -363,13 +667,41 @@ func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, 
 	if subscriptionID != "" {
 		lic.StripeSubscriptionID = subscriptionID
 	}
+	lic.StripePaymentIntentID = paymentIntentID
+	lic.StripeCheckoutSessionID = sessionID
 
 	// Ensure user record exists so they appear in Customers
 	_ = h.Store.UpsertUser(ctx, &model.User{Email: email})
 
 	if err := h.Store.CreateLicenseWithSubscription(ctx, lic, plan); err != nil {
+		if store.IsCheckoutSessionConflict(err) {
+			// Another worker fulfilled this session while we held (or
+			// had lost) the claim — its license stands, ours is refused
+			// by the unique index. Nothing to release.
+			slog.Warn("stripe checkout: session fulfilled concurrently", "session_id", sessionID)
+			return true, nil
+		}
 		slog.Error("stripe checkout: failed to create license", "email", email, "error", err)
-		return
+		// Release the claim: the customer has paid, and a later
+		// webhook retry, success-page visit or sync must be able to
+		// try again instead of short-circuiting on the marker.
+		if sessionID != "" {
+			if derr := h.release(ctx, fulfilledSessionProvider, sessionClaimProvider, sessionID); derr != nil {
+				slog.Error("stripe checkout: failed to release session claim", "session_id", sessionID, "error", derr)
+			}
+		}
+		return false, fmt.Errorf("create license: %w", err)
+	}
+	if sessionID != "" {
+		// The reservation stays as the durable done marker; the
+		// in-flight marker goes. Failing here is not fatal: the license
+		// (with its session id) already answers every retry.
+		if err := h.Store.CompleteProcessedEvent(ctx, sessionClaimProvider, sessionID); err != nil {
+			slog.Error("stripe checkout: failed to record session completion", "session_id", sessionID, "error", err)
+		}
+		// The session is no longer pending; a marker left by an
+		// earlier unpaid completion or a racing worker goes away.
+		_ = h.Store.DeleteProcessedEvent(ctx, pendingSessionProvider, sessionID)
 	}
 
 	// Link license to user
@@ -406,6 +738,7 @@ func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, 
 	}
 
 	slog.Info("license created", "email", email, "plan", plan.Name, "source", source)
+	return true, nil
 }
 
 // VerifyCheckoutSession handles GET /api/v1/checkout/verify?session_id=xxx
@@ -423,11 +756,95 @@ func (h *StripeHandler) VerifyCheckoutSession(c *gin.Context) {
 		return
 	}
 
-	if sess.PaymentStatus != "paid" && sess.PaymentStatus != "no_payment_required" {
+	if !sessionPaid(string(sess.PaymentStatus)) {
 		response.OK(c, gin.H{"status": "pending"})
 		return
 	}
 
+	ok, err := h.fulfillSession(c.Request.Context(), sess, "verify")
+	if !ok {
+		h.Store.TryRecordProcessedEvent(c, pendingSessionProvider, sess.ID)
+	}
+	if err != nil {
+		slog.Warn("stripe verify: transient fulfilment failure", "session_id", sess.ID, "error", err)
+		response.Err(c, http.StatusServiceUnavailable, "FULFILLMENT_RETRY", "payment confirmed; license delivery is being retried")
+		return
+	}
+	if !ok {
+		// Paid, but no license yet (another worker is on it, or the
+		// plan mapping needs attention); the sync keeps trying.
+		response.OK(c, gin.H{"status": "pending", "email": sessionEmail(sess)})
+		return
+	}
+
+	response.OK(c, gin.H{"status": "ok", "email": sessionEmail(sess)})
+}
+
+// sessionFulfilled reports whether a license already exists for the
+// checkout session. A claim row alone is not proof: its owner may
+// still be running, or may have failed and released it.
+func (h *StripeHandler) sessionFulfilled(ctx context.Context, sessionID string) (bool, error) {
+	_, err := h.Store.FindLicenseByStripeCheckoutSession(ctx, sessionID)
+	if err == nil {
+		return true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	reserved, err := h.Store.HasProcessedEvent(ctx, fulfilledSessionProvider, sessionID)
+	if err != nil || !reserved {
+		return false, err
+	}
+	inflight, err := h.Store.HasProcessedEvent(ctx, sessionClaimProvider, sessionID)
+	return !inflight, err
+}
+
+// Checkout sessions follow the same two-row scheme as events: the
+// reservation under the name every binary so far has used
+// ("stripe_fulfill"), plus an in-flight marker until the license is
+// committed. Sessions older binaries fulfilled — before the upgrade or
+// while overlapping it — carry only the reservation and read as done;
+// their licenses have no session id, so that row is their record.
+const (
+	sessionClaimProvider     = "stripe_fulfill_claim"
+	fulfilledSessionProvider = "stripe_fulfill"
+)
+
+// stripeNotFound reports a 404 from Stripe: the object is gone for
+// good, which is a permanent condition, not a transient failure.
+func stripeNotFound(err error) bool {
+	var serr *stripe.Error
+	return errors.As(err, &serr) && serr.HTTPStatusCode == http.StatusNotFound
+}
+
+// staleClaimAge bounds how long a fulfilment claim may sit without a
+// license before another caller takes it over — long enough for the
+// slowest legitimate fulfilment (a few Stripe calls), short enough
+// that a crashed process does not strand a paid session.
+const staleClaimAge = 10 * time.Minute
+
+// claimSession takes the fulfilment claim for a session. A claim
+// left behind by a caller that died mid-way is released after
+// staleClaimAge; a claim released by a failed insert is simply gone.
+//
+// A database error is returned as such: the caller must treat the
+// session as not fulfilled and keep it scheduled for retry.
+func (h *StripeHandler) claimSession(ctx context.Context, sessionID string) (bool, error) {
+	claimed, _, err := h.reserve(ctx, fulfilledSessionProvider, sessionClaimProvider, sessionID, func() (bool, error) {
+		_, err := h.Store.FindLicenseByStripeCheckoutSession(ctx, sessionID)
+		if err == nil {
+			return true, nil
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	})
+	return claimed, err
+}
+
+// fulfillSession fulfils a session fetched from the Stripe API.
+func (h *StripeHandler) fulfillSession(ctx context.Context, sess *stripe.CheckoutSession, source string) (bool, error) {
 	custID := ""
 	if sess.Customer != nil {
 		custID = sess.Customer.ID
@@ -436,23 +853,82 @@ func (h *StripeHandler) VerifyCheckoutSession(c *gin.Context) {
 	if sess.Subscription != nil {
 		subID = sess.Subscription.ID
 	}
-
 	meta := sess.Metadata
 	if meta == nil {
 		meta = map[string]string{}
 	}
 	meta["session_id"] = sess.ID
+	return h.fulfillCheckout(ctx, sessionEmail(sess), custID, subID, paymentIntentID(sess), meta, source)
+}
 
-	h.fulfillCheckout(
-		c.Request.Context(),
-		sess.CustomerEmail,
-		custID,
-		subID,
-		meta,
-		"verify",
-	)
+// SyncPendingCheckouts re-checks sessions that completed before their
+// delayed payment (bank debit, voucher) settled. Those can pay hours
+// or days later, outside the window SyncRecentCheckouts scans, so a
+// lost async_payment_succeeded event would otherwise leave a paying
+// customer without a license. Only sessions this server saw complete
+// unpaid are polled; each is dropped once fulfilled or expired.
+func (h *StripeHandler) SyncPendingCheckouts(ctx context.Context) {
+	pageSize, maxPerRound := 100, 1000
+	if h.pendingBatchLimit > 0 {
+		maxPerRound = h.pendingBatchLimit
+		if pageSize > maxPerRound {
+			pageSize = maxPerRound
+		}
+	}
+	// A worker that lost the race records a pending marker after the
+	// winner already cleared it; sweep those so the backlog only holds
+	// sessions that still need work.
+	if err := h.Store.DeleteFulfilledPendingSessions(ctx); err != nil {
+		slog.Warn("stripe sync: failed to sweep fulfilled pending sessions", "error", err)
+	}
+	// Continue where the previous round stopped, so a backlog larger
+	// than one round is walked to the end across rounds before the
+	// walk starts over; nothing waits behind the oldest thousand.
+	after := h.pendingAfter
+	for seen := 0; seen < maxPerRound; {
+		rows, err := h.Store.ListPendingCheckoutSessions(ctx, 30*24*time.Hour, after, pageSize)
+		if err != nil {
+			slog.Error("stripe sync: failed to list pending sessions", "error", err)
+			return
+		}
+		if len(rows) == 0 {
+			h.pendingAfter = nil // walked to the end; next round starts over
+			return
+		}
+		for i := range rows {
+			h.syncPendingSession(ctx, rows[i].SessionID)
+		}
+		seen += len(rows)
+		after = &rows[len(rows)-1]
+	}
+	h.pendingAfter = after
+}
 
-	response.OK(c, gin.H{"status": "ok", "email": sess.CustomerEmail})
+func (h *StripeHandler) syncPendingSession(ctx context.Context, id string) {
+	{
+		sess, err := session.Get(id, nil)
+		if err != nil {
+			slog.Warn("stripe sync: failed to fetch pending session", "session_id", id, "error", err)
+			return
+		}
+		switch {
+		case sessionPaid(string(sess.PaymentStatus)):
+			if ok, err := h.fulfillSession(ctx, sess, "sync"); !ok || err != nil {
+				return // try again next round
+			}
+		case sess.Status == stripe.CheckoutSessionStatusExpired:
+		default:
+			return
+		}
+		_ = h.Store.DeleteProcessedEvent(ctx, pendingSessionProvider, id)
+	}
+}
+
+func paymentIntentID(sess *stripe.CheckoutSession) string {
+	if sess == nil || sess.PaymentIntent == nil {
+		return ""
+	}
+	return sess.PaymentIntent.ID
 }
 
 // SyncRecentCheckouts scans Stripe for completed checkout sessions in the last
@@ -469,41 +945,94 @@ func (h *StripeHandler) SyncRecentCheckouts(ctx context.Context) {
 	iter := session.List(params)
 	for iter.Next() {
 		sess := iter.CheckoutSession()
-		if sess.PaymentStatus != "paid" && sess.PaymentStatus != "no_payment_required" {
+		if !sessionPaid(string(sess.PaymentStatus)) {
+			// Completed on a delayed payment method and the completed
+			// webhook was missed too: track it like the webhook would.
+			h.Store.TryRecordProcessedEvent(ctx, pendingSessionProvider, sess.ID)
 			continue
 		}
 
-		subID := ""
-		if sess.Subscription != nil {
-			subID = sess.Subscription.ID
+		if ok, _ := h.fulfillSession(ctx, sess, "sync"); !ok {
+			// Outside the creation window the pending marker is the
+			// only way back to this session.
+			h.Store.TryRecordProcessedEvent(ctx, pendingSessionProvider, sess.ID)
 		}
-		custID := ""
-		if sess.Customer != nil {
-			custID = sess.Customer.ID
-		}
-
-		meta := sess.Metadata
-		if meta == nil {
-			meta = map[string]string{}
-		}
-		meta["session_id"] = sess.ID
-		h.fulfillCheckout(ctx, sess.CustomerEmail, custID, subID, meta, "sync")
 	}
 	if err := iter.Err(); err != nil {
 		slog.Error("stripe sync: failed to list sessions", "error", err)
 	}
 }
 
-func (h *StripeHandler) onInvoicePaid(ctx context.Context, raw json.RawMessage) {
-	var data struct {
-		Subscription string `json:"subscription"`
-		PeriodEnd    int64  `json:"period_end"`
+// invoiceEvent is the part of an invoice webhook payload Keygate acts
+// on. Stripe moved the subscription reference in API version
+// 2025-03-31: older versions put it at invoice.subscription, current
+// ones under invoice.parent.subscription_details.subscription. Both
+// shapes arrive in practice, since a webhook endpoint keeps the API
+// version it was created with.
+type invoiceEvent struct {
+	Subscription     string `json:"subscription"`
+	PeriodEnd        int64  `json:"period_end"`
+	Customer         string `json:"customer"`
+	AmountDue        int64  `json:"amount_due"`
+	Currency         string `json:"currency"`
+	HostedInvoiceURL string `json:"hosted_invoice_url"`
+	Parent           *struct {
+		SubscriptionDetails *struct {
+			Subscription string `json:"subscription"`
+		} `json:"subscription_details"`
+	} `json:"parent"`
+}
+
+// SubscriptionID returns the subscription the invoice belongs to, in
+// either payload shape, or "" for one-off invoices.
+func (e *invoiceEvent) SubscriptionID() string {
+	if e.Subscription != "" {
+		return e.Subscription
 	}
-	if json.Unmarshal(raw, &data) != nil || data.Subscription == "" {
+	if e.Parent != nil && e.Parent.SubscriptionDetails != nil {
+		return e.Parent.SubscriptionDetails.Subscription
+	}
+	return ""
+}
+
+// subscriptionEvent is the part of a subscription webhook payload
+// Keygate acts on. current_period_end moved from the subscription to
+// its items in API version 2025-03-31; read both.
+type subscriptionEvent struct {
+	ID               string `json:"id"`
+	Status           string `json:"status"`
+	CurrentPeriodEnd int64  `json:"current_period_end"`
+	TrialEnd         int64  `json:"trial_end"`
+	Items            struct {
+		Data []struct {
+			CurrentPeriodEnd int64 `json:"current_period_end"`
+		} `json:"data"`
+	} `json:"items"`
+}
+
+// PeriodEnd returns the end of the current billing period: the
+// subscription-level value when present, else the latest item period
+// end. Zero when neither is set — callers must not write that.
+func (e *subscriptionEvent) PeriodEnd() int64 {
+	if e.CurrentPeriodEnd > 0 {
+		return e.CurrentPeriodEnd
+	}
+	var end int64
+	for _, it := range e.Items.Data {
+		if it.CurrentPeriodEnd > end {
+			end = it.CurrentPeriodEnd
+		}
+	}
+	return end
+}
+
+func (h *StripeHandler) onInvoicePaid(ctx context.Context, raw json.RawMessage) {
+	var data invoiceEvent
+	if json.Unmarshal(raw, &data) != nil || data.SubscriptionID() == "" {
 		return
 	}
 
-	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, data.Subscription)
+	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, data.SubscriptionID())
 	if err != nil {
 		return
 	}
@@ -532,11 +1061,7 @@ func (h *StripeHandler) onInvoicePaid(ctx context.Context, raw json.RawMessage) 
 }
 
 func (h *StripeHandler) onSubscriptionUpdated(ctx context.Context, raw json.RawMessage) {
-	var data struct {
-		ID               string `json:"id"`
-		Status           string `json:"status"`
-		CurrentPeriodEnd int64  `json:"current_period_end"`
-	}
+	var data subscriptionEvent
 	if json.Unmarshal(raw, &data) != nil {
 		return
 	}
@@ -585,8 +1110,14 @@ func (h *StripeHandler) onSubscriptionUpdated(ctx context.Context, raw json.RawM
 		lic.PastDueAt = nil
 	}
 
-	until := time.Unix(data.CurrentPeriodEnd, 0)
-	lic.ValidUntil = &until
+	// Only move valid_until when the payload carries a period end;
+	// writing the zero value would expire the license on the spot.
+	if end := data.PeriodEnd(); end > 0 {
+		until := time.Unix(end, 0)
+		lic.ValidUntil = &until
+	} else {
+		cols = []string{"status", "canceled_at", "past_due_at"}
+	}
 	_ = h.Store.UpdateLicenseAndSubscription(ctx, lic, cols...)
 
 	// Recovery notification fires only on past_due → active. Routed
@@ -666,14 +1197,12 @@ func (h *StripeHandler) onSubscriptionDeleted(ctx context.Context, raw json.RawM
 }
 
 func (h *StripeHandler) onPaymentFailed(ctx context.Context, raw json.RawMessage) {
-	var data struct {
-		Subscription string `json:"subscription"`
-	}
-	if json.Unmarshal(raw, &data) != nil || data.Subscription == "" {
+	var data invoiceEvent
+	if json.Unmarshal(raw, &data) != nil || data.SubscriptionID() == "" {
 		return
 	}
 
-	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, data.Subscription)
+	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, data.SubscriptionID())
 	if err != nil {
 		return
 	}
@@ -697,7 +1226,7 @@ func (h *StripeHandler) onPaymentFailed(ctx context.Context, raw json.RawMessage
 	}
 }
 
-func (h *StripeHandler) onChargeRefunded(ctx context.Context, raw json.RawMessage) {
+func (h *StripeHandler) onChargeRefunded(ctx context.Context, raw json.RawMessage) error {
 	var data struct {
 		ID             string `json:"id"`
 		Customer       string `json:"customer"`
@@ -705,19 +1234,28 @@ func (h *StripeHandler) onChargeRefunded(ctx context.Context, raw json.RawMessag
 		AmountRefunded int64  `json:"amount_refunded"`
 		Refunded       bool   `json:"refunded"`
 		PaymentIntent  string `json:"payment_intent"`
+		Invoice        string `json:"invoice"`
 	}
 	if json.Unmarshal(raw, &data) != nil {
-		return
+		return nil
 	}
 
-	lic, err := h.Store.FindLicenseByStripeCustomer(ctx, data.Customer)
+	lic, err := h.licenseForCharge(ctx, data.ID, data.PaymentIntent, data.Invoice, data.Customer)
 	if err != nil {
-		return
+		return fmt.Errorf("locate license for charge %s: %w", data.ID, err)
+	}
+	if lic == nil {
+		return nil
 	}
 
 	if data.Refunded {
+		if lic.Status == model.StatusRevoked {
+			return nil // a second refund event for the same purchase; nothing more to take away
+		}
 		lic.Status = model.StatusRevoked
-		_ = h.Store.UpdateLicenseAndSubscription(ctx, lic, "status")
+		if err := h.Store.UpdateLicenseAndSubscription(ctx, lic, "status"); err != nil {
+			return fmt.Errorf("revoke license %s: %w", lic.ID, err)
+		}
 
 		h.Store.Audit(ctx, &model.AuditLog{
 			Entity: "license", EntityID: lic.ID, Action: "revoked",
@@ -731,6 +1269,7 @@ func (h *StripeHandler) onChargeRefunded(ctx context.Context, raw json.RawMessag
 			Changes:   map[string]any{"amount_refunded": data.AmountRefunded, "provider": "stripe"},
 		})
 	}
+	return nil
 }
 
 func (h *StripeHandler) CancelSubscription(c *gin.Context) {
@@ -925,6 +1464,96 @@ func (h *StripeHandler) ChangePlan(c *gin.Context) {
 	})
 }
 
+// licenseForCharge finds the license a charge paid for.
+//
+//   - One-time purchases: the charge's payment intent is the one the
+//     checkout session recorded on the license.
+//   - Subscription invoices: older API versions put the invoice id on
+//     the charge; current ones (2025-03-31+) don't, so the invoice is
+//     found through its payments, filtered by the payment intent.
+//     Either way the invoice's subscription names the license.
+//   - Customer only: a customer can hold several licenses, so the id
+//     alone is trusted only when it names exactly one. Revoking a
+//     guess would take a paid license away from the wrong purchase.
+//
+// nil,nil means no license is attributable (a permanent condition);
+// an error means a lookup failed and the event should be retried.
+func (h *StripeHandler) licenseForCharge(ctx context.Context, chargeID, paymentIntent, invoiceID, customerID string) (*model.License, error) {
+	if paymentIntent != "" {
+		lic, err := h.Store.FindLicenseByStripePaymentIntent(ctx, paymentIntent)
+		if err == nil {
+			return lic, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+	}
+	if invoiceID != "" {
+		inv, err := stripeinvoice.Get(invoiceID, nil)
+		if err != nil && !stripeNotFound(err) {
+			return nil, err
+		}
+		if err == nil {
+			if lic, err := h.licenseForInvoice(ctx, inv); err != nil || lic != nil {
+				return lic, err
+			}
+		}
+	}
+	if paymentIntent != "" {
+		params := &stripe.InvoicePaymentListParams{
+			Payment: &stripe.InvoicePaymentListPaymentParams{
+				Type:          stripe.String("payment_intent"),
+				PaymentIntent: stripe.String(paymentIntent),
+			},
+		}
+		params.AddExpand("data.invoice")
+		params.Filters.AddFilter("limit", "", "1")
+		iter := invoicepayment.List(params)
+		if iter.Next() {
+			if lic, err := h.licenseForInvoice(ctx, iter.InvoicePayment().Invoice); err != nil || lic != nil {
+				return lic, err
+			}
+		} else if err := iter.Err(); err != nil && !stripeNotFound(err) {
+			return nil, fmt.Errorf("list invoice payments: %w", err)
+		}
+	}
+	if customerID == "" {
+		return nil, nil
+	}
+	ls, err := h.Store.ListLicensesByStripeCustomer(ctx, customerID)
+	if err != nil {
+		return nil, err
+	}
+	if len(ls) == 0 {
+		return nil, nil
+	}
+	if len(ls) > 1 {
+		slog.Warn("stripe charge: customer holds several licenses, not acting on charge",
+			"charge_id", chargeID, "customer_id", customerID, "licenses", len(ls))
+		h.Store.Audit(ctx, &model.AuditLog{
+			Entity: "charge", EntityID: chargeID, Action: "unmatched",
+			ActorType: "webhook",
+			Changes:   map[string]any{"customer_id": customerID, "licenses": len(ls), "provider": "stripe"},
+		})
+		return nil, nil
+	}
+	return ls[0], nil
+}
+
+func (h *StripeHandler) licenseForInvoice(ctx context.Context, inv *stripe.Invoice) (*model.License, error) {
+	if inv == nil || inv.Parent == nil || inv.Parent.SubscriptionDetails == nil || inv.Parent.SubscriptionDetails.Subscription == nil {
+		return nil, nil
+	}
+	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, inv.Parent.SubscriptionDetails.Subscription.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return lic, nil
+}
+
 func (h *StripeHandler) onDisputeCreated(ctx context.Context, raw json.RawMessage) {
 	var dispute struct {
 		ID       string `json:"id"`
@@ -1086,14 +1715,11 @@ func (h *StripeHandler) ListInvoices(c *gin.Context) {
 }
 
 func (h *StripeHandler) onPaymentActionRequired(ctx context.Context, raw json.RawMessage) {
-	var data struct {
-		Subscription     string `json:"subscription"`
-		HostedInvoiceURL string `json:"hosted_invoice_url"`
-	}
-	if json.Unmarshal(raw, &data) != nil || data.Subscription == "" {
+	var data invoiceEvent
+	if json.Unmarshal(raw, &data) != nil || data.SubscriptionID() == "" {
 		return
 	}
-	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, data.Subscription)
+	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, data.SubscriptionID())
 	if err != nil {
 		return
 	}
@@ -1181,16 +1807,11 @@ func (h *StripeHandler) onTrialWillEnd(ctx context.Context, raw json.RawMessage)
 }
 
 func (h *StripeHandler) onInvoiceUpcoming(ctx context.Context, raw json.RawMessage) {
-	var data struct {
-		Customer     string `json:"customer"`
-		Subscription string `json:"subscription"`
-		AmountDue    int64  `json:"amount_due"`
-		Currency     string `json:"currency"`
-	}
-	if json.Unmarshal(raw, &data) != nil || data.Subscription == "" {
+	var data invoiceEvent
+	if json.Unmarshal(raw, &data) != nil || data.SubscriptionID() == "" {
 		return
 	}
-	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, data.Subscription)
+	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, data.SubscriptionID())
 	if err != nil {
 		return
 	}
@@ -1224,14 +1845,53 @@ func (h *StripeHandler) productName(ctx context.Context, productID string) strin
 	return "Your Software"
 }
 
-func (h *StripeHandler) resolvePlan(ctx context.Context, subID string) *model.Plan {
+// resolvePlanFromLineItems maps a checkout session to a plan through
+// the price on its first line item. Keygate creates single-item
+// sessions; a multi-item session built elsewhere fulfils its first
+// item only.
+func (h *StripeHandler) resolvePlanFromLineItems(ctx context.Context, sessionID string) (*model.Plan, error) {
+	params := &stripe.CheckoutSessionListLineItemsParams{Session: stripe.String(sessionID)}
+	params.Filters.AddFilter("limit", "", "1")
+	iter := session.ListLineItems(params)
+	if !iter.Next() {
+		if err := iter.Err(); err != nil && !stripeNotFound(err) {
+			return nil, err
+		}
+		return nil, nil
+	}
+	item := iter.LineItem()
+	if item.Price == nil || item.Price.ID == "" {
+		return nil, nil
+	}
+	return h.planForPrice(ctx, item.Price.ID)
+}
+
+// resolvePlan maps a subscription to a plan through its first item's
+// price. nil,nil when the subscription has no items or the price is
+// not mapped; an error for Stripe or database failures.
+func (h *StripeHandler) resolvePlan(ctx context.Context, subID string) (*model.Plan, error) {
 	sub, err := subscription.Get(subID, nil)
-	if err != nil || len(sub.Items.Data) == 0 {
-		return nil
-	}
-	plan, err := h.Store.FindPlanByStripePrice(ctx, sub.Items.Data[0].Price.ID)
 	if err != nil {
-		return nil
+		if stripeNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
-	return plan
+	if len(sub.Items.Data) == 0 {
+		return nil, nil
+	}
+	return h.planForPrice(ctx, sub.Items.Data[0].Price.ID)
+}
+
+// planForPrice distinguishes "no plan uses this price" from a
+// database failure.
+func (h *StripeHandler) planForPrice(ctx context.Context, priceID string) (*model.Plan, error) {
+	plan, err := h.Store.FindPlanByStripePrice(ctx, priceID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return plan, nil
 }

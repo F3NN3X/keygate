@@ -1,7 +1,8 @@
 # Fork patches — what `custom` carries on top of upstream
 
 `license.deckshot.app` builds from this fork's **`custom`** branch, which is upstream
-`tabloy/keygate`'s `main` plus the patch set below. The fork's own `main` is kept as a clean mirror of
+`tabloy/keygate`'s `main` plus the patch set below. **Currently tracking upstream v0.1.5** (merged
+2026-09-07). The fork's own `main` is kept as a clean mirror of
 upstream, so `git log --oneline main..custom` is the authoritative, current list of deviations — this
 document is its annotated form: what each patch is, why it exists, and where the detail lives.
 
@@ -61,12 +62,11 @@ Grouped by area, newest first within each group. SHAs are the `custom` commits a
 
 ### Payments — Stripe
 
-- **Ignore webhook API-version mismatch** — `a9bbe0b`. keygate auto-registers its Stripe webhook using
-  the account's *default* API version, but its pinned `stripe-go` expects an older one, so events failed
-  signature verification and every `POST /webhook/stripe` returned 400 — issuance then rode only on the
-  success-page fallback, missing any buyer who closed the tab. Switches to `ConstructEventWithOptions`
-  with `IgnoreAPIVersionMismatch`: the HMAC signature and the livemode gate still apply; only the version
-  check is relaxed. Files: `internal/payment/stripe.go`.
+- **Ignore webhook API-version mismatch** — ~~`a9bbe0b`~~ **UPSTREAMED in v0.1.5, patch dropped
+  (2026-09-07).** Our fix relaxed the webhook API-version check via `ConstructEventWithOptions{
+  IgnoreAPIVersionMismatch: true}`. Upstream's v0.1.5 payment overhaul adopted the same approach (and
+  added a signing-secret-rotation fallback), so on taking v0.1.5 the `stripe.go` conflict was resolved by
+  taking upstream's file — our patch is no longer carried. No fork deviation remains here.
 
 ### Email
 

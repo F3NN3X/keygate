@@ -294,6 +294,14 @@ type License struct {
 	PaymentProvider      string `json:"payment_provider,omitempty"`
 	StripeCustomerID     string `json:"stripe_customer_id,omitempty"`
 	StripeSubscriptionID string `bun:",unique,nullzero" json:"stripe_subscription_id,omitempty"`
+	// StripePaymentIntentID is the payment intent of the checkout session
+	// that created this license. charge.refunded carries the same id, so
+	// a refund can be matched to exactly this license.
+	StripePaymentIntentID string `bun:",notnull,default:''" json:"stripe_payment_intent_id,omitempty"`
+	// StripeCheckoutSessionID is the checkout session that created the
+	// license; fulfilment retries use it to see whether the session
+	// already produced one.
+	StripeCheckoutSessionID string `bun:",notnull,default:''" json:"stripe_checkout_session_id,omitempty"`
 
 	Status      string     `bun:",notnull,default:'active'" json:"status"`
 	ValidFrom   time.Time  `bun:",notnull,default:now()" json:"valid_from"`

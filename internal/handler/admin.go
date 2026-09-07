@@ -358,6 +358,10 @@ func (h *AdminHandler) CreatePlan(c *gin.Context) {
 		return
 	}
 
+	if h.stripePriceTaken(c, req.StripePriceID, "") {
+		return
+	}
+
 	p := &model.Plan{
 		ProductID:       req.ProductID,
 		Name:            req.Name,
@@ -376,6 +380,10 @@ func (h *AdminHandler) CreatePlan(c *gin.Context) {
 		SortOrder:       req.SortOrder,
 	}
 	if err := h.Store.CreatePlan(c, p); err != nil {
+		if isStripePriceConflict(err) {
+			response.Err(c, http.StatusConflict, "STRIPE_PRICE_IN_USE", "stripe_price_id is already used by another plan")
+			return
+		}
 		response.Err(c, http.StatusConflict, "DUPLICATE", "plan slug already exists for this product")
 		return
 	}
@@ -516,6 +524,9 @@ func (h *AdminHandler) UpdatePlan(c *gin.Context) {
 		p.GraceDays = *req.GraceDays
 	}
 	if req.StripePriceID != nil {
+		if h.stripePriceTaken(c, *req.StripePriceID, p.ID) {
+			return
+		}
 		p.StripePriceID = *req.StripePriceID
 	}
 	if req.LicenseModel != nil {
@@ -535,10 +546,40 @@ func (h *AdminHandler) UpdatePlan(c *gin.Context) {
 	}
 
 	if err := h.Store.UpdatePlan(c, p); err != nil {
+		if isStripePriceConflict(err) {
+			response.Err(c, http.StatusConflict, "STRIPE_PRICE_IN_USE", "stripe_price_id is already used by another plan")
+			return
+		}
 		response.Internal(c)
 		return
 	}
 	response.OK(c, p)
+}
+
+// isStripePriceConflict recognises the partial unique index on
+// plans.stripe_price_id. The read-before-write check in
+// stripePriceTaken gives the friendly message; the index is what
+// makes the invariant hold under concurrent writes.
+func isStripePriceConflict(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "idx_plans_stripe_price_unique")
+}
+
+// stripePriceTaken rejects a Stripe price already mapped to another
+// plan. Checkout sessions created outside Keygate (Payment Links)
+// resolve their plan by price alone, so the mapping must be unique.
+// Writes the 409 response itself and reports whether it did.
+func (h *AdminHandler) stripePriceTaken(c *gin.Context, priceID, exceptPlanID string) bool {
+	if priceID == "" {
+		return false
+	}
+	other, err := h.Store.FindPlanByStripePrice(c, priceID)
+	if err != nil || other.ID == exceptPlanID {
+		return false
+	}
+	response.Conflict(c, "STRIPE_PRICE_IN_USE",
+		"stripe_price_id is already used by plan \""+other.Name+"\"",
+		gin.H{"plan_id": other.ID, "product_id": other.ProductID})
+	return true
 }
 
 func (h *AdminHandler) DeletePlan(c *gin.Context) {
@@ -1929,8 +1970,11 @@ var settingsEnum = map[string][]string{
 // back, so once Stripe was configured every save failed with
 // "unknown setting: stripe_webhook_secret".
 var settingsServerOwned = map[string]bool{
-	"stripe_webhook_secret":      true,
-	"stripe_webhook_endpoint_id": true,
+	"stripe_webhook_secret":                true,
+	"stripe_webhook_endpoint_id":           true,
+	"stripe_webhook_secret_previous":       true,
+	"stripe_webhook_secret_previous_until": true,
+	"stripe_webhook_retire_endpoint_id":    true,
 }
 
 func (h *AdminHandler) GetSettings(c *gin.Context) {
