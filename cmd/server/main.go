@@ -310,6 +310,8 @@ func main() {
 					return
 				case <-ticker.C:
 					stripeH.SyncRecentCheckouts(ctx)
+					stripeH.SyncPendingCheckouts(ctx)
+					stripeH.RetireReplacedEndpoint(ctx)
 				}
 			}
 		}()

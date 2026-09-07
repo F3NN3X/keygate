@@ -67,11 +67,26 @@ func (s *Store) DeleteSetting(ctx context.Context, key string) error {
 	return err
 }
 
+// SetSettings writes all keys in one transaction: callers that store
+// related state (an endpoint id with its secret, a rotation with the
+// previous secret) never leave half of it behind.
 func (s *Store) SetSettings(ctx context.Context, settings map[string]string) error {
+	if len(settings) == 0 {
+		return nil
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	for key, value := range settings {
-		if err := s.SetSetting(ctx, key, value); err != nil {
+		setting := &Setting{Key: key, Value: value}
+		if _, err := tx.NewInsert().Model(setting).
+			On("CONFLICT (key) DO UPDATE").
+			Set("value = EXCLUDED.value").
+			Exec(ctx); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
