@@ -2,12 +2,44 @@ package service
 
 import (
 	"crypto/ed25519"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/tabloy/keygate/internal/license"
 	"github.com/tabloy/keygate/internal/model"
 )
+
+// The verify envelope is a wire contract the SDK clients parse by JSON
+// key. A silent rename of activations_used / max_activations / email
+// leaves a client rendering "0 / 0" or a blank owner with no error, so
+// pin the key names (and the email omitempty) here where a DB is not
+// needed to catch a struct-tag regression.
+func TestVerifyResultJSONShape(t *testing.T) {
+	b, err := json.Marshal(VerifyResult{Email: "owner@example.com", ActivationsUsed: 2, MaxActivations: 3})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, want := range []string{`"activations_used":2`, `"max_activations":3`, `"email":"owner@example.com"`} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("verify envelope missing %s\n got: %s", want, b)
+		}
+	}
+
+	// Email is omitempty (products created without one), but the counts
+	// are always emitted — a real 0 must reach the client, not vanish.
+	b, err = json.Marshal(VerifyResult{})
+	if err != nil {
+		t.Fatalf("marshal empty: %v", err)
+	}
+	if strings.Contains(string(b), `"email"`) {
+		t.Errorf("email should be omitempty when unset, got: %s", b)
+	}
+	if !strings.Contains(string(b), `"activations_used":0`) || !strings.Contains(string(b), `"max_activations":0`) {
+		t.Errorf("counts must always emit (not omitempty), got: %s", b)
+	}
+}
 
 func TestAssertUsable(t *testing.T) {
 	svc := &LicenseService{}

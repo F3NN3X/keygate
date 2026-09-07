@@ -203,6 +203,18 @@ type VerifyResult struct {
 	// to keep the payload small for the common case.
 	ExternalCustomerID  string `json:"external_customer_id,omitempty"`
 	ExternalWorkspaceID string `json:"external_workspace_id,omitempty"`
+	// Owner email and this license's activation usage, echoed so an SDK
+	// client can show "2 / 3 devices · owner@example.com" without a
+	// second call. Safe to return here specifically: Verify only reaches
+	// this point for a caller that already holds a real key AND an active
+	// device slot (see the FindActivation gate above), so it is the
+	// license owner reading their own summary — not a new existence
+	// oracle. The per-device LIST stays behind the session-auth portal;
+	// this is only the count. Email is omitempty for products created
+	// without one; the counts are always meaningful (used is ≥ 1 here).
+	Email           string `json:"email,omitempty"`
+	ActivationsUsed int    `json:"activations_used"`
+	MaxActivations  int    `json:"max_activations"`
 }
 
 func (s *LicenseService) Verify(ctx context.Context, in VerifyInput) (*VerifyResult, error) {
@@ -271,6 +283,16 @@ func (s *LicenseService) Verify(ctx context.Context, in VerifyInput) (*VerifyRes
 		planName = lic.Plan.Name
 	}
 
+	// Activation usage for the "N / max devices" summary. Best-effort: a
+	// count read failing must not fail an otherwise-valid verify (the
+	// FindActivation above already proved the DB is reachable), so a
+	// transient error degrades to 0 and self-heals on the next refresh.
+	used, err := s.store.CountActivations(ctx, lic.ID)
+	if err != nil {
+		s.logger.Warn("verify: activation count failed", "license_id", lic.ID, "err", err)
+		used = 0
+	}
+
 	middleware.LicenseVerifications.WithLabelValues(lic.ProductID, "valid").Inc()
 
 	token, err := s.signToken(lic, in.Identifier)
@@ -289,6 +311,9 @@ func (s *LicenseService) Verify(ctx context.Context, in VerifyInput) (*VerifyRes
 		Meta:                responseMeta(),
 		ExternalCustomerID:  lic.ExternalCustomerID,
 		ExternalWorkspaceID: lic.ExternalWorkspaceID,
+		Email:               lic.Email,
+		ActivationsUsed:     used,
+		MaxActivations:      s.maxActivations(lic),
 	}, nil
 }
 
