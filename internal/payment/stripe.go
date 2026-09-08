@@ -715,14 +715,18 @@ func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, 
 		// Use DecryptLicenseKey for forward compatibility — Phase C will
 		// drop the plaintext column and direct .LicenseKey reads will be empty.
 		displayKey := h.Store.DecryptLicenseKey(lic)
-		body := fmt.Sprintf(`<!DOCTYPE html>
-<html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-<h2 style="color: #111;">Your %s License</h2>
-<p>Your <strong>%s</strong> license is ready.</p>
-<div style="background: #f4f4f5; border-radius: 8px; padding: 16px; margin: 16px 0; font-family: monospace; font-size: 18px; text-align: center; letter-spacing: 2px;">%s</div>
-<p style="color: #666; font-size: 14px;">Keep this key safe. You'll need it to activate your software.</p>
-</body></html>`, productName, plan.Name, displayKey)
-		_ = h.Store.EnqueueEmail(ctx, email, "Your license for "+productName, body)
+		// Render through the shared template so a customised
+		// email_template_license_created setting reaches buyers, not only
+		// admin-created licences. h.Email is nil only in unit tests (no email
+		// service wired); a zero-value EmailService has no store, so
+		// RenderLicenseCreated falls back to the built-in template — same
+		// html/template escaping, no duplicated inline HTML.
+		renderer := h.Email
+		if renderer == nil {
+			renderer = &service.EmailService{}
+		}
+		subject, body := renderer.RenderLicenseCreated(productName, plan.Name, displayKey)
+		_ = h.Store.EnqueueEmail(ctx, email, subject, body)
 	}
 
 	h.Store.Audit(ctx, &model.AuditLog{

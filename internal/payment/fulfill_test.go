@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,6 +20,7 @@ import (
 	"github.com/stripe/stripe-go/v82/webhook"
 
 	"github.com/tabloy/keygate/internal/model"
+	"github.com/tabloy/keygate/internal/service"
 	"github.com/tabloy/keygate/internal/store"
 )
 
@@ -78,6 +81,62 @@ func TestFulfillCheckout_OneLicensePerSession(t *testing.T) {
 	}
 	if n != 2 {
 		t.Fatalf("expected 2 licenses (two sessions, one replayed), got %d", n)
+	}
+}
+
+// TestFulfillCheckout_UsesCustomLicenseTemplate pins that a purchase
+// delivers the licence through the customised email_template_license_created
+// setting, not the built-in body. The fulfilment path used to hardcode the
+// email HTML inline and bypass the template system, so an admin's saved
+// template silently never reached buyers — only admin-created licences. With
+// an EmailService wired to the store (as in production), the enqueued email
+// must render the custom template.
+func TestFulfillCheckout_UsesCustomLicenseTemplate(t *testing.T) {
+	s, ctx := openStore(t)
+	defer s.Close()
+
+	plan := seedPlan(t, s, ctx, "CustomTmpl", "perpetual")
+
+	const marker = "KEYGATE-CUSTOM-TEMPLATE-MARKER"
+	custom := `<!DOCTYPE html><html><body><h1>` + marker +
+		`</h1><p>{{.Product}} / {{.Plan}}</p><code>{{.LicenseKey}}</code></body></html>`
+	if err := s.SetSetting(ctx, "email_template_license_created", custom); err != nil {
+		t.Fatalf("set custom template: %v", err)
+	}
+
+	// Wire the email service to the same store, the way main.go does, so
+	// getTemplate resolves the custom template. Host/from need not connect:
+	// fulfilment enqueues the email, it does not send it.
+	emailSvc := service.NewEmailService("smtp.example.com", "465", "", "",
+		"noreply@example.com", slog.New(slog.NewTextHandler(io.Discard, nil)), s)
+	h := &StripeHandler{Store: s, Email: emailSvc}
+
+	suffix := time.Now().Format("150405.000")
+	buyer := "custom-" + suffix + "@example.com"
+	if !fulfilOK(h, ctx, buyer, "", "", "",
+		map[string]string{"plan_id": plan.ID, "session_id": "cs_custom_" + suffix}, "test") {
+		t.Fatal("fulfilment did not succeed")
+	}
+
+	emails, err := s.ListPendingEmails(ctx, 500)
+	if err != nil {
+		t.Fatalf("list pending emails: %v", err)
+	}
+	var found *store.QueuedEmail
+	for _, e := range emails {
+		if e.ToAddr == buyer {
+			found = e
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("no licence email queued for %s", buyer)
+	}
+	if !strings.Contains(found.Body, marker) {
+		t.Errorf("purchase email did not use the custom template (missing %q):\n%s", marker, found.Body)
+	}
+	if !strings.Contains(found.Subject, "CustomTmpl") {
+		t.Errorf("unexpected subject: %q", found.Subject)
 	}
 }
 
