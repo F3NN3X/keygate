@@ -70,6 +70,16 @@ Grouped by area, newest first within each group. SHAs are the `custom` commits a
 
 ### Email
 
+- **Purchase emails honour the custom licence template** — 2026-09-08. The Stripe fulfilment path
+  (`fulfillCheckout`) hardcoded the licence-delivery email's HTML inline and enqueued it directly,
+  bypassing the `email_template_license_created` setting — so an admin's saved template reached only
+  *admin-created* licences (which go through `SendLicenseCreated` → `getTemplate`), never real buyers.
+  Extracts `EmailService.RenderLicenseCreated`, which honours the custom template (falling back to the
+  built-in), and renders the purchase email through it when the email service is wired; the inline body
+  remains only as the `Email == nil` unit-test fallback. A new integration test
+  (`TestFulfillCheckout_UsesCustomLicenseTemplate`) pins the money-path behaviour. Candidate to upstream.
+  Files: `internal/service/email.go`, `internal/payment/stripe.go`, `internal/payment/fulfill_test.go`.
+
 - **Implicit-TLS SMTP (SMTPS, port 465)** — `531d927`. Cloudflare Email Service offers no STARTTLS on
   587, and upstream's mailer only did plaintext-dial-then-STARTTLS. Adds an implicit-TLS (465) dial path
   so key-delivery email can leave the box. Files: `internal/service/email.go`,

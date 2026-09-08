@@ -405,15 +405,26 @@ func validateSMTPLine(s string) error {
 // "localhost" or empty values; "[127.0.0.1]" is universally accepted.
 func localHostname() string { return "[127.0.0.1]" }
 
-func (s *EmailService) SendLicenseCreated(to, productName, planName, licenseKey string) {
-	body := renderTemplate(s.getTemplate("license_created", tmplLicenseCreated), map[string]string{
+// RenderLicenseCreated builds the subject and HTML body for the
+// license-delivery email, honouring a custom email_template_license_created
+// setting when one is saved (falling back to the built-in template). Split
+// out so the Stripe purchase path can render the same way and enqueue the
+// result — otherwise a customised template only reaches admin-created
+// licences, never real buyers.
+func (s *EmailService) RenderLicenseCreated(productName, planName, licenseKey string) (subject, body string) {
+	body = renderTemplate(s.getTemplate("license_created", tmplLicenseCreated), map[string]string{
 		"Product":    productName,
 		"Plan":       planName,
 		"LicenseKey": licenseKey,
 	})
+	return "Your license for " + productName, body
+}
+
+func (s *EmailService) SendLicenseCreated(to, productName, planName, licenseKey string) {
+	subject, body := s.RenderLicenseCreated(productName, planName, licenseKey)
 	go func() {
-		if err := s.Send(to, "Your license for "+productName, body); err != nil {
-			s.logger.Error("email delivery failed", "to", to, "subject", "Your license for "+productName, "error", err)
+		if err := s.Send(to, subject, body); err != nil {
+			s.logger.Error("email delivery failed", "to", to, "subject", subject, "error", err)
 		}
 	}()
 }
