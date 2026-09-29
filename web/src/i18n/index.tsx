@@ -53,6 +53,26 @@ export function I18nProvider({ children }: { children: ReactNode }) {
   return <I18nContext.Provider value={{ locale, setLocale, t }}>{children}</I18nContext.Provider>
 }
 
+// A component that only needs a label — the toast's close button —
+// must not be able to take the whole tree down by sitting outside the
+// provider. useI18n still throws, because a page rendering text in the
+// wrong place is a bug worth seeing; this one falls back to English.
+// A crash in a provider is uncatchable by the ErrorBoundary below it,
+// and leaves a page that looks fine and answers no clicks.
+const fallbackI18n: I18nContextType = {
+  locale: "en",
+  setLocale: () => {},
+  t: (key, params) => {
+    let text: string = en[key] || key
+    if (params) for (const [k, v] of Object.entries(params)) text = text.replace(`{${k}}`, String(v))
+    return text
+  },
+}
+
+export function useI18nOptional() {
+  return useContext(I18nContext) ?? fallbackI18n
+}
+
 export function useI18n() {
   const ctx = useContext(I18nContext)
   if (!ctx) throw new Error("useI18n must be used within I18nProvider")

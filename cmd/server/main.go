@@ -5,13 +5,16 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -34,6 +37,173 @@ import (
 	"github.com/tabloy/keygate/internal/version"
 	"github.com/tabloy/keygate/pkg/response"
 )
+
+// credentialQueryParams are query parameters whose values must never
+// reach a log line. An updater sends a signed token this way when it
+// cannot set a header; the license key itself is refused in the URL,
+// but a client that tries still must not have it logged.
+var credentialQueryParams = []string{"license_key", "license_token"}
+
+// credentialPathPrefixes name the routes that carry a credential as a
+// path segment rather than a parameter. The customer portal addresses
+// a licence by its key, so the key is in the URL of every request a
+// signed-in customer makes there, on the way in and in the access log
+// on the way out. Redacting only the query string left those lines
+// holding a working credential.
+//
+// Each entry is the literal prefix up to and including the trailing
+// slash; the segment that follows it is the secret.
+var credentialPathPrefixes = []string{"/api/v1/portal/licenses/"}
+
+// credentialPathSuffixes name the first segment of each continuation
+// that may follow the secret and be kept in a log line. Keeping the
+// continuation is what makes an access log worth reading: it says
+// which endpoint was called, not merely that something under the
+// portal was. Keeping anything *else* is what leaks.
+var credentialPathSuffixes = map[string]bool{"activations": true}
+
+// redactCredentialSegments replaces the secret segment of any path
+// whose shape is known to carry one.
+//
+// It keeps the tail of the path only when the shape is exactly the
+// one the router matched: one non-empty segment holding the secret,
+// then a continuation this file knows by name. Every other shape has
+// its whole tail dropped, because in every other shape there is no
+// way to say which segment is the secret.
+//
+// That is not hypothetical. A doubled slash
+// (/portal/licenses//KG-SECRET/activations) makes the first segment
+// empty, so splitting on the first slash redacts *nothing* and hands
+// the key straight to the part that gets kept. An encoded slash
+// inside the key splits it in two and leaves the second half behind.
+// Neither request reaches a handler, since the router cleans the path
+// before matching, but the access log runs on every request that
+// arrives, matched or not, and that is where the key would land.
+//
+// A new sub-route not listed above costs a little log detail until
+// someone adds it. The failure runs in the safe direction.
+func redactCredentialSegments(path string) string {
+	for _, prefix := range credentialPathPrefixes {
+		if !strings.HasPrefix(path, prefix) {
+			continue
+		}
+		rest := path[len(prefix):]
+		if rest == "" {
+			return path
+		}
+		secret, suffix, hasSuffix := strings.Cut(rest, "/")
+		// Only the first segment of the continuation is checked. The
+		// secret is always the segment before it, so whatever follows
+		// a known continuation (an activation id, say) is not a
+		// credential and can stay.
+		head, _, _ := strings.Cut(suffix, "/")
+		if secret != "" && hasSuffix && credentialPathSuffixes[head] {
+			return prefix + "redacted/" + suffix
+		}
+		return prefix + "redacted"
+	}
+	return path
+}
+
+// redactRequestPath renders one request's path and query for a log
+// line, with every credential taken out.
+//
+// The decoded path is what gets matched against the sensitive
+// prefixes, because the decoded path is what the router matched to
+// choose a handler. RequestURI keeps whatever encoding the client
+// sent, so a request for /api/v1/portal/lic%65nses/KG-SECRET/... was
+// routed as "licenses" and handled, while a prefix test against the
+// raw string saw something else and let the key through.
+func redactRequestPath(u *url.URL) string {
+	out := redactCredentialSegments(u.Path)
+	if u.RawQuery == "" {
+		return out
+	}
+	return redactPath(out + "?" + u.RawQuery)
+}
+
+// redactPath replaces the value of every credential query parameter
+// in a "path?query" string, leaving everything else as it was.
+func redactPath(path string) string {
+	i := strings.IndexByte(path, '?')
+	if i < 0 {
+		return redactCredentialSegments(path)
+	}
+	path = redactCredentialSegments(path[:i]) + path[i:]
+	i = strings.IndexByte(path, '?')
+	query, err := url.ParseQuery(path[i+1:])
+	if err != nil {
+		// Unparseable: drop the query rather than log it unexamined.
+		return path[:i] + "?<redacted>"
+	}
+	redacted := false
+	for _, name := range credentialQueryParams {
+		if _, ok := query[name]; ok {
+			query.Set(name, "redacted")
+			redacted = true
+		}
+	}
+	if !redacted {
+		return path
+	}
+	return path[:i] + "?" + query.Encode()
+}
+
+// redactedRecovery replaces gin.Recovery(). Gin's dumps the whole
+// request on a panic — and on a broken pipe in any mode — masking
+// only Authorization, so the request URI and the license key or
+// token headers would end up in the log. This logs the same facts
+// with all three redacted, and answers 500 as gin's does. Gin
+// handles a broken pipe itself (there is no connection left to
+// answer on); its dump goes to io.Discard.
+func redactedRecovery() gin.HandlerFunc {
+	return gin.CustomRecoveryWithWriter(io.Discard, func(c *gin.Context, err any) {
+		fields := []any{
+			"method", c.Request.Method,
+			"path", redactRequestPath(c.Request.URL),
+			"client_ip", c.ClientIP(),
+			"panic", fmt.Sprint(err),
+			"stack", string(debug.Stack()),
+		}
+		for _, h := range []string{"X-License-Key", "X-License-Token", "Authorization"} {
+			if c.GetHeader(h) != "" {
+				fields = append(fields, h, "redacted")
+			}
+		}
+		slog.Error("panic recovered", fields...)
+		// The same envelope as every other 500. AbortWithStatus alone
+		// sends an empty body, which is the one reply a client cannot
+		// decode: a panic is exactly when an SDK is least able to
+		// afford a second parsing path. response.Err rather than
+		// response.Internal, because the cause is already logged above
+		// with the stack.
+		response.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"an internal error occurred")
+		c.Abort()
+	})
+}
+
+// redactedLogFormatter is gin's default log line with the query
+// string redacted.
+func redactedLogFormatter(p gin.LogFormatterParams) string {
+	if p.Latency > time.Minute {
+		p.Latency = p.Latency.Truncate(time.Second)
+	}
+	return fmt.Sprintf("[GIN] %v | %3d | %13v | %15s | %-7s %#v\n%s",
+		p.TimeStamp.Format("2006/01/02 - 15:04:05"),
+		p.StatusCode,
+		p.Latency,
+		p.ClientIP,
+		p.Method,
+		redactPath(p.Path),
+		p.ErrorMessage,
+	)
+}
+
+// defaultFeedURLTTL mirrors the STORAGE_FEED_URL_TTL default: what a
+// public feed's presigned links live for unless the operator says
+// otherwise.
+const defaultFeedURLTTL = 24 * time.Hour
 
 func main() {
 	cfg, err := config.Load()
@@ -62,14 +232,13 @@ func main() {
 	}
 	defer db.Close()
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	logger := newLogger(os.Stdout)
 
-	// Optional Redis-backed rate limiting
-	if cfg.RedisURL != "" {
-		logger.Info("Redis rate limiting enabled", "url", cfg.RedisURL)
-		// To enable: import github.com/redis/go-redis/v9 and uncomment:
-		// rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisURL})
-		// middleware.SetRateLimitBackend(middleware.NewRedisBackend(rdb))
+	// Optional Redis/Valkey backend for rate limiting shared across
+	// instances. Falls back to in-memory when REDIS_URL is unset or
+	// unreachable.
+	if redisClient := setupRedis(cfg.RedisURL, redisNamespace(cfg.BaseURL), logger); redisClient != nil {
+		defer func() { _ = redisClient.Close() }()
 	}
 
 	if cfg.StripeSecretKey != "" {
@@ -98,7 +267,8 @@ func main() {
 	// than the first /license/activate call.
 	licenseSigningPriv, err := license.PrivateKeyFromHex(cfg.LicenseSigningKey)
 	if err != nil {
-		log.Fatalf("LICENSE_SIGNING_KEY: %v", err)
+		logger.Error("LICENSE_SIGNING_KEY is unusable", "error", err)
+		os.Exit(1)
 	}
 	licenseSvc := service.NewLicenseService(db, licenseSigningPriv, logger, bf, webhookSvc, cfg.BaseURL)
 	usageSvc := service.NewUsageService(db, webhookSvc, emailSvc, logger, cfg.QuotaWarningThreshold)
@@ -141,11 +311,19 @@ func main() {
 			"value", cfg.StorageDownloadTTL, "error", err)
 		downloadTTL = 0
 	}
+	// Normalised here, not per consumer: the admin API, the store's
+	// fulfilment guard and the public feed all measure the same wait
+	// against it, and a zero left for each of them to interpret is
+	// how they came to disagree once already.
+	// Longer than store.MaxDurationSetting counts as invalid: S3 and
+	// compatible stores refuse to sign a link for that long, and it is
+	// the same ceiling the recorded bound is held to.
 	feedTTL, err := time.ParseDuration(cfg.StorageFeedURLTTL)
-	if err != nil {
-		logger.Warn("storage: invalid STORAGE_FEED_URL_TTL, using service default",
-			"value", cfg.StorageFeedURLTTL, "error", err)
-		feedTTL = 0
+	if err != nil || feedTTL <= 0 || feedTTL > store.MaxDurationSetting {
+		logger.Warn("storage: invalid STORAGE_FEED_URL_TTL, using the default",
+			"value", cfg.StorageFeedURLTTL, "max", store.MaxDurationSetting,
+			"default", defaultFeedURLTTL, "error", err)
+		feedTTL = defaultFeedURLTTL
 	}
 
 	// Master encryption key drives two independent features via HKDF:
@@ -222,6 +400,37 @@ func main() {
 	expiryChecker := service.NewExpiryChecker(db, emailSvc, webhookSvc, logger)
 	meteredSyncer := service.NewMeteredBillingSyncer(db, logger)
 	adminH := handler.NewAdminHandler(db, webhookSvc, emailSvc, expiryChecker, meteredSyncer)
+	// An update period may only be written once the links a public
+	// feed handed out have expired, and this is how long they live.
+	// The admin API and the fulfilment guard measure the same wait
+	// against the same value. Links already signed keep the lifetime
+	// they were signed with, so after lowering STORAGE_FEED_URL_TTL
+	// leave the maintenance features off until the longer-lived ones
+	// are gone.
+	db.SetFeedURLTTL(feedTTL)
+	adminH.FeedURLTTL = feedTTL
+	// Whether a Stripe subscription is over is Stripe's answer to
+	// give; the admin API asks through this rather than reaching for
+	// the SDK itself. Left nil without an API key, where the question
+	// cannot be put at all.
+	if cfg.StripeSecretKey != "" {
+		adminH.SubscriptionEnded = stripeH.SubscriptionEnded
+	}
+	// Recorded across replicas and across restarts: links signed
+	// before this start keep the lifetime they were signed with, so
+	// the wait is measured against the longest this install is known
+	// to have used, never merely the one configured now. A database
+	// that cannot answer stops the boot rather than let this replica
+	// run with a shorter one.
+	if bound, err := db.RaiseDurationSetting(context.Background(), store.SettingFeedURLTTLBound, feedTTL); err != nil {
+		logger.Error("could not record the feed url ttl bound",
+			"setting", store.SettingFeedURLTTLBound, "error", err)
+		os.Exit(1)
+	} else if bound > feedTTL {
+		logger.Info("feed url ttl: this install has signed longer-lived links before",
+			"configured", feedTTL, "bound", bound,
+			"hint", "lower the "+store.SettingFeedURLTTLBound+" setting once every replica runs the shorter TTL and the older links have expired")
+	}
 	usageH := handler.NewUsageHandler(usageSvc)
 	seatH := handler.NewSeatHandler(seatSvc)
 	entitlementH := handler.NewEntitlementHandler(entitlementSvc)
@@ -237,6 +446,7 @@ func main() {
 		BaseURL:     cfg.BaseURL,
 		DownloadTTL: downloadTTL,
 		FeedTTL:     feedTTL,
+		VerifyKey:   licenseSvc.SigningPublicKey(),
 	})
 	releaseSigningH := handler.NewReleaseSigningAdminHandler(releaseSigner, db)
 	publicPlansH := handler.NewPublicPlansHandler(db, logger)
@@ -335,7 +545,21 @@ func main() {
 	if cfg.IsProduction() {
 		gin.SetMode(gin.ReleaseMode)
 	}
-	r := gin.Default()
+	// gin.Default() logs the query string as it came in, and updaters
+	// that cannot set headers send the license key (or its token) as
+	// a query parameter — it would land in every log line, and from
+	// there in whatever collects them. Same engine, redacted path.
+	r := gin.New()
+
+	// Gin's default is to answer /api/v1/admin/products/ with a 301 to
+	// the slash-less path, carrying an HTML body. That redirect runs
+	// before NoRoute, so it is an /api/ response that is not the
+	// envelope, and a client that does not follow redirects gets HTML
+	// where it expects JSON. Off, so a stray trailing slash lands in
+	// NoRoute and is answered 404 like any other unknown path.
+	r.RedirectTrailingSlash = false
+
+	r.Use(gin.LoggerWithFormatter(redactedLogFormatter), redactedRecovery())
 
 	// Trust reverse proxy headers (Traefik, Nginx, etc.) to get real client IP.
 	// Trusts X-Forwarded-For / X-Real-Ip from private network ranges.
@@ -362,7 +586,13 @@ func main() {
 		if origin := c.GetHeader("Origin"); origin != "" {
 			if cfg.IsProduction() && origin != cfg.BaseURL {
 				if c.Request.Method == "OPTIONS" {
-					c.AbortWithStatus(http.StatusForbidden)
+					// Envelope, not an empty 403. A browser never
+					// reads a preflight body, but anything else that
+					// gets here does, and every other refusal in the
+					// API is shaped this way.
+					response.Err(c, http.StatusForbidden, "FORBIDDEN",
+						"origin not allowed")
+					c.Abort()
 					return
 				}
 				c.Next()
@@ -402,7 +632,7 @@ func main() {
 	})
 
 	// API documentation (public, read-only)
-	r.GET("/docs", func(c *gin.Context) {
+	docsPage := func(c *gin.Context) {
 		c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(`<!DOCTYPE html>
 <html><head>
 <title>Keygate API</title>
@@ -412,7 +642,16 @@ func main() {
 <script id="api-reference" data-url="/docs/openapi.yaml" data-configuration='{"hideTryIt":true}'></script>
 <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
 </body></html>`))
-	})
+	}
+
+	// The same handler on both spellings. RedirectTrailingSlash is off
+	// for the sake of the API contract, and a person typing the slash
+	// should still get the page rather than a JSON 404. Registered
+	// twice rather than re-entered through HandleContext, which would
+	// run the whole middleware chain a second time and bill the
+	// request twice in the access log and in the metrics.
+	r.GET("/docs", docsPage)
+	r.GET("/docs/", docsPage)
 	r.StaticFile("/docs/openapi.yaml", "docs/openapi.yaml")
 
 	v1 := r.Group("/api/v1")
@@ -593,7 +832,7 @@ func main() {
 			}
 			licenses, err := db.ListLicensesByEmail(c, emailStr)
 			if err != nil {
-				response.Internal(c)
+				response.Internal(c, err)
 				return
 			}
 			// model.License hides the key so it can't leak from admin
@@ -609,8 +848,15 @@ func main() {
 			for _, l := range licenses {
 				out = append(out, portalLicense{License: l, LicenseKey: db.DecryptLicenseKey(l)})
 			}
+			// The portal hides the renewal button while the switch is
+			// off; the endpoint refuses the sale regardless.
+			renewalsEnabled, err := db.MaintenanceFeaturesEnabled(c)
+			if err != nil {
+				response.Internal(c, err)
+				return
+			}
 			c.Header("Cache-Control", "no-store")
-			response.OK(c, gin.H{"licenses": out})
+			response.OK(c, gin.H{"licenses": out, "renewals_enabled": renewalsEnabled})
 		})
 		portal.PUT("/profile", func(c *gin.Context) {
 			userID, _ := c.Get("user_id")
@@ -638,13 +884,13 @@ func main() {
 			}
 
 			if err := db.UpdateUserProfile(c, uid, name); err != nil {
-				response.Internal(c)
+				response.Internal(c, err)
 				return
 			}
 
 			user, err := db.FindUserByID(c, uid)
 			if err != nil {
-				response.Internal(c)
+				response.Internal(c, err)
 				return
 			}
 
@@ -659,9 +905,9 @@ func main() {
 				response.BadRequest(c, "product_id is required")
 				return
 			}
-			plans, err := db.ListPlans(c, productID, "")
+			plans, _, err := db.ListPlans(c, productID, "", store.All)
 			if err != nil {
-				response.Internal(c)
+				response.Internal(c, err)
 				return
 			}
 			// Only return active plans with public info
@@ -675,7 +921,7 @@ func main() {
 					})
 				}
 			}
-			response.OK(c, gin.H{"plans": active})
+			response.OK(c, gin.H{"plans": response.Array(active)})
 		})
 		// Both portal guards parse the request body to extract
 		// license_key. Without an explicit cap a logged-in user could
@@ -824,6 +1070,9 @@ func main() {
 		portal.POST("/subscription/cancel", stripeH.CancelSubscription)
 		portal.POST("/subscription/billing-portal", stripeH.CreatePortalSession)
 		portal.GET("/subscription/invoices", stripeH.ListInvoices)
+		// Maintenance renewal for perpetual licenses: a one-time
+		// checkout that extends updates_until.
+		portal.POST("/updates/renew", stripeH.RenewUpdates)
 	}
 
 	// Admin route layout: three groups under /admin, all sharing the
@@ -884,13 +1133,20 @@ func main() {
 		licWrite.GET("/licenses/export", adminH.ExportLicenses)
 		licWrite.GET("/licenses/:id", adminH.GetLicense)
 		licWrite.GET("/licenses/:id/key", adminH.RevealLicenseKey)
+		// Mails the key to the address on the licence, for a send
+		// that never arrived. Recipient is not caller-supplied.
+		licWrite.POST("/licenses/:id/resend-email", adminH.ResendLicenseEmail)
 		licWrite.POST("/licenses", adminH.CreateLicense)
 		licWrite.POST("/licenses/:id/refund", adminH.RefundLicense)
 		licWrite.POST("/licenses/:id/revoke", adminH.RevokeLicense)
 		licWrite.POST("/licenses/:id/suspend", adminH.SuspendLicense)
 		licWrite.POST("/licenses/:id/reinstate", adminH.ReinstateLicense)
 		licWrite.POST("/licenses/:id/valid-until", adminH.SetLicenseValidUntil)
+		licWrite.POST("/licenses/:id/updates-until", adminH.SetLicenseUpdatesUntil)
 		licWrite.POST("/licenses/:id/change-plan", adminH.ChangeLicensePlan)
+		// Cuts a licence loose from a subscription Stripe has
+		// finished with, so it can be managed locally again.
+		licWrite.POST("/licenses/:id/stripe/unlink", adminH.UnlinkStripeSubscription)
 		licWrite.GET("/licenses/:id/usage", adminH.ListLicenseUsage)
 		licWrite.POST("/licenses/:id/usage/reset", adminH.ResetLicenseUsage)
 		licWrite.GET("/licenses/:id/seats", adminH.ListLicenseSeats)
@@ -979,22 +1235,45 @@ func main() {
 
 	serveFrontend(r)
 
+	// Anything that reaches the router without matching a route. Gin's
+	// built-in answer is the string "404 page not found" as
+	// text/plain, which is the one reply this API gives that is not
+	// the envelope: a client decoding every response the same way hits
+	// a parse error instead of a code it can act on, and that is
+	// exactly what a typo'd path, a removed endpoint or an SDK newer
+	// than the server produces.
+	//
+	// The frontend is unaffected. serveFrontend runs as middleware and
+	// answers every non-API path itself, letting only /api, /pay,
+	// /health, /metrics and /docs through to the router, so this is
+	// reached for those prefixes and for installs with no web/dist.
+	//
+	// The message names nothing from the request. One route addresses
+	// a licence by its key (/portal/licenses/:license_key/...), so
+	// echoing the path back would hand that key to whatever reads the
+	// response — and a near-miss on that path is precisely when this
+	// handler runs.
+	r.NoRoute(func(c *gin.Context) {
+		response.NotFound(c, "no such endpoint")
+	})
+
 	srv := &http.Server{
 		Addr:    ":" + cfg.Port,
 		Handler: r,
 	}
 
 	go func() {
-		log.Printf("Keygate starting on :%s", cfg.Port)
+		logger.Info("Keygate starting", "port", cfg.Port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server: %v", err)
+			logger.Error("server stopped", "error", err)
+			os.Exit(1)
 		}
 	}()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	log.Println("Shutting down server...")
+	logger.Info("shutting down")
 
 	cancel() // cancel background context — stops all goroutines
 
@@ -1002,9 +1281,10 @@ func main() {
 	defer shutdownCancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("server forced shutdown: %v", err)
+		logger.Error("server forced shutdown", "error", err)
+		os.Exit(1)
 	}
-	log.Println("Server exited gracefully")
+	logger.Info("server exited gracefully")
 }
 
 // stripHTMLTags removes all HTML tags from a string to prevent XSS.
@@ -1027,6 +1307,46 @@ func stripHTMLTags(s string) string {
 	return result.String()
 }
 
+// frontendAssetExts are the extensions a browser asks for as files,
+// where the SPA shell would be the wrong answer.
+var frontendAssetExts = map[string]bool{
+	".js": true, ".mjs": true, ".css": true, ".map": true, ".json": true,
+	".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".svg": true, ".webp": true, ".avif": true,
+	".ico": true, ".woff": true, ".woff2": true, ".ttf": true, ".otf": true, ".wasm": true,
+}
+
+// isFrontendAsset reports whether a path was asked for as a file. A
+// route of the app's own ("/licenses/1.0", say) has an extension too,
+// so the list is explicit rather than "anything with a dot".
+func isFrontendAsset(clean string) bool {
+	return strings.HasPrefix(clean, "/assets/") || frontendAssetExts[strings.ToLower(filepath.Ext(clean))]
+}
+
+// newLogger builds the application logger and makes it the one that
+// package-level slog calls reach.
+//
+// The SetDefault is the whole point. Services are handed this logger
+// explicitly, but pkg/response is not: it writes the reason behind
+// every 500 through the package-level slog.Error, because a response
+// helper that had to be constructed with a logger would have to be
+// threaded through every handler that answers an error. Without
+// SetDefault those lines went to slog's built-in default, which is a
+// text handler on stderr, while everything else went to this one as
+// JSON on stdout. A deployment collecting the JSON stream got every
+// log line the application writes except the ones explaining its
+// 500s, which are the lines worth having.
+// It also reroutes the log package: after SetDefault, log.Print and
+// log.Fatalf are written through this handler, at Info. That is why
+// everything in main past this point logs through the returned logger
+// rather than through log. A log.Fatalf here would still exit, but it
+// would announce the server refusing to start as an INFO line, and a
+// deployment that pages on level=ERROR would never hear about it.
+func newLogger(w io.Writer) *slog.Logger {
+	logger := slog.New(slog.NewJSONHandler(w, nil))
+	slog.SetDefault(logger)
+	return logger
+}
+
 // serveFrontend serves the React SPA from web/dist if it exists.
 func serveFrontend(r *gin.Engine) {
 	distPath := "web/dist"
@@ -1036,7 +1356,7 @@ func serveFrontend(r *gin.Engine) {
 
 	indexHTML, err := os.ReadFile(distPath + "/index.html")
 	if err != nil {
-		log.Printf("WARNING: web/dist exists but index.html not found: %v", err)
+		slog.Warn("web/dist exists but index.html not found", "error", err)
 		return
 	}
 
@@ -1055,14 +1375,43 @@ func serveFrontend(r *gin.Engine) {
 		if clean := filepath.Clean(path); clean != "/" && clean != "/index.html" {
 			filePath := filepath.Join(distPath, clean)
 			if info, err := os.Stat(filePath); err == nil && !info.IsDir() {
+				if strings.HasPrefix(clean, "/assets/") {
+					// Every name under /assets carries a content hash,
+					// so one URL never changes what it holds.
+					c.Header("Cache-Control", "public, max-age=31536000, immutable")
+				}
 				c.File(filePath)
+				c.Abort()
+				return
+			}
+			// A file that is missing is a 404, not the app shell. A tab
+			// still holding an older index.html asks for the asset that
+			// build referenced; answering with HTML makes the browser
+			// refuse a script it was promised as JavaScript, and the
+			// page comes up blank with nothing in the server log to say
+			// why. A 404 sends the reload it actually needs.
+			if isFrontendAsset(clean) {
+				c.Status(http.StatusNotFound)
 				c.Abort()
 				return
 			}
 		}
 
-		// SPA fallback: serve cached index.html for all other routes.
-		c.Data(http.StatusOK, "text/html; charset=utf-8", indexHTML)
+		// SPA fallback. index.html is re-read here rather than served
+		// from the copy taken at boot: a frontend rebuilt or
+		// redeployed under a running server would otherwise keep
+		// handing out a shell that points at assets it has deleted,
+		// until someone restarts the process. The boot copy stays as
+		// the fallback for a read that fails.
+		html := indexHTML
+		if fresh, err := os.ReadFile(filepath.Join(distPath, "index.html")); err == nil {
+			html = fresh
+		}
+		// The shell names hashed assets, so it must not be held by a
+		// cache across a deploy; what it points at may be cached
+		// forever.
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "text/html; charset=utf-8", html)
 		c.Abort()
 	})
 }

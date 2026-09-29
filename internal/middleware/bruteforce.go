@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"sync"
 	"time"
@@ -39,7 +40,11 @@ func NewBruteForceProtection(maxFails int, lockout, maxLockout, window time.Dura
 	return bf
 }
 
-// RecordFailure records a failed attempt for a key (IP or license key).
+// RecordFailure records a failed attempt against a key — in practice
+// the caller's address, spelled by FailureKeyIP. Keeping a count per
+// licence key was dropped: nothing ever read it, and locking a key
+// would have let anyone who learnt it lock out the customer who
+// bought it.
 func (bf *BruteForceProtection) RecordFailure(key string) {
 	bf.mu.Lock()
 	defer bf.mu.Unlock()
@@ -108,26 +113,36 @@ func (bf *BruteForceProtection) cleanup() {
 	}
 }
 
+// RetryAfterSeconds turns what is left of a lockout into the number a
+// client is told to wait. It rounds up: truncating 59.9 to 59 sends a
+// well-behaved client back a moment early, to another 429 and no
+// better advice than the first one.
+func RetryAfterSeconds(retryAfter time.Duration) int {
+	seconds := max(int(math.Ceil(retryAfter.Seconds())), 1)
+	return seconds
+}
+
+// FailureKeyIP is how a failed licence attempt is filed: one namespace
+// shared by the middleware that blocks and the service that records,
+// because a lockout written under one spelling and looked up under
+// another never fires. The service layer builds the same string from
+// the address the handler took off the request.
+func FailureKeyIP(ip string) string { return "ip:" + ip }
+
 // LicenseBruteForceGuard is a middleware that checks brute-force state before processing.
 func LicenseBruteForceGuard(bf *BruteForceProtection) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		ip := c.ClientIP()
-		blocked, retryAfter := bf.IsBlocked(ip)
+		blocked, retryAfter := bf.IsBlocked(FailureKeyIP(c.ClientIP()))
 		if blocked {
 			BruteForceBlocks.Inc()
 			// retry_after lives in `error.details` (NOT alongside
 			// code/message) so the response shape stays the canonical
 			// envelope: { success, error: { code, message, details? } }.
-			retrySec := int(retryAfter.Seconds())
+			retrySec := RetryAfterSeconds(retryAfter)
 			c.Header("Retry-After", fmt.Sprintf("%d", retrySec))
-			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-				"success": false,
-				"error": gin.H{
-					"code":    "LOCKED_OUT",
-					"message": "too many failed attempts, please try again later",
-					"details": gin.H{"retry_after": retrySec},
-				},
-			})
+			abortWithErrorDetails(c, http.StatusTooManyRequests, "LOCKED_OUT",
+				"too many failed attempts, please try again later",
+				gin.H{"retry_after": retrySec})
 			return
 		}
 

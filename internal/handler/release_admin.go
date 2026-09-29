@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -374,7 +373,7 @@ func (h *ReleaseAdminHandler) Update(c *gin.Context) {
 			response.NotFound(c, "release not found")
 			return
 		}
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
 	if !requireKeyProductScope(c, rel.ProductID) {
@@ -405,7 +404,7 @@ func (h *ReleaseAdminHandler) Update(c *gin.Context) {
 		case store.ErrReleaseNotFound:
 			response.NotFound(c, "release not found")
 		default:
-			response.Internal(c)
+			response.Internal(c, err)
 		}
 		return
 	}
@@ -417,7 +416,7 @@ func (h *ReleaseAdminHandler) Update(c *gin.Context) {
 
 	updated, err := h.store.FindReleaseByID(c.Request.Context(), id)
 	if err != nil {
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
 	response.OK(c, updated)
@@ -444,24 +443,11 @@ func (h *ReleaseAdminHandler) Delete(c *gin.Context) {
 
 // GET /api/v1/admin/releases
 func (h *ReleaseAdminHandler) List(c *gin.Context) {
-	limit := 50
-	if v := c.Query("limit"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 || n > 200 {
-			response.BadRequest(c, "limit must be an integer between 1 and 200")
-			return
-		}
-		limit = n
-	}
-	offset := 0
-	if v := c.Query("offset"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			response.BadRequest(c, "offset must be a non-negative integer")
-			return
-		}
-		offset = n
-	}
+	// Same window every admin list takes, and the same clamp: see
+	// listPage. This endpoint used to answer 400 for a limit outside
+	// 1..200; it now serves the cap instead, which no caller can be
+	// worse off for, and says in the response what it applied.
+	page := listPage(c)
 	channel := c.Query("channel")
 	if channel != "" && !model.IsValidReleaseChannel(channel) {
 		response.BadRequest(c, "channel must be stable, beta, alpha, or dev")
@@ -496,26 +482,21 @@ func (h *ReleaseAdminHandler) List(c *gin.Context) {
 		ProductID: productID,
 		Channel:   channel,
 		Status:    status,
-		Limit:     limit,
-		Offset:    offset,
+		Limit:     page.Limit,
+		Offset:    page.Offset,
 	}
 
 	releases, err := h.store.ListReleases(c.Request.Context(), filter)
 	if err != nil {
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
 	total, err := h.store.CountReleases(c.Request.Context(), filter)
 	if err != nil {
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
-	response.OK(c, gin.H{
-		"releases": releases,
-		"total":    total,
-		"limit":    limit,
-		"offset":   offset,
-	})
+	listOK(c, "releases", releases, total, page)
 }
 
 // GET /api/v1/admin/releases/:id
@@ -530,7 +511,7 @@ func (h *ReleaseAdminHandler) Get(c *gin.Context) {
 		case store.ErrReleaseNotFound:
 			response.NotFound(c, "release not found")
 		default:
-			response.Internal(c)
+			response.Internal(c, err)
 		}
 		return
 	}

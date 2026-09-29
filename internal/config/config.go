@@ -3,6 +3,8 @@ package config
 import (
 	"encoding/hex"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -149,7 +151,7 @@ func Load() (*Config, error) {
 	cfg.QuotaWarningThreshold = envFloatOr("QUOTA_WARNING_THRESHOLD", 0.8)
 
 	if admins := os.Getenv("ADMIN_EMAILS"); admins != "" {
-		for _, e := range strings.Split(admins, ",") {
+		for e := range strings.SplitSeq(admins, ",") {
 			cfg.AdminEmails = append(cfg.AdminEmails, strings.TrimSpace(e))
 		}
 	}
@@ -185,6 +187,22 @@ func (c *Config) normalizedEnv() string {
 }
 
 func (c *Config) IsProduction() bool { return c.normalizedEnv() == "production" }
+
+// isLoopbackURL reports whether a URL points at this machine. Browsers
+// treat those as trustworthy even over plain HTTP, so a local trial
+// needs no warning about TLS.
+func isLoopbackURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
 
 func (c *Config) IsDevLoginAllowed() bool { return c.normalizedEnv() == "development" }
 
@@ -273,6 +291,14 @@ func (c *Config) ValidateSecurityDefaults() (warnings []string, fatal []string) 
 		// Must have at least one admin
 		if len(c.AdminEmails) == 0 {
 			warnings = append(warnings, "SECURITY: ADMIN_EMAILS is empty — no one can access the admin panel")
+		}
+		// Sessions ride a cookie. Over plain HTTP it travels in the
+		// clear and cannot carry the Secure attribute — the browser
+		// would drop it and every login would end in a 401 on the
+		// next request. Anything more than a local trial belongs
+		// behind TLS.
+		if !strings.HasPrefix(strings.ToLower(c.BaseURL), "https://") && !isLoopbackURL(c.BaseURL) {
+			warnings = append(warnings, "SECURITY: BASE_URL is not https — session cookies travel unprotected; put TLS in front of Keygate")
 		}
 	}
 

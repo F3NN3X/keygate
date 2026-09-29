@@ -21,17 +21,28 @@ func (s *Store) FindAddonByID(ctx context.Context, id string) (*model.Addon, err
 	return a, s.DB.NewSelect().Model(a).Where("id = ?", id).Scan(ctx)
 }
 
-func (s *Store) ListAddons(ctx context.Context, productID, search string) ([]*model.Addon, error) {
+func (s *Store) ListAddons(ctx context.Context, productID, search string, p Page) ([]*model.Addon, int, error) {
 	var out []*model.Addon
-	q := s.DB.NewSelect().Model(&out).OrderExpr("sort_order ASC, created_at DESC")
+	// The product travels with the addon. The dashboard used to name
+	// it by looking the id up in the full product list it happened to
+	// have loaded; with that list now a page, a row whose product is
+	// not on it would have shown a bare uuid.
+	q := s.DB.NewSelect().Model(&out).Relation("Product").
+		OrderExpr("addon.sort_order ASC, addon.created_at DESC, addon.id DESC")
 	if productID != "" {
-		q = q.Where("product_id = ?", productID)
+		q = q.Where("addon.product_id = ?", productID)
 	}
 	if search != "" {
-		q = q.Where("name ILIKE ? OR feature ILIKE ?", "%"+search+"%", "%"+search+"%")
+		q = q.Where("addon.name ILIKE ? OR addon.feature ILIKE ?", "%"+search+"%", "%"+search+"%")
 	}
-	err := q.Scan(ctx)
-	return out, err
+	total, err := scanPage(ctx, q, p)
+	if err != nil {
+		return nil, 0, err
+	}
+	if p.Limit <= 0 {
+		total = len(out)
+	}
+	return out, total, nil
 }
 
 func (s *Store) UpdateAddon(ctx context.Context, a *model.Addon) error {
@@ -62,9 +73,17 @@ func (s *Store) RemoveLicenseAddon(ctx context.Context, licenseID, addonID strin
 	return err
 }
 
-func (s *Store) ListLicenseAddons(ctx context.Context, licenseID string) ([]*model.LicenseAddon, error) {
+func (s *Store) ListLicenseAddons(ctx context.Context, licenseID string, p Page) ([]*model.LicenseAddon, int, error) {
 	var out []*model.LicenseAddon
-	err := s.DB.NewSelect().Model(&out).Relation("Addon").
-		Where("license_addon.license_id = ? AND license_addon.enabled = true", licenseID).Scan(ctx)
-	return out, err
+	q := s.DB.NewSelect().Model(&out).Relation("Addon").
+		Where("license_addon.license_id = ? AND license_addon.enabled = true", licenseID).
+		OrderExpr("license_addon.created_at ASC, license_addon.id ASC")
+	total, err := scanPage(ctx, q, p)
+	if err != nil {
+		return nil, 0, err
+	}
+	if p.Limit <= 0 {
+		total = len(out)
+	}
+	return out, total, nil
 }

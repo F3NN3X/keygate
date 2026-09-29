@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query"
 import { useState } from "react"
+import { ProductSelect } from "@/components/product-select"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent } from "@/components/ui/card"
 import {
@@ -25,20 +26,6 @@ export default function AuditPage() {
   const [productFilter, setProductFilter] = useState("")
   const [page, setPage] = useState(0)
   const limit = 30
-
-  const { data: productsData } = useQuery({
-    queryKey: ["admin", "products", ""],
-    queryFn: () => admin.listProducts(),
-  })
-  const products = productsData?.products || []
-  // Grouped product list keeps the dropdown scannable as the product
-  // count grows — admins can see at a glance which deployment surface
-  // (desktop / saas / hybrid) an audit row belongs to.
-  const groupedProducts = {
-    desktop: products.filter((p) => p.type === "desktop"),
-    saas: products.filter((p) => p.type === "saas"),
-    hybrid: products.filter((p) => p.type === "hybrid"),
-  }
 
   const { data, isLoading } = useQuery({
     queryKey: ["admin", "audit", entityFilter, entityIdFilter, productFilter, page],
@@ -66,11 +53,11 @@ export default function AuditPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-bold tracking-tight">{t("audit.title")}</h1>
+        <h1 className="text-2xl font-bold tracking-tight sr-only md:not-sr-only">{t("audit.title")}</h1>
         <p className="text-muted-foreground">{t("audit.subtitle")}</p>
       </div>
 
-      <div className="flex gap-4">
+      <div className="flex flex-wrap gap-3">
         <Select
           value={entityFilter || "all"}
           onValueChange={(v) => {
@@ -78,7 +65,7 @@ export default function AuditPage() {
             setPage(0)
           }}
         >
-          <SelectTrigger className="w-48">
+          <SelectTrigger className="w-full sm:w-48">
             <SelectValue placeholder={t("audit.filterEntity")} />
           </SelectTrigger>
           <SelectContent>
@@ -100,40 +87,22 @@ export default function AuditPage() {
             setEntityIdFilter(e.target.value)
             setPage(0)
           }}
-          className="w-64"
+          className="w-full sm:w-64"
         />
-        <Select
-          value={productFilter || "all"}
-          onValueChange={(v) => {
-            setProductFilter(v === "all" ? "" : v)
+        {/* Searched on the server: an install past the first page of
+            products could otherwise never filter the log by the rest
+            of them. The type still shows beside each name. */}
+        <ProductSelect
+          value={productFilter}
+          onChange={(v) => {
+            setProductFilter(v)
             setPage(0)
           }}
-        >
-          <SelectTrigger className="w-64">
-            <SelectValue placeholder={t("audit.filterProduct")} />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">{t("audit.allProducts")}</SelectItem>
-            {groupedProducts.desktop.map((p) => (
-              <SelectItem key={p.id} value={p.id}>
-                <span className="text-muted-foreground text-xs mr-2">[{t("products.desktop")}]</span>
-                {p.name}
-              </SelectItem>
-            ))}
-            {groupedProducts.saas.map((p) => (
-              <SelectItem key={p.id} value={p.id}>
-                <span className="text-muted-foreground text-xs mr-2">[{t("products.saas")}]</span>
-                {p.name}
-              </SelectItem>
-            ))}
-            {groupedProducts.hybrid.map((p) => (
-              <SelectItem key={p.id} value={p.id}>
-                <span className="text-muted-foreground text-xs mr-2">[{t("products.hybrid")}]</span>
-                {p.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+          allLabel={t("audit.allProducts")}
+          placeholder={t("audit.filterProduct")}
+          className="w-full sm:w-64"
+          withType
+        />
       </div>
 
       <Card>

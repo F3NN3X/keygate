@@ -137,6 +137,15 @@ type Product struct {
 	// Flip to false only for products that intentionally ship unsigned
 	// builds (CI test artifacts, internal tooling).
 	RequireSigning bool `bun:",notnull,default:true" json:"require_signing"`
+	// FeedLicenseRequired: the update feeds answer only when the
+	// updater sends its license key, so a maintenance period cannot
+	// be bypassed by asking for the public feed. Turn on for products
+	// sold with a maintenance period, once the updater ships the key.
+	FeedLicenseRequired bool `bun:",notnull,default:false" json:"feed_license_required"`
+	// FeedGatedAt is when FeedLicenseRequired was last switched on.
+	// The public feed is cacheable for a short while; a bounded period
+	// is refused until that cache has drained.
+	FeedGatedAt *time.Time `json:"feed_gated_at,omitempty"`
 
 	CreatedAt time.Time `bun:",nullzero,default:now()" json:"created_at"`
 }
@@ -229,12 +238,19 @@ type Plan struct {
 	// stored as the column default (e.g. 3). The DB column keeps its
 	// CREATE-TABLE default for legacy data, but the handler is now the
 	// sole source of truth for these values.
-	MaxActivations  int    `bun:",notnull" json:"max_activations"`
-	TrialDays       int    `bun:",notnull" json:"trial_days"`
-	GraceDays       int    `bun:",notnull" json:"grace_days"`
-	StripePriceID   string `json:"stripe_price_id,omitempty"`
-	LicenseModel    string `bun:",notnull" json:"license_model"` // standard | floating
-	FloatingTimeout int    `bun:",notnull" json:"floating_timeout"`
+	MaxActivations int    `bun:",notnull" json:"max_activations"`
+	TrialDays      int    `bun:",notnull" json:"trial_days"`
+	GraceDays      int    `bun:",notnull" json:"grace_days"`
+	StripePriceID  string `json:"stripe_price_id,omitempty"`
+	// Maintenance period, perpetual plans only. UpdatesDays is how
+	// long a purchase includes updates for (0 = for life). A renewal
+	// is a one-time purchase of RenewalDays more, sold at
+	// StripeRenewalPriceID; both empty means renewals are not offered.
+	UpdatesDays          int    `bun:",notnull" json:"updates_days"`
+	RenewalDays          int    `bun:",notnull" json:"renewal_days"`
+	StripeRenewalPriceID string `bun:",notnull" json:"stripe_renewal_price_id,omitempty"`
+	LicenseModel         string `bun:",notnull" json:"license_model"` // standard | floating
+	FloatingTimeout      int    `bun:",notnull" json:"floating_timeout"`
 	// TokenTTLDays is how long a signed token may be used offline
 	// before the client must verify again. 0 = server default.
 	TokenTTLDays int       `bun:",notnull" json:"token_ttl_days"`
@@ -267,6 +283,13 @@ type Entitlement struct {
 }
 
 // ─── License ───
+
+// FeedPublicMaxAge is how long shared caches may serve a public
+// update feed after it was fetched. Gating a product's feeds does not
+// reach a copy already cached, so it is one half of the wait before an
+// update period may be enforced on that product; the other half is the
+// lifetime of the presigned artifact URLs inside those copies.
+const FeedPublicMaxAge = 60 * time.Second
 
 type License struct {
 	bun.BaseModel `bun:"table:licenses"`
@@ -303,11 +326,21 @@ type License struct {
 	// already produced one.
 	StripeCheckoutSessionID string `bun:",notnull,default:''" json:"stripe_checkout_session_id,omitempty"`
 
-	Status      string     `bun:",notnull,default:'active'" json:"status"`
-	ValidFrom   time.Time  `bun:",notnull,default:now()" json:"valid_from"`
-	ValidUntil  *time.Time `json:"valid_until,omitempty"`
-	CanceledAt  *time.Time `json:"canceled_at,omitempty"`
-	SuspendedAt *time.Time `json:"suspended_at,omitempty"`
+	Status     string     `bun:",notnull,default:'active'" json:"status"`
+	ValidFrom  time.Time  `bun:",notnull,default:now()" json:"valid_from"`
+	ValidUntil *time.Time `json:"valid_until,omitempty"`
+	// UpdatesUntil ends the maintenance period of a perpetual license:
+	// the license stays valid, but releases published after this date
+	// cannot be installed. Nil means no separate limit — the license
+	// follows ValidUntil, or includes updates for life.
+	UpdatesUntil *time.Time `json:"updates_until,omitempty"`
+	// UpdatesTermsSet marks a row whose writer decided the period,
+	// including deciding there is none. It tells the database trigger
+	// apart from a replica that predates the column and simply left
+	// it out; see the migration.
+	UpdatesTermsSet bool       `bun:",notnull" json:"-"`
+	CanceledAt      *time.Time `json:"canceled_at,omitempty"`
+	SuspendedAt     *time.Time `json:"suspended_at,omitempty"`
 	// PastDueAt anchors the dunning-email ladder. Set by the
 	// payment-failed handler when the license first enters past_due;
 	// cleared on recovery / cancellation. Reading lic.UpdatedAt as
@@ -325,11 +358,26 @@ type License struct {
 	CreatedAt time.Time `bun:",nullzero,default:now()" json:"created_at"`
 	UpdatedAt time.Time `bun:",nullzero,default:now()" json:"updated_at"`
 
-	Product     *Product        `bun:"rel:belongs-to,join:product_id=id" json:"product,omitempty"`
-	Plan        *Plan           `bun:"rel:belongs-to,join:plan_id=id" json:"plan,omitempty"`
-	Activations []*Activation   `bun:"rel:has-many,join:id=license_id" json:"activations,omitempty"`
-	Seats       []*Seat         `bun:"rel:has-many,join:id=license_id" json:"seats,omitempty"`
-	Addons      []*LicenseAddon `bun:"rel:has-many,join:id=license_id" json:"addons,omitempty"`
+	Product     *Product      `bun:"rel:belongs-to,join:product_id=id" json:"product,omitempty"`
+	Plan        *Plan         `bun:"rel:belongs-to,join:plan_id=id" json:"plan,omitempty"`
+	Activations []*Activation `bun:"rel:has-many,join:id=license_id" json:"activations,omitempty"`
+
+	// ActivationCount is how many activations this license has, filled
+	// in on list responses where loading the activations themselves
+	// would mean dragging every row of every license back with the
+	// page. It is computed, never stored, so it is scan-only.
+	ActivationCount int `bun:"activation_count,scanonly" json:"activation_count"`
+
+	// ActiveSessionCount is how many floating seats are in use right
+	// now. A floating plan records occupancy in floating_sessions, not
+	// in activations, so ActivationCount answers the wrong question
+	// for one: a license with every seat taken has no activation rows
+	// at all. Both counts exist because a floating license can still
+	// activate devices; which one means "how full is it" depends on
+	// the plan's license_model.
+	ActiveSessionCount int             `bun:"active_session_count,scanonly" json:"active_session_count"`
+	Seats              []*Seat         `bun:"rel:has-many,join:id=license_id" json:"seats,omitempty"`
+	Addons             []*LicenseAddon `bun:"rel:has-many,join:id=license_id" json:"addons,omitempty"`
 }
 
 const (
@@ -529,6 +577,167 @@ type LicenseAddon struct {
 	Enabled       bool      `bun:",notnull,default:true" json:"enabled"`
 	CreatedAt     time.Time `bun:",nullzero,default:now()" json:"created_at"`
 	Addon         *Addon    `bun:"rel:belongs-to,join:addon_id=id" json:"addon,omitempty"`
+}
+
+// ─── Plan Update Terms ───
+//
+// One row per period a plan has sold, with the instant it took
+// effect. A checkout Keygate created carries the period it was sold
+// at; a Stripe Payment Link the merchant made carries nothing, and
+// this is what tells fulfilment which period the buyer was shown.
+type PlanUpdateTerms struct {
+	bun.BaseModel `bun:"table:plan_update_terms"`
+
+	ID          string `bun:",pk" json:"id"`
+	PlanID      string `bun:",notnull" json:"plan_id"`
+	UpdatesDays int    `bun:",notnull" json:"updates_days"`
+	// LicenseType is the kind of licence the plan sold then: a Stripe
+	// Payment Link carries no terms, and a session's own shape cannot
+	// tell a subscription from a trial.
+	LicenseType string `bun:",notnull" json:"license_type"`
+	// EffectiveFrom is a whole second, the one after the edit: a
+	// Stripe session carries its created time in whole seconds, so a
+	// change made during that same second must not apply to it.
+	EffectiveFrom time.Time `bun:",notnull,nullzero" json:"effective_from"`
+	// RecordedAt is when the row was actually written, and orders two
+	// edits that land inside one second.
+	RecordedAt time.Time `bun:",notnull,nullzero" json:"recorded_at"`
+}
+
+// ─── License Renewal ───
+//
+// One paid extension of a perpetual license's maintenance period.
+// The checkout session keeps fulfilment idempotent, the payment
+// intent lets a refund find the renewal it reverses, and
+// PreviousUpdatesUntil is what that refund restores.
+type LicenseRenewal struct {
+	bun.BaseModel `bun:"table:license_renewals"`
+
+	ID                      string     `bun:",pk" json:"id"`
+	LicenseID               string     `bun:",notnull" json:"license_id"`
+	StripeCheckoutSessionID string     `bun:",notnull,default:''" json:"stripe_checkout_session_id,omitempty"`
+	StripePaymentIntentID   string     `bun:",notnull,default:''" json:"stripe_payment_intent_id,omitempty"`
+	Days                    int        `bun:",notnull" json:"days"`
+	PreviousUpdatesUntil    *time.Time `json:"previous_updates_until,omitempty"`
+	// UpdatesUntil is the end this renewal produced; nil when it
+	// changed nothing (applied to a license with updates for life,
+	// or refunded before it was applied).
+	UpdatesUntil *time.Time `json:"updates_until,omitempty"`
+	RefundedAt   *time.Time `json:"refunded_at,omitempty"`
+	// SupersededAt is set when the license's period was reset outside
+	// the ledger; the renewal then belongs to a previous period.
+	SupersededAt *time.Time `json:"superseded_at,omitempty"`
+	// CreatedAt is the instant the renewal was applied and the "now"
+	// its end was computed from, so the ledger can be replayed.
+	CreatedAt time.Time `bun:",nullzero,default:now()" json:"created_at"`
+}
+
+// Counts reports whether the renewal still contributes to the
+// license's maintenance period.
+func (r *LicenseRenewal) Counts() bool { return r.RefundedAt == nil && r.UpdatesUntil != nil }
+
+// ReplayRenewals derives the maintenance end from the ledger, so a
+// refund lands on the dates a customer who never bought the refunded
+// renewal would have, in whatever order refunds arrive.
+//
+// Two cursors walk the rows oldest first. observed is the end the
+// license had at each point, counting renewals that were later
+// refunded, because they were in effect when the next one was bought.
+// net is the same walk without refunded renewals; it is the answer.
+//
+// A row whose recorded previous end is not what observed predicts
+// marks a change made outside the ledger, an admin edit. It is
+// carried as an offset rather than a new baseline: resetting net to
+// the edited date would fold every earlier renewal into it, and
+// refunding one of those would then give the money back without
+// taking the days. Applying the difference keeps both properties —
+// the edit survives, and a refund removes exactly its own renewal.
+// Only a move to or from "updates for life" cannot be expressed as
+// an offset, and there both cursors restart.
+func ReplayRenewals(renewals []*LicenseRenewal) *time.Time {
+	var observed, net *time.Time
+	for i, r := range renewals {
+		switch {
+		case i == 0 || SameEnd(r.PreviousUpdatesUntil, observed):
+			if i == 0 {
+				observed, net = r.PreviousUpdatesUntil, r.PreviousUpdatesUntil
+			}
+		case r.PreviousUpdatesUntil == nil || observed == nil:
+			observed, net = r.PreviousUpdatesUntil, r.PreviousUpdatesUntil
+		default:
+			if net != nil {
+				shifted := net.Add(r.PreviousUpdatesUntil.Sub(*observed))
+				net = &shifted
+			}
+			observed = r.PreviousUpdatesUntil
+		}
+		if r.UpdatesUntil == nil {
+			continue // changed nothing when applied
+		}
+		end := RenewedUpdatesUntil(observed, r.CreatedAt, r.Days)
+		observed = &end
+		if r.RefundedAt == nil {
+			netEnd := RenewedUpdatesUntil(net, r.CreatedAt, r.Days)
+			net = &netEnd
+		}
+	}
+	return net
+}
+
+// SameEnd compares two optional instants that went through Postgres
+// (microseconds) and Go (nanoseconds).
+func SameEnd(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Sub(*b).Abs() < time.Second
+}
+
+// EffectiveUpdatesUntil is the maintenance end that applies now. Only
+// perpetual plans have one: a license moved to a subscription follows
+// valid_until again even if a date was left behind on the row. With
+// the plan not loaded the stored date is used as-is.
+func (l *License) EffectiveUpdatesUntil() *time.Time {
+	if l.Plan != nil && l.Plan.LicenseType != "perpetual" {
+		return nil
+	}
+	return l.UpdatesUntil
+}
+
+// UpdatesUntilFor is the maintenance end a purchase of days grants.
+// Only perpetual licenses have a separate period, and zero days means
+// updates for life; both answer nil.
+func UpdatesUntilFor(licenseType string, days int, now time.Time) *time.Time {
+	if licenseType != "perpetual" || days <= 0 {
+		return nil
+	}
+	until := now.Add(time.Duration(days) * 24 * time.Hour)
+	return &until
+}
+
+// InitialUpdatesUntil is the maintenance period a new license on this
+// plan starts with, as the plan reads right now.
+func (p *Plan) InitialUpdatesUntil(now time.Time) *time.Time {
+	return UpdatesUntilFor(p.LicenseType, p.UpdatesDays, now)
+}
+
+// OffersRenewal reports whether customers can buy more maintenance
+// for licenses on this plan through Stripe. A deactivated plan was
+// taken off sale: like checkout and plan changes, renewals stop too.
+func (p *Plan) OffersRenewal() bool {
+	return p.Active && p.LicenseType == "perpetual" && p.RenewalDays > 0 && p.StripeRenewalPriceID != ""
+}
+
+// RenewedUpdatesUntil is the maintenance end after buying days more:
+// a renewal before expiry extends from the current end, a renewal
+// after expiry starts from now — the lapsed time is not sold twice
+// and not given away either.
+func RenewedUpdatesUntil(current *time.Time, now time.Time, days int) time.Time {
+	base := now
+	if current != nil && current.After(now) {
+		base = *current
+	}
+	return base.Add(time.Duration(days) * 24 * time.Hour)
 }
 
 // ─── Metered Billing (event log) ───

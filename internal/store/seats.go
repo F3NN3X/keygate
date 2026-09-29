@@ -337,12 +337,19 @@ func (s *Store) FindSeatByEmail(ctx context.Context, licenseID, email string) (*
 		Scan(ctx)
 }
 
-func (s *Store) ListSeats(ctx context.Context, licenseID string) ([]*model.Seat, error) {
+func (s *Store) ListSeats(ctx context.Context, licenseID string, p Page) ([]*model.Seat, int, error) {
 	var out []*model.Seat
-	err := s.DB.NewSelect().Model(&out).
+	q := s.DB.NewSelect().Model(&out).
 		Where("license_id = ? AND removed_at IS NULL", licenseID).
-		OrderExpr("created_at ASC").Scan(ctx)
-	return out, err
+		OrderExpr("created_at ASC, id ASC")
+	total, err := scanPage(ctx, q, p)
+	if err != nil {
+		return nil, 0, err
+	}
+	if p.Limit <= 0 {
+		total = len(out)
+	}
+	return out, total, nil
 }
 
 func (s *Store) CountActiveSeats(ctx context.Context, licenseID string) (int, error) {

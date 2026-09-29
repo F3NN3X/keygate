@@ -14,6 +14,7 @@ import {
 } from "lucide-react"
 import { useState } from "react"
 import { Link } from "react-router-dom"
+import { ProductSelect } from "@/components/product-select"
 import { showToast } from "@/components/toast"
 import {
   AlertDialog,
@@ -36,13 +37,20 @@ import {
   DataTableHeader,
   DataTablePagination,
   DataTableRow,
-  useClientPagination,
+  useServerPagination,
 } from "@/components/ui/data-table"
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { useI18n } from "@/i18n"
+import { type TranslationKeys, useI18n } from "@/i18n"
 import { admin, type WebhookConfig } from "@/lib/api"
 import { boolColor, formatDate } from "@/lib/utils"
 
@@ -74,10 +82,17 @@ export default function WebhooksPage() {
   const qc = useQueryClient()
   const [productFilter, setProductFilter] = useState<string>("")
   const [search, setSearch] = useState("")
-  const { data: productsData } = useQuery({ queryKey: ["admin", "products"], queryFn: () => admin.listProducts() })
+  const pg = useServerPagination(10, [productFilter, search])
+  const { data: productsData } = useQuery({
+    // One row is all this page needs from the catalogue: whether the
+    // install has any product at all, and which one a new form starts
+    // on. The pickers fetch their own candidates, with search.
+    queryKey: ["admin", "products", "newest"],
+    queryFn: () => admin.listProducts({ limit: 1 }),
+  })
   const { data, isLoading } = useQuery({
-    queryKey: ["admin", "webhooks", productFilter, search],
-    queryFn: () => admin.listWebhooks(productFilter || undefined, search || undefined),
+    queryKey: ["admin", "webhooks", productFilter, search, pg.page, pg.pageSize],
+    queryFn: () => admin.listWebhooks({ product_id: productFilter, search, ...pg.params }),
   })
   const [creating, setCreating] = useState(false)
   const [newSecret, setNewSecret] = useState<string | null>(null)
@@ -85,16 +100,7 @@ export default function WebhooksPage() {
   const [viewingDeliveries, setViewingDeliveries] = useState<string | null>(null)
 
   const products = productsData?.products || []
-  const webhooks = data?.webhooks || []
-  const {
-    page: wPage,
-    setPage: wSetPage,
-    pageSize: wPageSize,
-    setPageSize: wSetPageSize,
-    total: wTotal,
-    totalPages: wTotalPages,
-    paginatedItems: paginatedWebhooks,
-  } = useClientPagination(webhooks, 10)
+  const { items: paginatedWebhooks, total: wTotal, totalPages: wTotalPages } = pg.from(data, data?.webhooks)
 
   const createMut = useMutation({
     mutationFn: admin.createWebhook,
@@ -104,12 +110,14 @@ export default function WebhooksPage() {
       setNewSecret(data.secret)
       showToast(t("toast.webhookCreated"), "success")
     },
+    onError: (e: Error) => showToast(e.message, "error"),
   })
   const toggleMut = useMutation({
     mutationFn: ({ id, active }: { id: string; active: boolean }) => admin.updateWebhook(id, { active }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["admin", "webhooks"] })
     },
+    onError: (e: Error) => showToast(e.message, "error"),
   })
   const deleteMut = useMutation({
     mutationFn: (id: string) => admin.deleteWebhook(id),
@@ -117,6 +125,7 @@ export default function WebhooksPage() {
       qc.invalidateQueries({ queryKey: ["admin", "webhooks"] })
       setDeleting(null)
     },
+    onError: (e: Error) => showToast(e.message, "error"),
   })
   const testMut = useMutation({
     mutationFn: (id: string) => admin.testWebhook(id),
@@ -140,7 +149,7 @@ export default function WebhooksPage() {
     return (
       <div className="space-y-6">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">{t("webhooks.title")}</h1>
+          <h1 className="text-2xl font-bold tracking-tight sr-only md:not-sr-only">{t("webhooks.title")}</h1>
           <p className="text-muted-foreground">{t("webhooks.subtitle")}</p>
         </div>
         <Card>
@@ -161,9 +170,9 @@ export default function WebhooksPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight">{t("webhooks.title")}</h1>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h1 className="text-2xl font-bold tracking-tight sr-only md:not-sr-only">{t("webhooks.title")}</h1>
           <p className="text-muted-foreground">{t("webhooks.subtitle")}</p>
         </div>
         <Button onClick={() => setCreating(true)}>
@@ -171,25 +180,13 @@ export default function WebhooksPage() {
         </Button>
       </div>
 
-      <div className="flex gap-4">
-        <Select value={productFilter} onValueChange={(v) => setProductFilter(v === "all" ? "" : v)}>
-          <SelectTrigger className="w-48">
-            <SelectValue placeholder={t("filter.allProducts")} />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">{t("filter.allProducts")}</SelectItem>
-            {products.map((p) => (
-              <SelectItem key={p.id} value={p.id}>
-                {p.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+      <div className="flex flex-wrap gap-3">
+        <ProductSelect value={productFilter} onChange={setProductFilter} allLabel={t("filter.allProducts")} />
         <Input
           placeholder={t("common.search")}
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          className="w-64"
+          className="w-full sm:w-64"
         />
       </div>
 
@@ -285,12 +282,12 @@ export default function WebhooksPage() {
               </DataTable>
               {wTotal > 0 && (
                 <DataTablePagination
-                  page={wPage}
+                  page={pg.page}
                   totalPages={wTotalPages}
                   total={wTotal}
-                  pageSize={wPageSize}
-                  onPageChange={wSetPage}
-                  onPageSizeChange={wSetPageSize}
+                  pageSize={pg.pageSize}
+                  onPageChange={pg.setPage}
+                  onPageSizeChange={pg.setPageSize}
                 />
               )}
             </>
@@ -363,7 +360,7 @@ function CreateWebhookDialog({
 
   return (
     <Dialog open={open} onOpenChange={onClose}>
-      <DialogContent className="max-w-lg max-h-[85vh] overflow-y-auto">
+      <DialogContent className="max-w-lg">
         <DialogHeader>
           <DialogTitle>{t("webhooks.new")}</DialogTitle>
           <DialogDescription>{t("webhooks.newDesc")}</DialogDescription>
@@ -373,54 +370,51 @@ function CreateWebhookDialog({
             e.preventDefault()
             onSubmit({ product_id: productId, url, events: selectedEvents })
           }}
-          className="space-y-4"
+          className="flex min-h-0 flex-1 flex-col gap-4"
         >
-          <div className="space-y-2">
-            <Label>{t("common.product")}</Label>
-            <Select value={productId} onValueChange={setProductId}>
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {products.map((p) => (
-                  <SelectItem key={p.id} value={p.id}>
-                    {p.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="space-y-2">
-            <Label>URL</Label>
-            <Input type="url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://..." required />
-          </div>
-          <div className="space-y-2">
-            <Label>{t("webhooks.events")}</Label>
-            <div className="grid grid-cols-2 gap-2">
-              {WEBHOOK_EVENTS.map((event) => (
-                <label
-                  key={event}
-                  className="flex items-center gap-2 rounded border px-3 py-2 text-sm cursor-pointer hover:bg-accent"
-                >
-                  <input
-                    type="checkbox"
-                    checked={selectedEvents.includes(event)}
-                    onChange={() => toggleEvent(event)}
-                    className="rounded"
-                  />
-                  {event}
-                </label>
-              ))}
+          <DialogBody className="space-y-4">
+            <div className="space-y-2">
+              <Label>{t("common.product")}</Label>
+              <ProductSelect value={productId} onChange={setProductId} className="w-full" />
             </div>
-          </div>
-          <div className="flex justify-end gap-2 pt-2">
+            <div className="space-y-2">
+              <Label>URL</Label>
+              <Input
+                type="url"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                placeholder="https://..."
+                required
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>{t("webhooks.events")}</Label>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                {WEBHOOK_EVENTS.map((event) => (
+                  <label
+                    key={event}
+                    className="flex items-center gap-2 rounded border px-3 py-2 text-sm cursor-pointer hover:bg-accent"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selectedEvents.includes(event)}
+                      onChange={() => toggleEvent(event)}
+                      className="rounded"
+                    />
+                    {event}
+                  </label>
+                ))}
+              </div>
+            </div>
+          </DialogBody>
+          <DialogFooter>
             <Button type="button" variant="outline" onClick={onClose}>
               {t("common.cancel")}
             </Button>
             <Button type="submit" disabled={loading || selectedEvents.length === 0}>
               {loading ? t("common.loading") : t("common.create")}
             </Button>
-          </div>
+          </DialogFooter>
         </form>
       </DialogContent>
     </Dialog>
@@ -445,22 +439,24 @@ function SecretDialog({ secret, onClose }: { secret: string; onClose: () => void
           <DialogTitle>{t("webhooks.secretCreated")}</DialogTitle>
           <DialogDescription>{t("webhooks.secretDesc")}</DialogDescription>
         </DialogHeader>
-        <div className="space-y-4">
-          <div className="flex items-center gap-2 bg-muted rounded-lg p-3">
-            <code className="flex-1 text-sm break-all">
-              {visible ? secret : `${secret.substring(0, 12)}...${"*".repeat(20)}`}
-            </code>
-            <Button variant="ghost" size="icon" className="shrink-0" onClick={() => setVisible(!visible)}>
-              {visible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-            </Button>
-            <Button variant="ghost" size="icon" className="shrink-0" onClick={copy}>
-              {copied ? <Check className="h-4 w-4 text-emerald-600" /> : <Copy className="h-4 w-4" />}
-            </Button>
+        <DialogBody>
+          <div className="space-y-4">
+            <div className="flex items-center gap-2 bg-muted rounded-lg p-3">
+              <code className="flex-1 text-sm break-all">
+                {visible ? secret : `${secret.substring(0, 12)}...${"*".repeat(20)}`}
+              </code>
+              <Button variant="ghost" size="icon" className="shrink-0" onClick={() => setVisible(!visible)}>
+                {visible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+              </Button>
+              <Button variant="ghost" size="icon" className="shrink-0" onClick={copy}>
+                {copied ? <Check className="h-4 w-4 text-emerald-600" /> : <Copy className="h-4 w-4" />}
+              </Button>
+            </div>
+            <div className="flex justify-end">
+              <Button onClick={onClose}>Done</Button>
+            </div>
           </div>
-          <div className="flex justify-end">
-            <Button onClick={onClose}>Done</Button>
-          </div>
-        </div>
+        </DialogBody>
       </DialogContent>
     </Dialog>
   )
@@ -499,150 +495,154 @@ function DeliveryLogDialog({ webhookId, onClose }: { webhookId: string; onClose:
 
   return (
     <Dialog open onOpenChange={onClose}>
-      <DialogContent className="max-w-3xl max-h-[85vh] overflow-y-auto">
+      <DialogContent className="max-w-3xl">
         <DialogHeader>
           <DialogTitle>{t("webhooks.deliveries")}</DialogTitle>
           <DialogDescription>
             {total} {t("webhooks.deliveriesCount")}
           </DialogDescription>
         </DialogHeader>
-        {/* Status filter: lets admins drill into failed deliveries
+        <DialogBody>
+          {/* Status filter: lets admins drill into failed deliveries
             without scrolling past every delivered row. Pagination
             resets on change so the user sees the first matching page. */}
-        <div className="flex items-center gap-2 -mt-2">
-          <span className="text-xs text-muted-foreground">{t("common.status")}:</span>
-          {(["", "pending", "delivered", "failed"] as const).map((s) => (
-            <button
-              type="button"
-              key={s || "all"}
-              onClick={() => {
-                setStatusFilter(s)
-                setPage(0)
-              }}
-              className={
-                "text-xs px-2 py-1 rounded border " +
-                (statusFilter === s
-                  ? "bg-primary text-primary-foreground border-primary"
-                  : "bg-background hover:bg-muted")
-              }
-            >
-              {s === "" ? t("webhooks.statusAll") : t(`status.${s}` as const)}
-            </button>
-          ))}
-        </div>
-        {isLoading ? (
-          <div className="h-48 animate-pulse bg-muted rounded-lg" />
-        ) : deliveries.length === 0 ? (
-          <p className="text-sm text-muted-foreground py-8 text-center">{t("webhooks.noDeliveries")}</p>
-        ) : (
-          <div className="space-y-4">
-            <DataTable>
-              <DataTableHeader>
-                <DataTableRow>
-                  <DataTableHead className="w-8" />
-                  <DataTableHead>{t("webhooks.event")}</DataTableHead>
-                  <DataTableHead>{t("common.status")}</DataTableHead>
-                  <DataTableHead>{t("webhooks.response")}</DataTableHead>
-                  <DataTableHead>{t("webhooks.attempts")}</DataTableHead>
-                  <DataTableHead>{t("webhooks.delivered")}</DataTableHead>
-                </DataTableRow>
-              </DataTableHeader>
-              <DataTableBody>
-                {deliveries.map((d) => (
-                  <>
-                    <DataTableRow
-                      key={d.id}
-                      className="cursor-pointer"
-                      onClick={() => setExpandedId(expandedId === d.id ? null : d.id)}
-                    >
-                      <DataTableCell>
-                        {expandedId === d.id ? (
-                          <ChevronDown className="h-4 w-4" />
-                        ) : (
-                          <ChevronRight className="h-4 w-4" />
-                        )}
-                      </DataTableCell>
-                      <DataTableCell>
-                        <Badge variant="secondary" className="text-xs">
-                          {d.event}
-                        </Badge>
-                      </DataTableCell>
-                      <DataTableCell>
-                        <Badge
-                          className={
-                            d.status === "delivered"
-                              ? "bg-emerald-100 text-emerald-800"
-                              : d.status === "failed"
-                                ? "bg-red-100 text-red-800"
-                                : "bg-amber-100 text-amber-800"
-                          }
-                        >
-                          {t(`status.${d.status}` as any)}
-                        </Badge>
-                      </DataTableCell>
-                      <DataTableCell className="text-muted-foreground">{d.response_code ?? "-"}</DataTableCell>
-                      <DataTableCell className="text-muted-foreground">{d.attempts}</DataTableCell>
-                      <DataTableCell className="text-muted-foreground text-xs">
-                        {formatDate(d.delivered_at)}
-                      </DataTableCell>
-                    </DataTableRow>
-                    {expandedId === d.id && (
-                      <DataTableRow key={`${d.id}-detail`}>
-                        <DataTableCell colSpan={6}>
-                          <div className="space-y-2 p-2">
-                            <div className="flex items-center justify-between">
-                              <span className="text-[11px] font-mono text-muted-foreground break-all">id: {d.id}</span>
-                              {/* Resend re-fires the same event payload as a
+          <div className="flex items-center gap-2 -mt-2">
+            <span className="text-xs text-muted-foreground">{t("common.status")}:</span>
+            {(["", "pending", "delivered", "failed"] as const).map((s) => (
+              <button
+                type="button"
+                key={s || "all"}
+                onClick={() => {
+                  setStatusFilter(s)
+                  setPage(0)
+                }}
+                className={
+                  "text-xs px-2 py-1 rounded border " +
+                  (statusFilter === s
+                    ? "bg-primary text-primary-foreground border-primary"
+                    : "bg-background hover:bg-muted")
+                }
+              >
+                {s === "" ? t("webhooks.statusAll") : t(`status.${s}` as const)}
+              </button>
+            ))}
+          </div>
+          {isLoading ? (
+            <div className="h-48 animate-pulse bg-muted rounded-lg" />
+          ) : deliveries.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-8 text-center">{t("webhooks.noDeliveries")}</p>
+          ) : (
+            <div className="space-y-4">
+              <DataTable>
+                <DataTableHeader>
+                  <DataTableRow>
+                    <DataTableHead className="w-8" />
+                    <DataTableHead>{t("webhooks.event")}</DataTableHead>
+                    <DataTableHead>{t("common.status")}</DataTableHead>
+                    <DataTableHead>{t("webhooks.response")}</DataTableHead>
+                    <DataTableHead>{t("webhooks.attempts")}</DataTableHead>
+                    <DataTableHead>{t("webhooks.delivered")}</DataTableHead>
+                  </DataTableRow>
+                </DataTableHeader>
+                <DataTableBody>
+                  {deliveries.map((d) => (
+                    <>
+                      <DataTableRow
+                        key={d.id}
+                        className="cursor-pointer"
+                        onClick={() => setExpandedId(expandedId === d.id ? null : d.id)}
+                      >
+                        <DataTableCell>
+                          {expandedId === d.id ? (
+                            <ChevronDown className="h-4 w-4" />
+                          ) : (
+                            <ChevronRight className="h-4 w-4" />
+                          )}
+                        </DataTableCell>
+                        <DataTableCell>
+                          <Badge variant="secondary" className="text-xs">
+                            {d.event}
+                          </Badge>
+                        </DataTableCell>
+                        <DataTableCell>
+                          <Badge
+                            className={
+                              d.status === "delivered"
+                                ? "bg-emerald-100 text-emerald-800"
+                                : d.status === "failed"
+                                  ? "bg-red-100 text-red-800"
+                                  : "bg-amber-100 text-amber-800"
+                            }
+                          >
+                            {t(`status.${d.status}` as TranslationKeys)}
+                          </Badge>
+                        </DataTableCell>
+                        <DataTableCell className="text-muted-foreground">{d.response_code ?? "-"}</DataTableCell>
+                        <DataTableCell className="text-muted-foreground">{d.attempts}</DataTableCell>
+                        <DataTableCell className="text-muted-foreground text-xs">
+                          {formatDate(d.delivered_at)}
+                        </DataTableCell>
+                      </DataTableRow>
+                      {expandedId === d.id && (
+                        <DataTableRow key={`${d.id}-detail`}>
+                          <DataTableCell colSpan={6}>
+                            <div className="space-y-2 p-2">
+                              <div className="flex items-center justify-between">
+                                <span className="text-[11px] font-mono text-muted-foreground break-all">
+                                  id: {d.id}
+                                </span>
+                                {/* Resend re-fires the same event payload as a
                                   new delivery. We disable it while the
                                   mutation is in-flight to avoid double-send
                                   on a slow connection. */}
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                onClick={() => resendMut.mutate(d.id)}
-                                disabled={resendMut.isPending}
-                              >
-                                <RefreshCw className="h-3 w-3 mr-1" />
-                                {resendMut.isPending && resendMut.variables === d.id
-                                  ? t("common.loading")
-                                  : t("webhooks.resend")}
-                              </Button>
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() => resendMut.mutate(d.id)}
+                                  disabled={resendMut.isPending}
+                                >
+                                  <RefreshCw className="h-3 w-3 mr-1" />
+                                  {resendMut.isPending && resendMut.variables === d.id
+                                    ? t("common.loading")
+                                    : t("webhooks.resend")}
+                                </Button>
+                              </div>
+                              {d.payload && (
+                                <div>
+                                  <p className="text-xs font-medium text-muted-foreground mb-1">Payload</p>
+                                  <pre className="text-xs bg-muted rounded p-2 overflow-auto max-h-40">
+                                    {JSON.stringify(d.payload, null, 2)}
+                                  </pre>
+                                </div>
+                              )}
+                              {d.response_body && (
+                                <div>
+                                  <p className="text-xs font-medium text-muted-foreground mb-1">Response Body</p>
+                                  <pre className="text-xs bg-muted rounded p-2 overflow-auto max-h-40">
+                                    {d.response_body}
+                                  </pre>
+                                </div>
+                              )}
                             </div>
-                            {d.payload && (
-                              <div>
-                                <p className="text-xs font-medium text-muted-foreground mb-1">Payload</p>
-                                <pre className="text-xs bg-muted rounded p-2 overflow-auto max-h-40">
-                                  {JSON.stringify(d.payload, null, 2)}
-                                </pre>
-                              </div>
-                            )}
-                            {d.response_body && (
-                              <div>
-                                <p className="text-xs font-medium text-muted-foreground mb-1">Response Body</p>
-                                <pre className="text-xs bg-muted rounded p-2 overflow-auto max-h-40">
-                                  {d.response_body}
-                                </pre>
-                              </div>
-                            )}
-                          </div>
-                        </DataTableCell>
-                      </DataTableRow>
-                    )}
-                  </>
-                ))}
-              </DataTableBody>
-            </DataTable>
-            {total > 0 && (
-              <DataTablePagination
-                page={page}
-                totalPages={totalPages}
-                total={total}
-                pageSize={limit}
-                onPageChange={setPage}
-              />
-            )}
-          </div>
-        )}
+                          </DataTableCell>
+                        </DataTableRow>
+                      )}
+                    </>
+                  ))}
+                </DataTableBody>
+              </DataTable>
+              {total > 0 && (
+                <DataTablePagination
+                  page={page}
+                  totalPages={totalPages}
+                  total={total}
+                  pageSize={limit}
+                  onPageChange={setPage}
+                />
+              )}
+            </div>
+          )}
+        </DialogBody>
       </DialogContent>
     </Dialog>
   )

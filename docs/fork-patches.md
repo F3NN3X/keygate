@@ -1,8 +1,8 @@
 # Fork patches — what `custom` carries on top of upstream
 
 `license.deckshot.app` builds from this fork's **`custom`** branch, which is upstream
-`tabloy/keygate`'s `main` plus the patch set below. **Currently tracking upstream v0.1.5** (merged
-2026-09-07). The fork's own `main` is kept as a clean mirror of
+`tabloy/keygate`'s `main` plus the patch set below. **Currently tracking upstream v0.1.11** (merged
+2026-09-29; previously v0.1.5, 2026-09-07). The fork's own `main` is kept as a clean mirror of
 upstream, so `git log --oneline main..custom` is the authoritative, current list of deviations — this
 document is its annotated form: what each patch is, why it exists, and where the detail lives.
 
@@ -29,7 +29,9 @@ Grouped by area, newest first within each group. SHAs are the `custom` commits a
   `server` / `url`. The AGPL §7(b) attribution (`server` = "Keygate", `url` = keygate.app, from
   `internal/branding`) is **kept unchanged** — `instance` is additive so a caller can see which deployment
   answered without the attribution being repurposed. `LicenseService` gained a `baseURL` field, wired from
-  config in `cmd/server/main.go`. Files: `internal/service/license.go`, `cmd/server/main.go`.
+  config in `cmd/server/main.go`. `responseMeta` is therefore a method: new upstream call sites that use
+  the bare `responseMeta()` function won't compile after a merge and need `s.` added (v0.1.11's
+  activation-race path was one). Files: `internal/service/license.go`, `cmd/server/main.go`.
 
 - **`/license/verify` returns owner email + activation usage** — `b5e3d33` (2026-09-07).
   Adds `email`, `activations_used`, `max_activations` to the `VerifyResult` so an SDK client can show a
@@ -74,16 +76,20 @@ Grouped by area, newest first within each group. SHAs are the `custom` commits a
   (`fulfillCheckout`) hardcoded the licence-delivery email's HTML inline and enqueued it directly,
   bypassing the `email_template_license_created` setting — so an admin's saved template reached only
   *admin-created* licences (which go through `SendLicenseCreated` → `getTemplate`), never real buyers.
-  Extracts `EmailService.RenderLicenseCreated`, which honours the custom template (falling back to the
-  built-in), and renders the purchase email through it when the email service is wired; the inline body
-  remains only as the `Email == nil` unit-test fallback. A new integration test
-  (`TestFulfillCheckout_UsesCustomLicenseTemplate`) pins the money-path behaviour. Candidate to upstream.
-  Files: `internal/service/email.go`, `internal/payment/stripe.go`, `internal/payment/fulfill_test.go`.
+  Renders the purchase email through `EmailService.RenderLicenseCreated` (a zero-value `EmailService`
+  when none is wired, which falls back to the built-in template). Upstream v0.1.11 added its own
+  identical `RenderLicenseCreated` (for its resend feature), so our copy of that method was dropped on
+  the merge — the patch is now only the `fulfillCheckout` call site, which upstream still inlines. The
+  integration test (`TestFulfillCheckout_UsesCustomLicenseTemplate`) pins the money-path behaviour; it
+  reads `email_queue` directly since upstream replaced `ListPendingEmails` with lease-based
+  `ClaimNextEmail`. Candidate to upstream. Files: `internal/payment/stripe.go`,
+  `internal/payment/fulfill_test.go`.
 
-- **Implicit-TLS SMTP (SMTPS, port 465)** — `531d927`. Cloudflare Email Service offers no STARTTLS on
-  587, and upstream's mailer only did plaintext-dial-then-STARTTLS. Adds an implicit-TLS (465) dial path
-  so key-delivery email can leave the box. Files: `internal/service/email.go`,
-  `internal/service/email_auth_test.go`.
+- **Implicit-TLS SMTP (SMTPS, port 465)** — ~~`531d927`~~ **UPSTREAMED in v0.1.11, patch dropped
+  (2026-09-29).** Upstream's mailer now picks implicit TLS for port 465 itself (`resolvedEmail.implicitTLS`)
+  and trims the port first. Our `implicit` flag to `pickAuth` isn't needed: `smtp.NewClient` already
+  marks a `*tls.Conn` as TLS, so the LOGIN/PLAIN guards accept an SMTPS socket. Both files taken from
+  upstream on the merge; no fork deviation remains here.
 
 ### Admin analytics
 
@@ -96,7 +102,9 @@ Grouped by area, newest first within each group. SHAs are the `custom` commits a
 - **Version stamped from a `VERSION` file** — `a5bf990`, `50502a9` (supersedes the git-describe stamp in
   `0d520ab`). Dokploy clones without tags, so `git describe` produced a bare SHA the update checker read
   as `0.0.0` (perpetually "out of date"). A committed `VERSION` file is the source of truth; bump it when
-  taking a release. Files: `VERSION`, `Dockerfile`.
+  taking a release. Since v0.1.11 the build step also keeps upstream's `TARGETOS`/`TARGETARCH`
+  cross-compile args, so the Dockerfile conflict on a merge is the `RUN go build` block, and the fix is
+  to combine both. Files: `VERSION`, `Dockerfile`.
 - **Build from source, adapted for Dokploy** — `02a63cd`, `b86b415`, `14dc154`. Builds the image from
   source (`build: .`) instead of upstream's published image, with a `docker-compose.yml` shaped for
   Dokploy at `license.deckshot.app` (no published host port, `dokploy-network` for Traefik, secrets from
@@ -104,7 +112,8 @@ Grouped by area, newest first within each group. SHAs are the `custom` commits a
   container however Dokploy sets it. Files: `Dockerfile`, `docker-compose.yml`, `.dockerignore`.
 - **Forward `RELEASE_KEY_ENCRYPTION_KEY` to the container** — `95fe24b`. The whitelist above is exactly
   how this variable once went missing; this adds it (and the `STORAGE_*` set) to the compose
-  `environment:`. Files: `docker-compose.yml`, `.env.example`.
+  `environment:`. v0.1.11 added `REDIS_URL` (optional shared rate-limit backend; empty = in-memory), which
+  is forwarded the same way. Files: `docker-compose.yml`, `.env.example`.
 
 ## Cross-references
 

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"slices"
 	"testing"
 )
 
@@ -86,6 +87,40 @@ func TestValidateSecurityDefaults(t *testing.T) {
 		}
 		if !found {
 			t.Error("expected dev-login warning")
+		}
+	})
+
+	t.Run("production over plain http warns about the session cookie", func(t *testing.T) {
+		base := func(url string) *Config {
+			return &Config{
+				Environment:       "production",
+				BaseURL:           url,
+				AdminEmails:       []string{"admin@example.com"},
+				JWTSecret:         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				LicenseSigningKey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			}
+		}
+		const want = "SECURITY: BASE_URL is not https — session cookies travel unprotected; put TLS in front of Keygate"
+		warned := func(url string) bool {
+			warnings, fatal := base(url).ValidateSecurityDefaults()
+			if len(fatal) > 0 {
+				t.Fatalf("unexpected fatal for %s: %v", url, fatal)
+			}
+			return slices.Contains(warnings, want)
+		}
+		// A remote install over plain HTTP is the one that cannot log
+		// anybody in: the browser drops a Secure cookie, and without
+		// it the session travels in the clear.
+		if !warned("http://keygate.example.com") {
+			t.Error("no warning for a plain-http production install")
+		}
+		// Loopback is trustworthy to browsers, so a local trial is
+		// quiet; TLS needs no warning either.
+		if warned("http://localhost:9000") || warned("http://127.0.0.1:9000") {
+			t.Error("warned about a loopback BASE_URL")
+		}
+		if warned("https://keygate.example.com") {
+			t.Error("warned about an https BASE_URL")
 		}
 	})
 

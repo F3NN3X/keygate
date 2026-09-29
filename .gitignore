@@ -45,3 +45,6 @@ tests/
 *.out
 coverage.html
 seed
+
+# Stray build output from `go build ./cmd/server` without -o
+/server

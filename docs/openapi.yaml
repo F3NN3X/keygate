@@ -52,7 +52,7 @@ info:
     This prevents an attacker from probing valid `license_key` values
     by status-code differentiation. Paid users discover lifecycle
     state via email + the portal, not via these endpoints.
-  version: 1.1.0
+  version: 1.2.0
   contact:
     name: Keygate
     url: https://keygate.app
@@ -612,6 +612,13 @@ paths:
         If `version` is omitted, returns the latest published release
         in the channel that has an artifact for `platform`. Channel
         fallback chain applies (beta sees beta + stable, etc.).
+
+        Perpetual licenses with a maintenance period (`updates_until`
+        in the verify response) may only install releases published
+        before that date. Pinning a later version answers 403
+        `UPDATES_EXPIRED`; without a pin, "latest" is the newest
+        release published inside the period. The feed endpoints apply
+        the same limit when called with the license key.
       requestBody:
         required: true
         content:
@@ -673,7 +680,9 @@ paths:
         "400":
           description: Invalid platform / channel
         "403":
-          description: License inactive (cannot download)
+          description: |
+            `UPDATES_EXPIRED` — the requested release was published
+            after the license's maintenance period ended.
         "404":
           description: License not found or no release matches
         "410":
@@ -695,11 +704,15 @@ paths:
         - $ref: "#/components/parameters/Platform"
         - $ref: "#/components/parameters/Channel"
         - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/LicenseKey"
+        - $ref: "#/components/parameters/LicenseToken"
       responses:
         "200":
           description: Sparkle XML appcast
           content:
             application/xml: {}
+        "401":
+          description: "`LICENSE_KEY_REQUIRED` — the product requires the license token (or key) on its feeds"
         "400":
           description: Invalid platform / channel / limit
         "404":
@@ -714,11 +727,15 @@ paths:
         - $ref: "#/components/parameters/Platform"
         - $ref: "#/components/parameters/Channel"
         - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/LicenseKey"
+        - $ref: "#/components/parameters/LicenseToken"
       responses:
         "200":
           description: Velopack JSON array
           content:
             application/json: {}
+        "401":
+          description: "`LICENSE_KEY_REQUIRED` — the product requires the license token (or key) on its feeds"
         "400":
           description: Invalid platform / channel / limit
         "404":
@@ -737,6 +754,8 @@ paths:
         - $ref: "#/components/parameters/ProductSlug"
         - $ref: "#/components/parameters/Platform"
         - $ref: "#/components/parameters/Channel"
+        - $ref: "#/components/parameters/LicenseKey"
+        - $ref: "#/components/parameters/LicenseToken"
       responses:
         "200":
           description: Tauri manifest
@@ -764,6 +783,8 @@ paths:
                     type: string
         "204":
           description: No published release yet for this channel/platform
+        "401":
+          description: "`LICENSE_KEY_REQUIRED` — the product requires the license token (or key) on its feeds"
         "400":
           description: Invalid platform / channel
         "404":
@@ -800,6 +821,48 @@ components:
         type: string
         enum: [stable, beta, alpha, dev]
         default: stable
+    LicenseKey:
+      in: header
+      name: X-License-Key
+      required: false
+      schema: { type: string }
+      description: |
+        Optional, and header-only: the key is a long-lived credential
+        that also opens activate, verify and download, and one placed
+        in the URL is written to CDN, proxy and access logs before the
+        request arrives. A feed called with a `license_key` query
+        parameter answers 400 — use `license_token` there instead.
+        Identifies the installation's license. A perpetual license with a
+        maintenance period then sees only releases published before
+        its `updates_until`; other licenses see the full feed. An
+        unknown or unusable key answers 404, so the gate cannot be
+        skipped by dropping the key. A product must set
+        `feed_license_required` before any of its plans can sell an
+        update period or renewals; its feeds then answer 401
+        `LICENSE_KEY_REQUIRED` without a key or token. Turning it on
+        is a rollout, in this order: ship an updater that sends the
+        license, set the flag, wait out the links the public feed
+        already handed out (the admin API says how long), and only
+        then give a plan an update period. Other products keep a
+        public, ungated feed.
+
+        An updater that cannot set headers uses `license_token`.
+    LicenseToken:
+      in: query
+      name: license_token
+      required: false
+      schema: { type: string }
+      description: |
+        The only credential accepted in the URL, and what updaters
+        that can only put things there use (Sparkle's
+        `feedParametersForUpdater`).
+        The signed token from `/license/verify` or `/license/activate`
+        (also accepted as an `X-License-Token` header): it identifies
+        the same license, expires with the plan's `token_ttl_days`,
+        and is accepted on the feeds only. The period comes from the
+        license as it reads now, not from the token, so a renewal or a
+        revocation takes effect at once. An invalid, expired or
+        unusable token answers 404, like an unknown key.
     Limit:
       in: query
       name: limit
@@ -848,6 +911,7 @@ components:
                 Ed25519-signed offline verification token. Format:
                 `<base64url-payload>.<base64url-signature>`. Verify
                 using the server's public key from /license/pubkey.
+                Payload fields are listed under VerifyResponse.
 
     VerifyResponse:
       type: object
@@ -869,6 +933,16 @@ components:
               type: string
               format: date-time
               nullable: true
+            updates_until:
+              type: string
+              format: date-time
+              description: |
+                End of a perpetual license's maintenance period. The
+                license stays valid after this date, but releases
+                published later cannot be installed; the signed token
+                carries the same instant as `upd`. Absent when the
+                license has no separate limit (subscriptions, trials,
+                perpetual plans with updates for life).
             features:
               type: object
               description: "Key-value map of feature entitlements"
@@ -878,6 +952,30 @@ components:
                 storage_gb: "100"
             token:
               type: string
+              description: |
+                Ed25519-signed offline verification token,
+                `<base64url-payload>.<base64url-signature>`; the
+                signed bytes are the base64url payload string. The
+                payload is a JSON object with these fields (all
+                times are unix seconds):
+
+                | field | meaning |
+                |---|---|
+                | `lid`, `pid`, `pln` | license, product, plan ids |
+                | `sts` | license status at issue time |
+                | `did` | the identifier the token was issued for |
+                | `fpr` | SHA-256 of identifier + product id, for device binding |
+                | `ftr` | feature entitlements, same as `features` |
+                | `iat`, `exp` | issued at; how long the client may stay offline before verifying again. `exp` is a check-in interval, not the license term |
+                | `vun` | when the license itself lapses; absent = perpetual |
+                | `upd` | end of the maintenance period: install only releases published at or before this instant; absent = no separate limit |
+                | `grc` | grace days after `vun` |
+                | `nce` | per-issuance nonce |
+
+                A client that ships updates through its own channel
+                must compare the release's publish date against `upd`
+                itself; the server's feeds and download endpoint apply
+                the same rule when given the license key.
             grace_days:
               type: integer
             email:

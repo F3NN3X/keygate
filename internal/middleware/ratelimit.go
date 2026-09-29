@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/tabloy/keygate/internal/breaker"
 )
 
 // RateLimitBackend abstracts the rate limiting storage.
@@ -92,7 +94,7 @@ func (mb *memoryBackend) cleanup() {
 // RedisClient is a minimal interface for Redis operations needed by rate limiting.
 // Compatible with github.com/redis/go-redis/v9.
 type RedisClient interface {
-	Eval(ctx context.Context, script string, keys []string, args ...interface{}) RedisResult
+	Eval(ctx context.Context, script string, keys []string, args ...any) RedisResult
 }
 
 // RedisResult is the minimal result interface.
@@ -102,12 +104,15 @@ type RedisResult interface {
 
 type redisBackend struct {
 	client RedisClient
+	// prefix namespaces keys per install (e.g. "kg:<hash>:rl:") so two
+	// deployments sharing one Redis DB do not share rate-limit counters.
+	prefix string
 }
 
-// NewRedisBackend creates a Redis-backed rate limiter.
-func NewRedisBackend(client RedisClient) RateLimitBackend {
-	return &redisBackend{client: client}
-}
+// rlOpTimeout bounds one Redis rate-limit call. Without it a slow or
+// wedged endpoint would stall every limited request behind go-redis'
+// multi-second dial/read timeouts before failing over.
+const rlOpTimeout = 250 * time.Millisecond
 
 // Lua script for atomic rate limiting: INCR + EXPIRE in one round trip.
 const rateLimitScript = `
@@ -121,19 +126,53 @@ end
 return current
 `
 
-func (rb *redisBackend) Allow(key string, rate int, window time.Duration) bool {
-	result := rb.client.Eval(
-		context.Background(),
-		rateLimitScript,
-		[]string{"rl:" + key},
-		rate,
-		int(window.Seconds()),
-	)
+// allow runs the script under a short timeout and reports the decision
+// plus any backend error, so a caller can degrade instead of blocking.
+func (rb *redisBackend) allow(key string, rate int, window time.Duration) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), rlOpTimeout)
+	defer cancel()
+	result := rb.client.Eval(ctx, rateLimitScript, []string{rb.prefix + key}, rate, int(window.Seconds()))
 	count, err := result.Int64()
 	if err != nil {
-		return true // fail open on Redis errors
+		return true, err
 	}
-	return count <= int64(rate)
+	return count <= int64(rate), nil
+}
+
+// resilientBackend uses Redis for shared, cross-instance limiting but
+// degrades to a per-instance in-memory limiter whenever Redis errors, so
+// a slow or down endpoint neither stalls requests (each try is bounded by
+// rlOpTimeout) nor silently drops all limiting. A breaker stops probing a
+// dead endpoint on every request, then lets one request retry after a
+// cooldown.
+type resilientBackend struct {
+	redis  *redisBackend
+	memory RateLimitBackend
+	br     *breaker.Breaker
+}
+
+// NewResilientRedisBackend wires a Redis rate limiter that falls back to
+// an in-memory limiter on Redis failure. prefix namespaces keys per
+// install.
+func NewResilientRedisBackend(client RedisClient, prefix string) RateLimitBackend {
+	return &resilientBackend{
+		redis:  &redisBackend{client: client, prefix: prefix},
+		memory: NewMemoryBackend(),
+		br:     breaker.New(5, 5*time.Second),
+	}
+}
+
+func (r *resilientBackend) Allow(key string, rate int, window time.Duration) bool {
+	if !r.br.Allow() {
+		return r.memory.Allow(key, rate, window)
+	}
+	ok, err := r.redis.allow(key, rate, window)
+	if err != nil {
+		r.br.Failure()
+		return r.memory.Allow(key, rate, window)
+	}
+	r.br.Success()
+	return ok
 }
 
 // ─── Default backend (package-level) ───

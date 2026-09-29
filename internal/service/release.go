@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -703,7 +704,13 @@ func (s *ReleaseService) Unyank(ctx context.Context, releaseID string) (*model.R
 		return nil, apperr.Internal(err)
 	}
 	if !model.ProductSupports(prod.Type, model.CapReleases) {
-		return nil, apperr.New(409, "INCOMPATIBLE_PRODUCT_TYPE",
+		// NOT_UNYANKABLE, not INCOMPATIBLE_PRODUCT_TYPE: everywhere else
+		// that code answers a request body asking for something the
+		// product type cannot do, and it answers 400. Here the body is
+		// fine and the product moved underneath the release, which is
+		// the same shape as the other unyank refusals. One code must
+		// mean one status, or a client cannot branch on it.
+		return nil, apperr.New(409, "NOT_UNYANKABLE",
 			"release management is not available for "+prod.Type+" products; change the product type back before unyanking")
 	}
 	if err := s.store.UnyankRelease(ctx, releaseID); err != nil {
@@ -785,7 +792,10 @@ func (s *ReleaseService) GenerateDownload(ctx context.Context, in DownloadInput)
 		// client asking for the latest would see 1.2.0 (macOS-only)
 		// and get PLATFORM_NOT_AVAILABLE even though 1.1.0 (Windows)
 		// is sitting right there.
-		rel, err = s.findLatestPublished(ctx, lic.ProductID, in.Channel, in.Platform)
+		// A license whose maintenance period has ended still gets
+		// "latest": the newest release published before the period
+		// ended, so an old install keeps a version it may run.
+		rel, err = s.findLatestPublished(ctx, lic.ProductID, in.Channel, in.Platform, lic.EffectiveUpdatesUntil())
 	}
 	if err != nil {
 		switch {
@@ -797,6 +807,11 @@ func (s *ReleaseService) GenerateDownload(ctx context.Context, in DownloadInput)
 		default:
 			return nil, apperr.Internal(err)
 		}
+	}
+	if until := lic.EffectiveUpdatesUntil(); !releaseWithinUpdates(rel, until) {
+		return nil, apperr.New(403, "UPDATES_EXPIRED",
+			fmt.Sprintf("release %s was published after this license's update period ended on %s; renew to install it",
+				rel.Version, until.Format("2006-01-02")))
 	}
 
 	// Find the artifact for the requested platform within this release.
@@ -849,18 +864,32 @@ func channelFallbackChain(c string) []string {
 
 const latestComputeWindow = 1000
 
-// findLatestPublished returns the highest-semver published release in
-// the channel-fallback chain. When platform is non-empty, candidates
-// are restricted to releases that have an uploaded artifact for that
-// platform, so the "latest" reflects what the client can actually
-// download — not the absolute newest version that happens to lack
-// their platform.
-func (s *ReleaseService) findLatestPublished(ctx context.Context, productID, channel, platform string) (*model.Release, error) {
+// releaseWithinUpdates reports whether a license whose maintenance
+// period ends at updatesUntil may install rel. Nil means no limit. A
+// release whose publish date is unknown cannot be shown to predate
+// the cutoff, so under a cutoff it is not installable — the same
+// answer the feed query gives, where a NULL date never satisfies
+// "published before". The migration backfills the date on published
+// rows, so this only guards against data written outside it.
+func releaseWithinUpdates(rel *model.Release, updatesUntil *time.Time) bool {
+	if updatesUntil == nil {
+		return true
+	}
+	if rel.PublishedAt == nil {
+		return false
+	}
+	return !rel.PublishedAt.After(*updatesUntil)
+}
+
+// findLatestPublished picks the highest semver among recently
+// published releases the platform can install. With publishedBefore
+// set, releases published after that instant are left out.
+func (s *ReleaseService) findLatestPublished(ctx context.Context, productID, channel, platform string, publishedBefore *time.Time) (*model.Release, error) {
 	chain := channelFallbackChain(channel)
 
 	var pool []*model.Release
 	for _, ch := range chain {
-		batch, err := s.store.ListPublishedReleasesForFeed(ctx, productID, ch, platform, latestComputeWindow)
+		batch, err := s.store.ListPublishedReleasesForFeed(ctx, productID, ch, platform, latestComputeWindow, publishedBefore)
 		if err != nil {
 			return nil, err
 		}
@@ -910,6 +939,16 @@ func sortBySemverDesc(rels []*model.Release) {
 	})
 }
 
+// VersionAtMost reports whether v is a valid version no newer than
+// ceiling; an unparsable v is treated as not exceeding anything.
+func VersionAtMost(v, ceiling string) bool {
+	nv, nc := semverNormalize(v), semverNormalize(ceiling)
+	if nv == "" || nc == "" {
+		return true
+	}
+	return semver.Compare(nv, nc) <= 0
+}
+
 func semverNormalize(v string) string {
 	if v == "" {
 		return ""
@@ -936,7 +975,10 @@ const feedQueryTimeout = 3 * time.Second
 // applied. That guarantees a client asking for limit=20 sees 20
 // downloadable rows (when that many exist) rather than 20 raw rows
 // thinned to a handful by post-filtering.
-func (s *ReleaseService) ListForFeed(ctx context.Context, productID, channel, platform string, limit int) ([]*model.Release, error) {
+//
+// publishedBefore limits the feed to releases inside a license's
+// maintenance period; nil lists everything published.
+func (s *ReleaseService) ListForFeed(ctx context.Context, productID, channel, platform string, limit int, publishedBefore *time.Time) ([]*model.Release, error) {
 	if !model.IsValidReleaseChannel(channel) {
 		return nil, ErrReleaseInvalidChannel
 	}
@@ -949,7 +991,7 @@ func (s *ReleaseService) ListForFeed(ctx context.Context, productID, channel, pl
 	chain := channelFallbackChain(channel)
 	var pool []*model.Release
 	for _, ch := range chain {
-		batch, err := s.store.ListPublishedReleasesForFeed(ctx, productID, ch, platform, latestComputeWindow)
+		batch, err := s.store.ListPublishedReleasesForFeed(ctx, productID, ch, platform, latestComputeWindow, publishedBefore)
 		if err != nil {
 			return nil, err
 		}
@@ -967,6 +1009,40 @@ func (s *ReleaseService) ListForFeed(ctx context.Context, productID, channel, pl
 		pool = pool[:limit]
 	}
 	return pool, nil
+}
+
+// FeedCutoff resolves the maintenance cutoff a feed must honour for a
+// license key: the end of the license's update period, or nil when
+// the license may install everything. Every "license unavailable"
+// condition collapses into LICENSE_NOT_FOUND, as on the download
+// endpoint, so a feed URL cannot be used to probe keys.
+func (s *ReleaseService) FeedCutoff(ctx context.Context, licenseKey, productID string) (*time.Time, error) {
+	lic, err := loadLicenseForSDK(ctx, s.store, licenseKey, productID, model.CapReleases, true)
+	if err != nil {
+		return nil, err
+	}
+	return lic.EffectiveUpdatesUntil(), nil
+}
+
+// FeedCutoffForToken is FeedCutoff for an updater that identified
+// itself with a signed license token instead of the license key. The
+// cutoff comes from the license row, never from the token: a token
+// signed before a renewal, a revocation or a plan change must not
+// decide what the feed shows.
+func (s *ReleaseService) FeedCutoffForToken(ctx context.Context, licenseID, productID string) (*time.Time, error) {
+	lic, err := s.store.FindLicenseByID(ctx, licenseID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, licenseNotFound()
+		}
+		return nil, apperr.Internal(err)
+	}
+	if lic.ProductID != productID ||
+		lic.Product == nil || !model.ProductSupports(lic.Product.Type, model.CapReleases) ||
+		!IsLicenseUsable(lic) {
+		return nil, licenseNotFound()
+	}
+	return lic.EffectiveUpdatesUntil(), nil
 }
 
 // ─── Helpers ───

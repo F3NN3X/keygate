@@ -48,6 +48,8 @@ services:
       STORAGE_UPLOAD_TTL: ${STORAGE_UPLOAD_TTL:-1h}
       STORAGE_DOWNLOAD_TTL: ${STORAGE_DOWNLOAD_TTL:-10m}
       MAX_RELEASE_SIGN_SIZE_MB: ${MAX_RELEASE_SIGN_SIZE_MB:-500}
+      # Shared rate-limit backend across instances; empty = in-memory (single instance).
+      REDIS_URL: ${REDIS_URL:-}
     # keygate calls the object store server-side (finalize HEADs the object, publish reads it back to
     # re-hash before signing) at the SAME public hostname the browser uploads to — presigned URLs bind
     # the host into the SigV4 signature, so it cannot use an internal name for its own calls.

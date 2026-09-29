@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Check, Copy, Eye, EyeOff, Package, Plus, RefreshCw, Trash2 } from "lucide-react"
 import { useState } from "react"
 import { Link } from "react-router-dom"
+import { ProductSelect } from "@/components/product-select"
 import { showToast } from "@/components/toast"
 import {
   AlertDialog,
@@ -24,12 +25,19 @@ import {
   DataTableHeader,
   DataTablePagination,
   DataTableRow,
-  useClientPagination,
+  useServerPagination,
 } from "@/components/ui/data-table"
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { useI18n } from "@/i18n"
 import { admin } from "@/lib/api"
 import { formatDate } from "@/lib/utils"
@@ -39,10 +47,17 @@ export default function APIKeysPage() {
   const qc = useQueryClient()
   const [productFilter, setProductFilter] = useState<string>("")
   const [search, setSearch] = useState("")
-  const { data: productsData } = useQuery({ queryKey: ["admin", "products"], queryFn: () => admin.listProducts() })
+  const pg = useServerPagination(10, [productFilter, search])
+  const { data: productsData } = useQuery({
+    // One row is all this page needs from the catalogue: whether the
+    // install has any product at all, and which one a new form starts
+    // on. The pickers fetch their own candidates, with search.
+    queryKey: ["admin", "products", "newest"],
+    queryFn: () => admin.listProducts({ limit: 1 }),
+  })
   const { data, isLoading } = useQuery({
-    queryKey: ["admin", "api-keys", productFilter, search],
-    queryFn: () => admin.listAPIKeys(productFilter || undefined, search || undefined),
+    queryKey: ["admin", "api-keys", productFilter, search, pg.page, pg.pageSize],
+    queryFn: () => admin.listAPIKeys({ product_id: productFilter, search, ...pg.params }),
   })
   const [creating, setCreating] = useState(false)
   const [newKey, setNewKey] = useState<string | null>(null)
@@ -50,8 +65,7 @@ export default function APIKeysPage() {
   const [rotating, setRotating] = useState<{ id: string; name: string } | null>(null)
 
   const products = productsData?.products || []
-  const keys = data?.api_keys || []
-  const { page, setPage, pageSize, setPageSize, total, totalPages, paginatedItems } = useClientPagination(keys, 10)
+  const { items: keys, total, totalPages } = pg.from(data, data?.api_keys)
 
   const createMut = useMutation({
     mutationFn: admin.createAPIKey,
@@ -61,6 +75,7 @@ export default function APIKeysPage() {
       setNewKey(data.key)
       showToast(t("toast.apiKeyCreated"), "success")
     },
+    onError: (e: Error) => showToast(e.message, "error"),
   })
   const deleteMut = useMutation({
     mutationFn: (id: string) => admin.deleteAPIKey(id),
@@ -68,6 +83,7 @@ export default function APIKeysPage() {
       qc.invalidateQueries({ queryKey: ["admin", "api-keys"] })
       setDeleting(null)
     },
+    onError: (e: Error) => showToast(e.message, "error"),
   })
   const rotateMut = useMutation({
     mutationFn: (id: string) => admin.rotateAPIKey(id),
@@ -79,13 +95,14 @@ export default function APIKeysPage() {
       setNewKey(data.key)
       showToast(`${t("apiKeys.rotate")} ✓`, "success")
     },
+    onError: (e: Error) => showToast(e.message, "error"),
   })
 
   if (products.length === 0 && !isLoading) {
     return (
       <div className="space-y-6">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">{t("apiKeys.title")}</h1>
+          <h1 className="text-2xl font-bold tracking-tight sr-only md:not-sr-only">{t("apiKeys.title")}</h1>
           <p className="text-muted-foreground">{t("apiKeys.subtitle")}</p>
         </div>
         <Card>
@@ -106,9 +123,9 @@ export default function APIKeysPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight">{t("apiKeys.title")}</h1>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h1 className="text-2xl font-bold tracking-tight sr-only md:not-sr-only">{t("apiKeys.title")}</h1>
           <p className="text-muted-foreground">{t("apiKeys.subtitle")}</p>
         </div>
         <Button onClick={() => setCreating(true)}>
@@ -116,25 +133,13 @@ export default function APIKeysPage() {
         </Button>
       </div>
 
-      <div className="flex gap-4">
-        <Select value={productFilter} onValueChange={(v) => setProductFilter(v === "all" ? "" : v)}>
-          <SelectTrigger className="w-48">
-            <SelectValue placeholder={t("filter.allProducts")} />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">{t("filter.allProducts")}</SelectItem>
-            {products.map((p) => (
-              <SelectItem key={p.id} value={p.id}>
-                {p.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+      <div className="flex flex-wrap gap-3">
+        <ProductSelect value={productFilter} onChange={setProductFilter} allLabel={t("filter.allProducts")} />
         <Input
           placeholder={t("common.search")}
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          className="w-64"
+          className="w-full sm:w-64"
         />
       </div>
 
@@ -155,8 +160,8 @@ export default function APIKeysPage() {
                 </DataTableRow>
               </DataTableHeader>
               <DataTableBody>
-                {paginatedItems.length === 0 && <DataTableEmpty colSpan={6} message={t("apiKeys.empty")} />}
-                {paginatedItems.map((k) => (
+                {keys.length === 0 && <DataTableEmpty colSpan={6} message={t("apiKeys.empty")} />}
+                {keys.map((k) => (
                   <DataTableRow key={k.id}>
                     <DataTableCell className="font-medium">{k.name}</DataTableCell>
                     <DataTableCell>
@@ -214,12 +219,12 @@ export default function APIKeysPage() {
 
       {total > 0 && (
         <DataTablePagination
-          page={page}
+          page={pg.page}
           totalPages={totalPages}
           total={total}
-          pageSize={pageSize}
-          onPageChange={setPage}
-          onPageSizeChange={setPageSize}
+          pageSize={pg.pageSize}
+          onPageChange={pg.setPage}
+          onPageSizeChange={pg.setPageSize}
         />
       )}
 
@@ -348,73 +353,63 @@ function CreateAPIKeyDialog({
               scopes,
             })
           }}
-          className="space-y-4"
+          className="flex min-h-0 flex-1 flex-col gap-4"
         >
-          <div className="space-y-2">
-            <Label>{t("apiKeys.scopes")}</Label>
-            <div className="rounded-md border divide-y">
-              {SCOPE_OPTIONS.map((opt) => (
-                <label key={opt.value} className="flex items-start gap-3 px-3 py-2 cursor-pointer hover:bg-muted/40">
-                  <input
-                    type="checkbox"
-                    checked={scopes.includes(opt.value)}
-                    onChange={() => toggleScope(opt.value)}
-                    className="mt-1 h-4 w-4 accent-primary"
-                  />
-                  <div className="flex-1">
-                    <p className="text-sm font-medium">
-                      {t(opt.labelKey)}{" "}
-                      <code className="text-[10px] text-muted-foreground bg-muted px-1 rounded">{opt.value}</code>
-                    </p>
-                    <p className="text-xs text-muted-foreground mt-0.5">{t(opt.descKey)}</p>
-                  </div>
-                </label>
-              ))}
+          <DialogBody className="space-y-4">
+            <div className="space-y-2">
+              <Label>{t("apiKeys.scopes")}</Label>
+              <div className="rounded-md border divide-y">
+                {SCOPE_OPTIONS.map((opt) => (
+                  <label key={opt.value} className="flex items-start gap-3 px-3 py-2 cursor-pointer hover:bg-muted/40">
+                    <input
+                      type="checkbox"
+                      checked={scopes.includes(opt.value)}
+                      onChange={() => toggleScope(opt.value)}
+                      className="mt-1 h-4 w-4 accent-primary"
+                    />
+                    <div className="flex-1">
+                      <p className="text-sm font-medium">
+                        {t(opt.labelKey)}{" "}
+                        <code className="text-[10px] text-muted-foreground bg-muted px-1 rounded">{opt.value}</code>
+                      </p>
+                      <p className="text-xs text-muted-foreground mt-0.5">{t(opt.descKey)}</p>
+                    </div>
+                  </label>
+                ))}
+              </div>
+              {error && <p className="text-xs text-destructive">{error}</p>}
             </div>
-            {error && <p className="text-xs text-destructive">{error}</p>}
-          </div>
 
-          {/* Product binding is optional and mostly informational —
+            {/* Product binding is optional and mostly informational —
               shown only when no admin scope is granted, since admin
               keys span products anyway. */}
-          {!scopes.includes("admin") && products.length > 0 && (
-            <div className="space-y-2">
-              <Label>
-                {t("common.product")} ({t("common.optional")})
-              </Label>
-              <Select value={productId || "none"} onValueChange={(v) => setProductId(v === "none" ? "" : v)}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="none">—</SelectItem>
-                  {products.map((p) => (
-                    <SelectItem key={p.id} value={p.id}>
-                      {p.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          )}
+            {!scopes.includes("admin") && products.length > 0 && (
+              <div className="space-y-2">
+                <Label>
+                  {t("common.product")} ({t("common.optional")})
+                </Label>
+                <ProductSelect value={productId} onChange={setProductId} noneLabel="—" className="w-full" />
+              </div>
+            )}
 
-          <div className="space-y-2">
-            <Label>{t("common.name")}</Label>
-            <Input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="e.g. CI provisioning, Acme prod backend"
-              required
-            />
-          </div>
-          <div className="flex justify-end gap-2 pt-2">
+            <div className="space-y-2">
+              <Label>{t("common.name")}</Label>
+              <Input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="e.g. CI provisioning, Acme prod backend"
+                required
+              />
+            </div>
+          </DialogBody>
+          <DialogFooter>
             <Button type="button" variant="outline" onClick={onClose}>
               {t("common.cancel")}
             </Button>
             <Button type="submit" disabled={loading || !canSubmit}>
               {loading ? t("common.loading") : t("common.create")}
             </Button>
-          </div>
+          </DialogFooter>
         </form>
       </DialogContent>
     </Dialog>
@@ -439,22 +434,24 @@ function NewKeyDialog({ keyValue, onClose }: { keyValue: string; onClose: () => 
           <DialogTitle>{t("apiKeys.created")}</DialogTitle>
           <DialogDescription>{t("apiKeys.createdDesc")}</DialogDescription>
         </DialogHeader>
-        <div className="space-y-4">
-          <div className="flex items-center gap-2 bg-muted rounded-lg p-3">
-            <code className="flex-1 text-sm break-all">
-              {visible ? keyValue : `${keyValue.substring(0, 12)}...${"*".repeat(20)}`}
-            </code>
-            <Button variant="ghost" size="icon" className="shrink-0" onClick={() => setVisible(!visible)}>
-              {visible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-            </Button>
-            <Button variant="ghost" size="icon" className="shrink-0" onClick={copy}>
-              {copied ? <Check className="h-4 w-4 text-emerald-600" /> : <Copy className="h-4 w-4" />}
-            </Button>
+        <DialogBody>
+          <div className="space-y-4">
+            <div className="flex items-center gap-2 bg-muted rounded-lg p-3">
+              <code className="flex-1 text-sm break-all">
+                {visible ? keyValue : `${keyValue.substring(0, 12)}...${"*".repeat(20)}`}
+              </code>
+              <Button variant="ghost" size="icon" className="shrink-0" onClick={() => setVisible(!visible)}>
+                {visible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+              </Button>
+              <Button variant="ghost" size="icon" className="shrink-0" onClick={copy}>
+                {copied ? <Check className="h-4 w-4 text-emerald-600" /> : <Copy className="h-4 w-4" />}
+              </Button>
+            </div>
+            <div className="flex justify-end">
+              <Button onClick={onClose}>Done</Button>
+            </div>
           </div>
-          <div className="flex justify-end">
-            <Button onClick={onClose}>Done</Button>
-          </div>
-        </div>
+        </DialogBody>
       </DialogContent>
     </Dialog>
   )

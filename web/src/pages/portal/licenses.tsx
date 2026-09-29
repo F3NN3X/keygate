@@ -14,15 +14,23 @@ import {
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { Dialog, DialogBody, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useAuth } from "@/hooks/use-auth"
-import { useI18n } from "@/i18n"
-import { type Activation, type Entitlement, type PortalLicense, portal, type Seat } from "@/lib/api"
+import { type TranslationKeys, useI18n } from "@/i18n"
+import {
+  type Activation,
+  type Entitlement,
+  type Invoice,
+  type Plan,
+  type PortalLicense,
+  portal,
+  type Seat,
+} from "@/lib/api"
 import { cn, formatDate, statusColor } from "@/lib/utils"
 
 export default function PortalLicensesPage() {
@@ -33,6 +41,11 @@ export default function PortalLicensesPage() {
   })
 
   const licenses = data?.licenses || []
+  // Renewals can be switched off server-side (during a rollout, or
+  // when the merchant stops selling them); don't offer what the
+  // endpoint would refuse. Only an explicit true counts: a replica on
+  // a version without the field has no renewal endpoint either.
+  const renewalsEnabled = data?.renewals_enabled === true
 
   if (isLoading) {
     return (
@@ -62,7 +75,7 @@ export default function PortalLicensesPage() {
       ) : (
         <div className="space-y-6">
           {licenses.map((lic) => (
-            <LicenseCard key={lic.id} license={lic} />
+            <LicenseCard key={lic.id} license={lic} renewalsEnabled={renewalsEnabled} />
           ))}
         </div>
       )}
@@ -70,8 +83,13 @@ export default function PortalLicensesPage() {
   )
 }
 
-function LicenseCard({ license: lic }: { license: PortalLicense }) {
+function LicenseCard({ license: lic, renewalsEnabled }: { license: PortalLicense; renewalsEnabled: boolean }) {
   const { t } = useI18n()
+  const { user } = useAuth()
+  // Seat members see the license too, but renewals, plan changes,
+  // cancellation and payment methods belong to the license holder;
+  // the server authorises those by the license's own address.
+  const isOwner = !!user?.email && user.email.toLowerCase() === lic.email.toLowerCase()
   const [copied, setCopied] = useState(false)
   const [showInvoices, setShowInvoices] = useState(false)
   const [showChangePlan, setShowChangePlan] = useState(false)
@@ -91,12 +109,45 @@ function LicenseCard({ license: lic }: { license: PortalLicense }) {
     setTimeout(() => setCopied(false), 2000)
   }
 
+  // Change plan, cancel and payment-method updates all act on a Stripe
+  // subscription. A one-time purchase has none: the backend answers 400
+  // to each, so don't offer them.
+  const hasSubscription = lic.payment_provider === "stripe" && !!lic.stripe_subscription_id
+
+  // Maintenance period of a perpetual license. The license never
+  // expires; updates_until only bounds which releases may be installed.
+  const isPerpetualPlan = lic.plan?.license_type === "perpetual"
+  const updatesUntil = lic.updates_until ? new Date(lic.updates_until) : null
+  const updatesEnded = updatesUntil !== null && updatesUntil.getTime() < Date.now()
+  const updatesEndingSoon =
+    updatesUntil !== null && !updatesEnded && updatesUntil.getTime() - Date.now() < 30 * 24 * 60 * 60 * 1000
+  const canRenewUpdates =
+    renewalsEnabled &&
+    isOwner &&
+    isPerpetualPlan &&
+    updatesUntil !== null &&
+    lic.status === "active" &&
+    lic.plan?.active !== false &&
+    (lic.plan?.renewal_days ?? 0) > 0 &&
+    !!lic.plan?.stripe_renewal_price_id
+  const [renewing, setRenewing] = useState(false)
+  const handleRenewUpdates = async () => {
+    setRenewing(true)
+    try {
+      const res = await portal.renewUpdates({ license_id: lic.id })
+      window.location.href = res.url
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "An error occurred")
+      setRenewing(false)
+    }
+  }
+
   const handleBillingPortal = async () => {
     try {
       const res = await portal.getBillingPortal({ license_id: lic.id })
       window.location.href = res.url
-    } catch {
-      // ignore
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "An error occurred")
     }
   }
 
@@ -110,7 +161,7 @@ function LicenseCard({ license: lic }: { license: PortalLicense }) {
             <CardTitle className="text-lg">{lic.product?.name || "License"}</CardTitle>
             <p className="text-sm text-muted-foreground mt-1">{lic.plan?.name}</p>
           </div>
-          <Badge className={statusColor(lic.status)}>{t(`status.${lic.status}` as any)}</Badge>
+          <Badge className={statusColor(lic.status)}>{t(`status.${lic.status}` as TranslationKeys)}</Badge>
         </div>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -147,26 +198,45 @@ function LicenseCard({ license: lic }: { license: PortalLicense }) {
           )}
         </div>
 
-        {/* Subscription Actions */}
-        {lic.payment_provider === "stripe" && (
-          <div className="flex gap-2 flex-wrap">
-            {lic.payment_provider === "stripe" && (
-              <>
-                <Button variant="outline" size="sm" onClick={() => setShowInvoices(true)}>
-                  {t("portal.viewInvoices")}
-                </Button>
-                <Button variant="outline" size="sm" onClick={handleBillingPortal}>
-                  {t("portal.updatePayment")}
-                </Button>
-              </>
+        {/* Maintenance period */}
+        {isPerpetualPlan && (
+          <div className="flex items-center justify-between gap-3 flex-wrap text-sm">
+            <p className={cn(updatesEnded ? "text-muted-foreground" : "", updatesEndingSoon ? "text-amber-600" : "")}>
+              {updatesUntil === null
+                ? t("portal.updatesForLife")
+                : updatesEnded
+                  ? t("portal.updatesEnded", { date: formatDate(lic.updates_until) })
+                  : `${t("portal.updatesUntil")} ${formatDate(lic.updates_until)}${updatesEndingSoon ? ` · ${t("portal.updatesEndingSoon")}` : ""}`}
+            </p>
+            {canRenewUpdates && (
+              <Button
+                size="sm"
+                variant={updatesEnded || updatesEndingSoon ? "default" : "outline"}
+                onClick={handleRenewUpdates}
+                disabled={renewing}
+              >
+                {renewing ? t("common.loading") : t("portal.renewUpdates")}
+              </Button>
             )}
-            {(lic.status === "active" || lic.status === "trialing") && (
+          </div>
+        )}
+
+        {/* Billing actions (license holder only) */}
+        {isOwner && lic.payment_provider === "stripe" && (
+          <div className="flex gap-2 flex-wrap">
+            <Button variant="outline" size="sm" onClick={() => setShowInvoices(true)}>
+              {t("portal.viewInvoices")}
+            </Button>
+            {hasSubscription && (
+              <Button variant="outline" size="sm" onClick={handleBillingPortal}>
+                {t("portal.updatePayment")}
+              </Button>
+            )}
+            {hasSubscription && (lic.status === "active" || lic.status === "trialing") && (
               <>
-                {lic.payment_provider === "stripe" && (
-                  <Button variant="outline" size="sm" onClick={() => setShowChangePlan(true)}>
-                    {t("portal.changePlan")}
-                  </Button>
-                )}
+                <Button variant="outline" size="sm" onClick={() => setShowChangePlan(true)}>
+                  {t("portal.changePlan")}
+                </Button>
                 <Button variant="outline" size="sm" className="text-destructive" onClick={() => setShowCancel(true)}>
                   {t("portal.cancelSubscription")}
                 </Button>
@@ -271,6 +341,7 @@ function ActivationsSection({ license }: { license: PortalLicense }) {
     onSettled: () => {
       setRemoving(null)
     },
+    onError: (e: Error) => showToast(e.message, "error"),
   })
 
   // Read-only path for unauthorised (pending-seat) viewers, and a
@@ -573,6 +644,7 @@ function InviteSeatDialog({ license, onClose }: { license: PortalLicense; onClos
       qc.invalidateQueries({ queryKey: ["portal", "seats", license.id] })
       onClose()
     },
+    onError: (e: Error) => showToast(e.message, "error"),
   })
 
   const trimmed = email.trim()
@@ -586,46 +658,47 @@ function InviteSeatDialog({ license, onClose }: { license: PortalLicense; onClos
           <DialogTitle>{t("licenses.inviteTitle")}</DialogTitle>
           <DialogDescription>{t("licenses.inviteDesc")}</DialogDescription>
         </DialogHeader>
+        <DialogBody>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="invite-email">{t("common.email")}</Label>
+              <Input
+                id="invite-email"
+                type="email"
+                autoComplete="off"
+                autoFocus
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="teammate@example.com"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && canSubmit) inviteMut.mutate()
+                }}
+              />
+            </div>
 
-        <div className="space-y-4">
-          <div className="space-y-2">
-            <Label htmlFor="invite-email">{t("common.email")}</Label>
-            <Input
-              id="invite-email"
-              type="email"
-              autoComplete="off"
-              autoFocus
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="teammate@example.com"
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && canSubmit) inviteMut.mutate()
-              }}
-            />
-          </div>
+            <div className="space-y-2">
+              <Label htmlFor="invite-role">{t("team.role")}</Label>
+              <Select value={role} onValueChange={(v) => setRole(v as "member" | "admin")}>
+                <SelectTrigger id="invite-role">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="member">{t("portal.roleMember")}</SelectItem>
+                  <SelectItem value="admin">{t("portal.roleAdmin")}</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
 
-          <div className="space-y-2">
-            <Label htmlFor="invite-role">{t("team.role")}</Label>
-            <Select value={role} onValueChange={(v) => setRole(v as "member" | "admin")}>
-              <SelectTrigger id="invite-role">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="member">{t("portal.roleMember")}</SelectItem>
-                <SelectItem value="admin">{t("portal.roleAdmin")}</SelectItem>
-              </SelectContent>
-            </Select>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={onClose}>
+                {t("common.cancel")}
+              </Button>
+              <Button disabled={!canSubmit} onClick={() => inviteMut.mutate()}>
+                {t("licenses.sendInvite")}
+              </Button>
+            </div>
           </div>
-
-          <div className="flex justify-end gap-2">
-            <Button variant="outline" onClick={onClose}>
-              {t("common.cancel")}
-            </Button>
-            <Button disabled={!canSubmit} onClick={() => inviteMut.mutate()}>
-              {t("licenses.sendInvite")}
-            </Button>
-          </div>
-        </div>
+        </DialogBody>
       </DialogContent>
     </Dialog>
   )
@@ -718,6 +791,7 @@ function CancelDialog({
       qc.invalidateQueries({ queryKey: ["portal", "licenses"] })
       onClose()
     },
+    onError: (e: Error) => showToast(e.message, "error"),
   })
 
   return (
@@ -727,30 +801,32 @@ function CancelDialog({
           <DialogTitle>{t("portal.cancelSubscription")}</DialogTitle>
           <DialogDescription>{t("portal.cancelDesc", { product: productName })}</DialogDescription>
         </DialogHeader>
-        <div className="space-y-4">
-          {provider === "stripe" && (
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={immediate}
-                onChange={(e) => setImmediate(e.target.checked)}
-                className="rounded"
-              />
-              {t("portal.cancelImmediately")}
-            </label>
-          )}
-          <p className="text-sm text-muted-foreground">
-            {immediate ? t("portal.cancelImmediateWarning") : t("portal.cancelEndWarning")}
-          </p>
-          <div className="flex justify-end gap-2">
-            <Button variant="outline" onClick={onClose}>
-              {t("common.cancel")}
-            </Button>
-            <Button variant="destructive" onClick={() => cancelMut.mutate()} disabled={cancelMut.isPending}>
-              {cancelMut.isPending ? t("common.loading") : t("portal.confirmCancel")}
-            </Button>
+        <DialogBody>
+          <div className="space-y-4">
+            {provider === "stripe" && (
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={immediate}
+                  onChange={(e) => setImmediate(e.target.checked)}
+                  className="rounded"
+                />
+                {t("portal.cancelImmediately")}
+              </label>
+            )}
+            <p className="text-sm text-muted-foreground">
+              {immediate ? t("portal.cancelImmediateWarning") : t("portal.cancelEndWarning")}
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={onClose}>
+                {t("common.cancel")}
+              </Button>
+              <Button variant="destructive" onClick={() => cancelMut.mutate()} disabled={cancelMut.isPending}>
+                {cancelMut.isPending ? t("common.loading") : t("portal.confirmCancel")}
+              </Button>
+            </div>
           </div>
-        </div>
+        </DialogBody>
       </DialogContent>
     </Dialog>
   )
@@ -766,45 +842,50 @@ function InvoicesDialog({ licenseId, onClose }: { licenseId: string; onClose: ()
 
   return (
     <Dialog open onOpenChange={onClose}>
-      <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
+      <DialogContent className="max-w-2xl">
         <DialogHeader>
           <DialogTitle>{t("portal.invoices")}</DialogTitle>
         </DialogHeader>
-        {isLoading ? (
-          <div className="h-32 animate-pulse bg-muted rounded-lg" />
-        ) : invoices.length === 0 ? (
-          <p className="text-sm text-muted-foreground text-center py-8">{t("common.noData")}</p>
-        ) : (
-          <div className="space-y-2">
-            {invoices.map((inv: any) => (
-              <div key={inv.id} className="flex items-center justify-between bg-muted/50 rounded-lg px-4 py-3 text-sm">
-                <div>
-                  <p className="font-medium">{inv.number || inv.id}</p>
-                  <p className="text-xs text-muted-foreground">{new Date(inv.created * 1000).toLocaleDateString()}</p>
+        <DialogBody>
+          {isLoading ? (
+            <div className="h-32 animate-pulse bg-muted rounded-lg" />
+          ) : invoices.length === 0 ? (
+            <p className="text-sm text-muted-foreground text-center py-8">{t("common.noData")}</p>
+          ) : (
+            <div className="space-y-2">
+              {invoices.map((inv: Invoice) => (
+                <div
+                  key={inv.id}
+                  className="flex items-center justify-between bg-muted/50 rounded-lg px-4 py-3 text-sm"
+                >
+                  <div>
+                    <p className="font-medium">{inv.number || inv.id}</p>
+                    <p className="text-xs text-muted-foreground">{new Date(inv.created * 1000).toLocaleDateString()}</p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <Badge
+                      className={
+                        inv.status === "paid" ? "bg-emerald-100 text-emerald-800" : "bg-amber-100 text-amber-800"
+                      }
+                    >
+                      {inv.status}
+                    </Badge>
+                    <span className="font-medium">
+                      {(inv.amount_paid / 100).toFixed(2)} {inv.currency?.toUpperCase()}
+                    </span>
+                    {inv.invoice_pdf && (
+                      <Button variant="ghost" size="sm" asChild>
+                        <a href={inv.invoice_pdf} target="_blank" rel="noopener noreferrer">
+                          PDF
+                        </a>
+                      </Button>
+                    )}
+                  </div>
                 </div>
-                <div className="flex items-center gap-3">
-                  <Badge
-                    className={
-                      inv.status === "paid" ? "bg-emerald-100 text-emerald-800" : "bg-amber-100 text-amber-800"
-                    }
-                  >
-                    {inv.status}
-                  </Badge>
-                  <span className="font-medium">
-                    {(inv.amount_paid / 100).toFixed(2)} {inv.currency?.toUpperCase()}
-                  </span>
-                  {inv.invoice_pdf && (
-                    <Button variant="ghost" size="sm" asChild>
-                      <a href={inv.invoice_pdf} target="_blank" rel="noopener noreferrer">
-                        PDF
-                      </a>
-                    </Button>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
+              ))}
+            </div>
+          )}
+        </DialogBody>
       </DialogContent>
     </Dialog>
   )
@@ -819,9 +900,12 @@ function ChangePlanDialog({ license, onClose }: { license: PortalLicense; onClos
     queryKey: ["portal", "plans", license.product_id],
     queryFn: () => portal.listPlans(license.product_id),
   })
-  // Filter: only plans with Stripe price, exclude current
-  const isStripe = license.payment_provider === "stripe"
-  const plans = (plansData?.plans || []).filter((p: any) => p.id !== license.plan_id && isStripe && p.stripe_price_id)
+  // Only other subscription plans with a Stripe price: a subscription
+  // can move between prices, not become a one-time purchase. Mirrors
+  // the backend's change-plan gate.
+  const plans = (plansData?.plans || []).filter(
+    (p: Plan) => p.id !== license.plan_id && p.license_type === "subscription" && p.stripe_price_id,
+  )
 
   const changeMut = useMutation({
     mutationFn: (newPriceId: string) => portal.changePlan({ license_id: license.id, new_price_id: newPriceId }),
@@ -829,6 +913,7 @@ function ChangePlanDialog({ license, onClose }: { license: PortalLicense; onClos
       qc.invalidateQueries({ queryKey: ["portal", "licenses"] })
       onClose()
     },
+    onError: (e: Error) => showToast(e.message, "error"),
   })
 
   return (
@@ -838,29 +923,32 @@ function ChangePlanDialog({ license, onClose }: { license: PortalLicense; onClos
           <DialogTitle>{t("portal.changePlan")}</DialogTitle>
           <DialogDescription>{t("portal.changePlanDesc")}</DialogDescription>
         </DialogHeader>
-        {plans.length === 0 ? (
-          <p className="text-sm text-muted-foreground text-center py-4">{t("portal.noOtherPlans")}</p>
-        ) : (
-          <div className="space-y-2">
-            {plans.map((plan: any) => (
-              <div key={plan.id} className="flex items-center justify-between bg-muted/50 rounded-lg px-4 py-3">
-                <div>
-                  <p className="font-medium text-sm">{plan.name}</p>
-                  <p className="text-xs text-muted-foreground">
-                    {plan.license_type} · {plan.billing_interval || t("plans.perpetual")}
-                  </p>
+        <DialogBody>
+          {plans.length === 0 ? (
+            <p className="text-sm text-muted-foreground text-center py-4">{t("portal.noOtherPlans")}</p>
+          ) : (
+            <div className="space-y-2">
+              {plans.map((plan: Plan) => (
+                <div key={plan.id} className="flex items-center justify-between bg-muted/50 rounded-lg px-4 py-3">
+                  <div>
+                    <p className="font-medium text-sm">{plan.name}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {plan.license_type}
+                      {plan.billing_interval ? ` · ${plan.billing_interval}` : ""}
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    onClick={() => changeMut.mutate(plan.stripe_price_id || "")}
+                    disabled={changeMut.isPending}
+                  >
+                    {changeMut.isPending ? t("common.loading") : t("portal.switchTo")}
+                  </Button>
                 </div>
-                <Button
-                  size="sm"
-                  onClick={() => changeMut.mutate(plan.stripe_price_id || "")}
-                  disabled={changeMut.isPending}
-                >
-                  {changeMut.isPending ? t("common.loading") : t("portal.switchTo")}
-                </Button>
-              </div>
-            ))}
-          </div>
-        )}
+              ))}
+            </div>
+          )}
+        </DialogBody>
       </DialogContent>
     </Dialog>
   )

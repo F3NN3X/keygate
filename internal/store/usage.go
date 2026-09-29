@@ -129,7 +129,7 @@ func (s *Store) GetUsageSummary(ctx context.Context, licenseID string) ([]*model
 func (s *Store) ListUsageEvents(ctx context.Context, licenseID, feature string, offset, limit int) ([]*model.UsageEvent, int, error) {
 	q := s.DB.NewSelect().Model((*model.UsageEvent)(nil)).
 		Where("license_id = ?", licenseID).
-		OrderExpr("recorded_at DESC")
+		OrderExpr("recorded_at DESC, id DESC")
 	if feature != "" {
 		q = q.Where("feature = ?", feature)
 	}

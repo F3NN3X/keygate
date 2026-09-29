@@ -57,6 +57,7 @@ const en = {
   "nav.customers": "Customers",
   "nav.settings": "Settings",
   "nav.sponsor": "Sponsor Us",
+  "nav.menu": "Menu",
   "nav.portal": "User Portal",
   "nav.logout": "Logout",
 
@@ -77,6 +78,10 @@ const en = {
   "products.title": "Products",
   "products.subtitle": "Manage your software products.",
   "products.new": "New Product",
+  "products.feedLicenseRequired": "Update feeds require a license",
+  "products.feedLicenseRequiredHint": "Required before this product can sell a maintenance period.",
+  "products.feedLicenseRequiredHelp":
+    "With it on, the update feed answers nobody who doesn't hold a license — which is the only thing that stops a customer whose updates ran out from installing the newest version anyway.\n\nShip an updater that sends the license first: installs still running an older one will stop seeing updates.",
   "products.slug": "Slug",
   "products.empty": "No products yet",
   "products.deleteConfirm": "This action cannot be undone. Products with existing licenses cannot be deleted.",
@@ -91,6 +96,7 @@ const en = {
   "plans.licenseType": "License Type",
   "plans.maxActivations": "Max Activations",
   "plans.maxSeats": "Max Seats",
+  "plans.maxSeatsHint": "0 = no limit.",
   "plans.licenseModel": "License Model",
   "plans.modelStandard": "Standard",
   "plans.modelFloating": "Floating (concurrent)",
@@ -140,6 +146,9 @@ const en = {
   "licenses.noProductsDesc": "Create a product and plan first before issuing licenses.",
   "licenses.detail": "License Detail",
   "licenses.activations": "Activations",
+  "licenses.resendEmail": "Resend email",
+  "licenses.resendEmailConfirm": "Send the license key to {email} again? Use this when the first email never arrived.",
+  "licenses.resendEmailAction": "Send",
   "licenses.revoke": "Revoke",
   "licenses.revokeConfirm":
     "This will permanently revoke the license. The customer will lose access immediately. This cannot be undone.",
@@ -149,6 +158,14 @@ const en = {
   "licenses.reinstate": "Reinstate",
   "licenses.refundConfirm":
     "This will cancel the subscription at the payment provider and revoke the license. The customer will lose access immediately.",
+  "licenses.selectPlan": "Select a plan",
+  "licenses.subscription": "Stripe subscription",
+  "licenses.unlink": "Unlink",
+  "licenses.unlinkTitle": "Unlink this Stripe subscription?",
+  "licenses.unlinkConfirm":
+    "Keygate asks Stripe first and refuses while the subscription is still there. Once unlinked, this license is managed here again — its plan and expiry become editable — and a refund of that subscription’s last invoice will no longer find it by subscription id.",
+  "licenses.unlinkDone": "Subscription unlinked.",
+  "licenses.unlinkNotLinked": "This license has no Stripe subscription.",
   "licenses.changePlan": "Change Plan",
   "licenses.seats": "Seats",
   "licenses.role": "Role",
@@ -347,9 +364,31 @@ const en = {
     "SMTP is set on the server with SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD and SMTP_FROM.",
   "settings.emailHost": "SMTP host",
   "settings.emailFrom": "From address",
+  "settings.emailProvider": "Provider",
+  "settings.emailProviderDesc":
+    "How outgoing mail is sent. Cloudflare Email works over HTTPS, which helps when a host blocks SMTP ports.",
+  "settings.emailFromDesc": "The address mail is sent from. Must be a verified sender on your provider.",
+  "settings.emailPort": "SMTP port",
+  "settings.emailUsername": "SMTP username",
+  "settings.emailPassword": "SMTP password",
+  "settings.emailCfAccount": "Account ID",
+  "settings.emailApiToken": "API token",
+  "settings.secretSaved": "•••••••• (saved)",
+  "settings.secretKeepHint": "Leave blank to keep the current value.",
+  "settings.secretClear": "Clear",
+  "settings.secretCleared": "Secret cleared",
+  "settings.emailEnvBanner":
+    "Email is currently taken from environment variables. Saving here manages it from the dashboard instead.",
+  "settings.testEmailToPlaceholder": "recipient (defaults to you)",
+  "settings.testEmailDirtyHint": "Save your changes to enable the test — it uses the saved configuration.",
+  "settings.testEmailSaveHint": "Save your changes before sending a test — the test uses the saved configuration.",
   "settings.testEmail": "Send Test Email",
   "settings.testEmailDesc": "Send a test email to verify your SMTP configuration.",
   "settings.signup": "Sign-ups",
+  "settings.maintenance": "Maintenance periods",
+  "settings.maintenanceEnabled": "Enable maintenance-period features",
+  "settings.maintenanceDesc":
+    "Bounded update periods, renewals, gated update feeds and manual cutoffs stay refused until this is on. Turn it on only after every replica runs a version with this setting; older replicas would ignore the cutoff and serve newer releases. Switching it off stops new bounded licences and new renewal checkouts; a renewal checkout already open in Stripe still fulfils if it is paid, since it extends a period the licence already has. Switch it off again before rolling back to a version without this setting. The wait after gating a feed is measured against the longest STORAGE_FEED_URL_TTL this install is known to have used (the feed_url_ttl_bound setting): to shorten it, move every replica to the shorter TTL first, wait out the links signed under the old one, then lower that setting.",
   "settings.signupMode": "Who can create an account",
   "settings.signupOpen": "Anyone with an email address",
   "settings.signupLicensedOnly": "Only emails that hold a license",
@@ -421,6 +460,8 @@ const en = {
   "checkout.licenseCreated": "Your license key has been created",
   "checkout.error": "Unable to verify payment. Your license will be delivered shortly via email.",
   "checkout.viewLicense": "View my license",
+  "checkout.renewalSuccess": "Your update period has been extended.",
+  "checkout.backToPortal": "Back to my licenses",
 
   // Portal
   "portal.myLicenses": "My Licenses",
@@ -472,8 +513,17 @@ const en = {
   "portal.changePlanDesc": "Select a new plan. Changes take effect immediately with prorated billing.",
   "portal.noOtherPlans": "No other plans available.",
   "portal.switchTo": "Switch",
+  "portal.updatesUntil": "Updates until",
+  "portal.updatesForLife": "Includes lifetime updates",
+  "portal.updatesEndingSoon": "ending soon",
+  "portal.updatesEnded": "Updates ended on {date}. The software keeps working.",
+  "portal.renewUpdates": "Renew updates",
 
   // Filters
+  "filter.searchProducts": "Search products…",
+  "filter.searchPlans": "Search plans…",
+  "filter.noMatches": "No matches",
+  "filter.moreMatches": "+{count} more — keep typing to narrow",
   "filter.allProducts": "All products",
   "filter.allStatuses": "All statuses",
   "filter.allPlans": "All plans",
@@ -527,6 +577,12 @@ const en = {
   "plans.string": "String",
   "plans.quota": "Quota",
   "plans.feature": "Feature",
+  "plans.updatesDays": "Updates Included (days)",
+  "plans.updatesDaysHint":
+    "0 = updates for life. Perpetual plans only, and only once the product's update feeds require a license — a public feed would serve past the period.",
+  "plans.renewalDays": "Renewal Length (days)",
+  "plans.stripeRenewalPriceId": "Stripe Renewal Price ID",
+  "plans.renewalHint": "One-time price customers pay in the portal to extend updates.",
 
   // Products extras
   "products.desktop": "Desktop",
@@ -568,6 +624,9 @@ const en = {
 
   // Licenses refund
   "licenses.refund": "Refund",
+  "licenses.updatesUntil": "Updates Until",
+  "licenses.updatesUntilEdit": "Edit update period",
+  "licenses.updatesUntilClear": "Leave empty for lifetime updates.",
 
   // Addons
   "nav.addons": "Addons",
@@ -579,13 +638,18 @@ const en = {
   "addons.deleteConfirm": "This will permanently remove this addon.",
   "addons.formDesc": "Configure the addon details.",
   "addons.description": "Description",
+  "addons.valueTrue": "Enabled (true)",
+  "addons.valueFalse": "Disabled (false)",
+  "addons.quotaZeroHint": "Whole number. 0 means no limit.",
 
   // Toast messages
+  "toast.dismiss": "Dismiss",
   "toast.productCreated": "Product created successfully.",
   "toast.productDeleted": "Product deleted.",
   "toast.planCreated": "Plan created successfully.",
   "toast.planDeleted": "Plan deleted.",
   "toast.licenseCreated": "License issued successfully.",
+  "toast.licenseEmailQueued": "License email on its way to {email}.",
   "toast.apiKeyCreated": "API key created successfully.",
   "toast.addonCreated": "Addon created successfully.",
   "toast.webhookCreated": "Webhook created successfully.",

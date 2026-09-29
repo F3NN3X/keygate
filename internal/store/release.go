@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"time"
 
 	"github.com/uptrace/bun"
 
@@ -49,6 +51,96 @@ type ReleaseFilter struct {
 const MaxFeedListLimit = 5000
 
 // ─── Release CRUD ───
+
+// ProductHasEverPublishedRelease reports whether any release of the
+// product has ever appeared in a feed — published, or yanked after
+// being published. A product without one has never handed out a
+// presigned artifact URL, so gating its feeds takes effect at once;
+// with one, links from before the gate may still be usable.
+func (s *Store) ProductHasEverPublishedRelease(ctx context.Context, productID string) (bool, error) {
+	return ProductHasEverPublishedReleaseIn(ctx, s.DB, productID)
+}
+
+// FeedDrainLeftIn reports the full drain a newly gated product waits
+// out and how much of it is left. What the public feed handed out
+// keeps working after the gate goes up: a shared cache may serve the
+// feed for its max-age, and every copy carries presigned artifact
+// URLs valid for ttl — the lifetime this replica signs them with — so
+// the wait is the longer of the two. A product that never published a
+// release handed out nothing.
+func FeedDrainLeftIn(ctx context.Context, db bun.IDB, prod *model.Product, ttl time.Duration) (drain, left time.Duration, err error) {
+	if prod.FeedGatedAt == nil {
+		return 0, 0, nil
+	}
+	published, err := ProductHasEverPublishedReleaseIn(ctx, db, prod.ID)
+	if err != nil || !published {
+		return 0, 0, err
+	}
+	// The bound is read on every check, not cached at start: a
+	// replica configured with a shorter lifetime must not call links
+	// another one signed for longer expired, and one that raises the
+	// bound while this replica runs is picked up at once.
+	recorded, err := DurationSettingIn(ctx, db, SettingFeedURLTTLBound, ttl)
+	if err != nil {
+		return 0, 0, err
+	}
+	if recorded > ttl {
+		ttl = recorded
+	}
+	drain = max(ttl, model.FeedPublicMaxAge)
+	// Elapsed time comes from the database clock too, for the same
+	// reason the stamp does: replicas need not agree on the time, and
+	// the one that decides is the one that wrote it.
+	var elapsed float64
+	if err := db.NewRaw("SELECT EXTRACT(EPOCH FROM (clock_timestamp() - ?))", *prod.FeedGatedAt).Scan(ctx, &elapsed); err != nil {
+		return 0, 0, err
+	}
+	return drain, drain - time.Duration(elapsed*float64(time.Second)), nil
+}
+
+// FeedsCanEnforcePeriodsIn reports whether a finite update period
+// written for this product would be enforceable now, and why not when
+// it would not. Two conditions: the update feeds must require the
+// license key (or the product serves no feeds), and what the public
+// feed handed out before the gate went up must have expired — a copy
+// of it, or a presigned link inside one, serves releases past any
+// cutoff written while it is still usable.
+//
+// feedURLTTL is how long this replica signs those links for
+// (STORAGE_FEED_URL_TTL); the wait is the longer of it and the bound
+// the install has recorded. The 60-second cache window is only the
+// floor — waiting that alone would call a link signed for a day
+// expired after a minute.
+//
+// Callers hold the product's feed gating lock (FeedGatingLockIn) so
+// the answer still holds when they write.
+func FeedsCanEnforcePeriodsIn(ctx context.Context, db bun.IDB, productID string, feedURLTTL time.Duration) (bool, string, error) {
+	prod, err := FindProductByIDIn(ctx, db, productID)
+	if err != nil {
+		return false, "", err
+	}
+	if !model.ProductSupports(prod.Type, model.CapReleases) {
+		return true, "", nil
+	}
+	if !prod.FeedLicenseRequired {
+		return false, "the product's update feeds do not require the license key", nil
+	}
+	_, left, err := FeedDrainLeftIn(ctx, db, prod, feedURLTTL)
+	if err != nil {
+		return false, "", err
+	}
+	if left > 0 {
+		return false, fmt.Sprintf("the update feeds were gated recently; what the public feed handed out stays usable for another %s", left.Round(time.Second)), nil
+	}
+	return true, "", nil
+}
+
+// ProductHasEverPublishedReleaseIn answers on a caller's transaction.
+func ProductHasEverPublishedReleaseIn(ctx context.Context, db bun.IDB, productID string) (bool, error) {
+	return db.NewSelect().Model((*model.Release)(nil)).
+		Where("product_id = ? AND status IN (?, ?)", productID,
+			model.ReleaseStatusPublished, model.ReleaseStatusYanked).Exists(ctx)
+}
 
 // CreateRelease inserts a new release in the draft state. No artifacts —
 // callers add platform-specific artifacts via AddArtifact.
@@ -383,7 +475,13 @@ func (s *Store) DeleteRelease(ctx context.Context, id string) (fileKeys []string
 //
 // `uploaded` is encoded as `file_key <> ” AND sha256 <> ”` to mirror
 // the model's IsUploaded() check.
-func (s *Store) ListPublishedReleasesForFeed(ctx context.Context, productID, channel, platform string, limit int) ([]*model.Release, error) {
+//
+// publishedBefore, when set, keeps only releases published at or
+// before that instant. It belongs in the query, not in a filter on
+// the result: for a license whose update period ended long ago, the
+// newest limit rows may all be too new, and the entitled releases
+// would never be seen.
+func (s *Store) ListPublishedReleasesForFeed(ctx context.Context, productID, channel, platform string, limit int, publishedBefore *time.Time) ([]*model.Release, error) {
 	if limit <= 0 {
 		limit = 20
 	}
@@ -406,6 +504,9 @@ func (s *Store) ListPublishedReleasesForFeed(ctx context.Context, productID, cha
               AND ra.file_key  <> ''
               AND ra.sha256    <> ''
         )`, platform)
+	}
+	if publishedBefore != nil {
+		q = q.Where("release.published_at <= ?", *publishedBefore)
 	}
 	err := q.OrderExpr("release.published_at DESC, release.id DESC").
 		Limit(limit).

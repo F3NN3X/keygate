@@ -124,7 +124,7 @@ func (s *EntitlementService) Check(ctx context.Context, in CheckInput) (*CheckRe
 	}
 
 	// Merge addon features (addons override or add to plan features)
-	addons, _ := s.store.ListLicenseAddons(ctx, lic.ID)
+	addons, _, _ := s.store.ListLicenseAddons(ctx, lic.ID, store.All)
 	for _, la := range addons {
 		if la.Addon == nil {
 			continue

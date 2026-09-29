@@ -42,9 +42,9 @@ createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
       <BrowserRouter>
-        <ToastProvider>
-          <ToastBridge />
-          <I18nProvider>
+        <I18nProvider>
+          <ToastProvider>
+            <ToastBridge />
             <SiteConfigProvider>
               <AuthProvider>
                 <ErrorBoundary>
@@ -80,8 +80,8 @@ createRoot(document.getElementById("root")!).render(
                 </ErrorBoundary>
               </AuthProvider>
             </SiteConfigProvider>
-          </I18nProvider>
-        </ToastProvider>
+          </ToastProvider>
+        </I18nProvider>
       </BrowserRouter>
     </QueryClientProvider>
   </StrictMode>,

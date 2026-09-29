@@ -16,6 +16,7 @@ import {
 } from "lucide-react"
 import { type ChangeEvent, useEffect, useRef, useState } from "react"
 import { Link } from "react-router-dom"
+import { ProductSelect } from "@/components/product-select"
 import { showToast } from "@/components/toast"
 import {
   AlertDialog,
@@ -39,7 +40,7 @@ import {
   DataTablePagination,
   DataTableRow,
 } from "@/components/ui/data-table"
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { Dialog, DialogBody, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -50,6 +51,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { useI18n } from "@/i18n"
 import {
   admin,
   RELEASE_CHANNELS,
@@ -62,7 +64,17 @@ import { formatDate } from "@/lib/utils"
 
 const PAGE_SIZE = 20
 
+// Releases belong to products that ship installable binaries. The
+// server enforces it; the pickers here ask for the same set so an
+// admin never fills in a form the server will then refuse.
+const RELEASE_PRODUCT_TYPES = ["desktop", "hybrid"]
+
 export default function ReleasesPage() {
+  // Only the heading is translated so far: the sidebar names this
+  // section from the same key, and the two reading differently on one
+  // screen is the confusing part. The rest of the page is still
+  // English.
+  const { t } = useI18n()
   const qc = useQueryClient()
   const [productFilter, setProductFilter] = useState("")
   const [channelFilter, setChannelFilter] = useState("")
@@ -76,14 +88,21 @@ export default function ReleasesPage() {
   const [openRelease, setOpenRelease] = useState<Release | null>(null)
   const [confirmPublish, setConfirmPublish] = useState<{ rel: Release; latest: string } | null>(null)
 
-  const { data: productsData } = useQuery({
-    queryKey: ["admin", "products"],
-    queryFn: () => admin.listProducts(),
+  // Only desktop and hybrid products can own releases, so that is
+  // what this page asks for — the question "does this install have a
+  // product that can publish?" is the server's to answer, not one to
+  // infer from whichever page of the catalogue happened to load. The
+  // empty state below turns on the counts, so both are needed.
+  const { data: releasableData } = useQuery({
+    queryKey: ["admin", "products", "releasable-count"],
+    queryFn: () => admin.listProducts({ type: RELEASE_PRODUCT_TYPES.join(","), limit: 1 }),
   })
-  // Only desktop + hybrid products can own releases. SaaS products
-  // are filtered out everywhere release-ish: list filter, create
-  // dialog, signing-key dialog. Mirrors the backend capability gate.
-  const products = (productsData?.products || []).filter((p) => p.type !== "saas")
+  const { data: anyProductsData } = useQuery({
+    queryKey: ["admin", "products", "any-count"],
+    queryFn: () => admin.listProducts({ limit: 1 }),
+  })
+  const releasableCount = releasableData?.total ?? 0
+  const anyProductCount = anyProductsData?.total ?? 0
 
   const { data, isLoading } = useQuery({
     queryKey: ["admin", "releases", productFilter, channelFilter, statusFilter, page],
@@ -130,12 +149,12 @@ export default function ReleasesPage() {
 
   // No release-eligible products. Either no products at all, or the
   // admin has only saas products (which don't ship installable binaries).
-  if (products.length === 0 && !isLoading) {
-    const hasAnyProducts = (productsData?.products || []).length > 0
+  if (releasableCount === 0 && releasableData && !isLoading) {
+    const hasAnyProducts = anyProductCount > 0
     return (
       <div className="space-y-6">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">Releases</h1>
+          <h1 className="text-2xl font-bold tracking-tight sr-only md:not-sr-only">{t("nav.releases")}</h1>
           <p className="text-muted-foreground">
             Distribute software updates to your customers via Sparkle, Velopack, or Tauri.
           </p>
@@ -170,9 +189,9 @@ export default function ReleasesPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight">Releases</h1>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h1 className="text-2xl font-bold tracking-tight sr-only md:not-sr-only">{t("nav.releases")}</h1>
           <p className="text-muted-foreground">
             Distribute software updates to your customers via Sparkle, Velopack, or Tauri.
           </p>
@@ -188,19 +207,12 @@ export default function ReleasesPage() {
       </div>
 
       <div className="flex flex-wrap gap-3">
-        <Select value={productFilter || "all"} onValueChange={(v) => setProductFilter(v === "all" ? "" : v)}>
-          <SelectTrigger className="w-48">
-            <SelectValue placeholder="All products" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All products</SelectItem>
-            {products.map((p) => (
-              <SelectItem key={p.id} value={p.id}>
-                {p.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        <ProductSelect
+          value={productFilter}
+          onChange={setProductFilter}
+          allLabel="All products"
+          types={RELEASE_PRODUCT_TYPES}
+        />
         <Select value={channelFilter || "all"} onValueChange={(v) => setChannelFilter(v === "all" ? "" : v)}>
           <SelectTrigger className="w-36">
             <SelectValue placeholder="All channels" />
@@ -363,7 +375,6 @@ export default function ReleasesPage() {
 
       {creating && (
         <CreateReleaseDialog
-          products={products}
           onClose={() => setCreating(false)}
           onCreated={(r) => {
             setCreating(false)
@@ -390,7 +401,7 @@ export default function ReleasesPage() {
           </AlertDialogContent>
         </AlertDialog>
       )}
-      {showSigningKeys && <SigningKeysDialog products={products} onClose={() => setShowSigningKeys(false)} />}
+      {showSigningKeys && <SigningKeysDialog onClose={() => setShowSigningKeys(false)} />}
       {deleting && (
         <AlertDialog open onOpenChange={() => setDeleting(null)}>
           <AlertDialogContent>
@@ -457,17 +468,13 @@ function StatusBadge({ status, yankedReason }: { status: string; yankedReason?: 
 
 // ─── Create Release Dialog (release metadata only; no artifacts yet) ──────
 
-function CreateReleaseDialog({
-  products,
-  onClose,
-  onCreated,
-}: {
-  products: { id: string; name: string }[]
-  onClose: () => void
-  onCreated: (rel: Release) => void
-}) {
+function CreateReleaseDialog({ onClose, onCreated }: { onClose: () => void; onCreated: (rel: Release) => void }) {
   const qc = useQueryClient()
-  const [productId, setProductId] = useState(products[0]?.id || "")
+  // Empty until picked: the candidates are searched on the server, so
+  // there is no "first product" on hand to default to — and defaulting
+  // to whichever one happened to load is how a release ends up filed
+  // against a product nobody chose.
+  const [productId, setProductId] = useState("")
   const [version, setVersion] = useState("")
   const [channel, setChannel] = useState<(typeof RELEASE_CHANNELS)[number]>("stable")
   const [name, setName] = useState("")
@@ -500,67 +507,63 @@ function CreateReleaseDialog({
             Create the release record. You'll add platform-specific binaries (artifacts) in the next step.
           </DialogDescription>
         </DialogHeader>
-        <div className="space-y-4 py-2">
-          <div className="space-y-2">
-            <Label>Product</Label>
-            <Select value={productId} onValueChange={setProductId}>
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {products.map((p) => (
-                  <SelectItem key={p.id} value={p.id}>
-                    {p.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="grid grid-cols-2 gap-3">
+        <DialogBody>
+          <div className="space-y-4 py-2">
             <div className="space-y-2">
-              <Label>Version</Label>
-              <Input placeholder="1.2.3" value={version} onChange={(e) => setVersion(e.target.value)} />
+              <Label>Product</Label>
+              <ProductSelect
+                value={productId}
+                onChange={setProductId}
+                className="w-full"
+                types={RELEASE_PRODUCT_TYPES}
+              />
+            </div>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label>Version</Label>
+                <Input placeholder="1.2.3" value={version} onChange={(e) => setVersion(e.target.value)} />
+              </div>
+              <div className="space-y-2">
+                <Label>Channel</Label>
+                <Select value={channel} onValueChange={(v) => setChannel(v as typeof channel)}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {RELEASE_CHANNELS.map((c) => (
+                      <SelectItem key={c} value={c}>
+                        {c}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
             </div>
             <div className="space-y-2">
-              <Label>Channel</Label>
-              <Select value={channel} onValueChange={(v) => setChannel(v as typeof channel)}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {RELEASE_CHANNELS.map((c) => (
-                    <SelectItem key={c} value={c}>
-                      {c}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <Label>Display name (optional)</Label>
+              <Input placeholder="MyApp Pro" value={name} onChange={(e) => setName(e.target.value)} />
             </div>
+            <div className="space-y-2">
+              <Label>Release notes (optional, markdown)</Label>
+              <textarea
+                rows={4}
+                placeholder="What's new in this version..."
+                value={releaseNotes}
+                onChange={(e) => setReleaseNotes(e.target.value)}
+                className="flex min-h-[60px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              />
+            </div>
+            {error && <p className="text-sm text-destructive">{error}</p>}
           </div>
-          <div className="space-y-2">
-            <Label>Display name (optional)</Label>
-            <Input placeholder="MyApp Pro" value={name} onChange={(e) => setName(e.target.value)} />
+          <div className="flex justify-end gap-2 pt-2">
+            <Button variant="outline" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button onClick={() => mut.mutate()} disabled={!productId || !version || mut.isPending}>
+              {mut.isPending ? "Creating..." : "Create draft"}
+            </Button>
           </div>
-          <div className="space-y-2">
-            <Label>Release notes (optional, markdown)</Label>
-            <textarea
-              rows={4}
-              placeholder="What's new in this version..."
-              value={releaseNotes}
-              onChange={(e) => setReleaseNotes(e.target.value)}
-              className="flex min-h-[60px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            />
-          </div>
-          {error && <p className="text-sm text-destructive">{error}</p>}
-        </div>
-        <div className="flex justify-end gap-2 pt-2">
-          <Button variant="outline" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button onClick={() => mut.mutate()} disabled={!productId || !version || mut.isPending}>
-            {mut.isPending ? "Creating..." : "Create draft"}
-          </Button>
-        </div>
+        </DialogBody>
       </DialogContent>
     </Dialog>
   )
@@ -594,7 +597,7 @@ function ReleaseDetailDialog({ release, onClose }: { release: Release; onClose: 
 
   return (
     <Dialog open onOpenChange={onClose}>
-      <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
+      <DialogContent className="max-w-2xl">
         <DialogHeader>
           <DialogTitle>
             {rel.product?.name || rel.product_id} {rel.version}
@@ -611,47 +614,48 @@ function ReleaseDetailDialog({ release, onClose }: { release: Release; onClose: 
             )}
           </DialogDescription>
         </DialogHeader>
+        <DialogBody>
+          <div className="space-y-4 py-2">
+            <div>
+              <p className="text-sm font-medium mb-2">Artifacts ({artifacts.length})</p>
+              {artifacts.length === 0 ? (
+                <p className="text-xs text-muted-foreground py-4 text-center bg-muted/50 rounded">
+                  No artifacts yet — add at least one platform before publishing.
+                </p>
+              ) : (
+                <div className="space-y-2">
+                  {artifacts.map((a) => (
+                    <ArtifactRow
+                      key={a.id}
+                      artifact={a}
+                      canEdit={rel.status === "draft"}
+                      onDelete={() => deleteArtifactMut.mutate(a.id)}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
 
-        <div className="space-y-4 py-2">
-          <div>
-            <p className="text-sm font-medium mb-2">Artifacts ({artifacts.length})</p>
-            {artifacts.length === 0 ? (
-              <p className="text-xs text-muted-foreground py-4 text-center bg-muted/50 rounded">
-                No artifacts yet — add at least one platform before publishing.
-              </p>
-            ) : (
-              <div className="space-y-2">
-                {artifacts.map((a) => (
-                  <ArtifactRow
-                    key={a.id}
-                    artifact={a}
-                    canEdit={rel.status === "draft"}
-                    onDelete={() => deleteArtifactMut.mutate(a.id)}
-                  />
-                ))}
-              </div>
+            {rel.status === "draft" && remainingPlatforms.length > 0 && (
+              <Button onClick={() => setAdding(true)} variant="outline" className="w-full">
+                <Plus className="h-4 w-4 mr-2" /> Add artifact ({remainingPlatforms.length} platforms remaining)
+              </Button>
             )}
           </div>
 
-          {rel.status === "draft" && remainingPlatforms.length > 0 && (
-            <Button onClick={() => setAdding(true)} variant="outline" className="w-full">
-              <Plus className="h-4 w-4 mr-2" /> Add artifact ({remainingPlatforms.length} platforms remaining)
-            </Button>
+          {adding && (
+            <AddArtifactDialog
+              release={rel}
+              availablePlatforms={remainingPlatforms}
+              onClose={() => setAdding(false)}
+              onAdded={() => {
+                setAdding(false)
+                qc.invalidateQueries({ queryKey: ["admin", "release", rel.id] })
+                qc.invalidateQueries({ queryKey: ["admin", "releases"] })
+              }}
+            />
           )}
-        </div>
-
-        {adding && (
-          <AddArtifactDialog
-            release={rel}
-            availablePlatforms={remainingPlatforms}
-            onClose={() => setAdding(false)}
-            onAdded={() => {
-              setAdding(false)
-              qc.invalidateQueries({ queryKey: ["admin", "release", rel.id] })
-              qc.invalidateQueries({ queryKey: ["admin", "releases"] })
-            }}
-          />
-        )}
+        </DialogBody>
       </DialogContent>
     </Dialog>
   )
@@ -781,49 +785,57 @@ function AddArtifactDialog({
             publish.
           </DialogDescription>
         </DialogHeader>
-        <div className="space-y-4 py-2">
-          <div className="space-y-2">
-            <Label>Platform</Label>
-            <Select value={platform} onValueChange={setPlatform} disabled={busy}>
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {availablePlatforms.map((p) => (
-                  <SelectItem key={p} value={p}>
-                    {p}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="space-y-2">
-            <Label>Artifact file</Label>
-            <input ref={fileInputRef} type="file" onChange={onFileChange} disabled={busy} className="text-sm w-full" />
-            {file && (
-              <p className="text-xs text-muted-foreground">
-                {file.name} · {formatBytes(file.size)}
-              </p>
+        <DialogBody>
+          <div className="space-y-4 py-2">
+            <div className="space-y-2">
+              <Label>Platform</Label>
+              <Select value={platform} onValueChange={setPlatform} disabled={busy}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {availablePlatforms.map((p) => (
+                    <SelectItem key={p} value={p}>
+                      {p}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label>Artifact file</Label>
+              <input
+                ref={fileInputRef}
+                type="file"
+                onChange={onFileChange}
+                disabled={busy}
+                className="text-sm w-full"
+              />
+              {file && (
+                <p className="text-xs text-muted-foreground">
+                  {file.name} · {formatBytes(file.size)}
+                </p>
+              )}
+            </div>
+            {error && <p className="text-sm text-destructive">{error}</p>}
+            {busy && (
+              <div className="text-sm space-y-1 bg-muted rounded-md p-3">
+                {progress === "init" && "Reserving artifact slot..."}
+                {progress === "uploading" && "Uploading to storage..."}
+                {progress === "finalizing" && "Computing SHA-256 + finalizing..."}
+              </div>
             )}
           </div>
-          {error && <p className="text-sm text-destructive">{error}</p>}
-          {busy && (
-            <div className="text-sm space-y-1 bg-muted rounded-md p-3">
-              {progress === "init" && "Reserving artifact slot..."}
-              {progress === "uploading" && "Uploading to storage..."}
-              {progress === "finalizing" && "Computing SHA-256 + finalizing..."}
-            </div>
-          )}
-        </div>
-        <div className="flex justify-end gap-2 pt-2">
-          <Button variant="outline" onClick={onClose} disabled={busy}>
-            Cancel
-          </Button>
-          <Button onClick={handleSubmit} disabled={busy || !file || !platform}>
-            <Upload className="h-4 w-4 mr-2" />
-            {busy ? "Working..." : "Upload"}
-          </Button>
-        </div>
+          <div className="flex justify-end gap-2 pt-2">
+            <Button variant="outline" onClick={onClose} disabled={busy}>
+              Cancel
+            </Button>
+            <Button onClick={handleSubmit} disabled={busy || !file || !platform}>
+              <Upload className="h-4 w-4 mr-2" />
+              {busy ? "Working..." : "Upload"}
+            </Button>
+          </div>
+        </DialogBody>
       </DialogContent>
     </Dialog>
   )
@@ -852,28 +864,30 @@ function YankDialog({ release, onClose }: { release: Release; onClose: () => voi
             Provide a reason — recorded in the audit log.
           </DialogDescription>
         </DialogHeader>
-        <div className="space-y-2 py-2">
-          <Label>Reason</Label>
-          <textarea
-            rows={3}
-            placeholder="Critical bug in v1.2.3 affecting Windows users; rollback recommended."
-            value={reason}
-            onChange={(e) => setReason(e.target.value)}
-            className="flex min-h-[60px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          />
-        </div>
-        <div className="flex justify-end gap-2 pt-2">
-          <Button variant="outline" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button
-            variant="destructive"
-            onClick={() => yankMut.mutate(reason)}
-            disabled={!reason.trim() || yankMut.isPending}
-          >
-            Yank
-          </Button>
-        </div>
+        <DialogBody>
+          <div className="space-y-2 py-2">
+            <Label>Reason</Label>
+            <textarea
+              rows={3}
+              placeholder="Critical bug in v1.2.3 affecting Windows users; rollback recommended."
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              className="flex min-h-[60px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            />
+          </div>
+          <div className="flex justify-end gap-2 pt-2">
+            <Button variant="outline" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => yankMut.mutate(reason)}
+              disabled={!reason.trim() || yankMut.isPending}
+            >
+              Yank
+            </Button>
+          </div>
+        </DialogBody>
       </DialogContent>
     </Dialog>
   )
@@ -989,12 +1003,12 @@ function computeLatestVersions(releases: Release[]): Map<string, string> {
 
 // ─── SigningKeysDialog (unchanged from before) ────────────────────────────
 
-function SigningKeysDialog({ products, onClose }: { products: { id: string; name: string }[]; onClose: () => void }) {
-  const [productId, setProductId] = useState(products[0]?.id || "")
+function SigningKeysDialog({ onClose }: { onClose: () => void }) {
+  const [productId, setProductId] = useState("")
 
   return (
     <Dialog open onOpenChange={onClose}>
-      <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
+      <DialogContent className="max-w-2xl">
         <DialogHeader>
           <DialogTitle>Release signing keys</DialogTitle>
           <DialogDescription>
@@ -1002,22 +1016,19 @@ function SigningKeysDialog({ products, onClose }: { products: { id: string; name
             every release artifact with the private key on publish.
           </DialogDescription>
         </DialogHeader>
-        <div className="space-y-2 py-2">
-          <Label>Product</Label>
-          <Select value={productId} onValueChange={setProductId}>
-            <SelectTrigger>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {products.map((p) => (
-                <SelectItem key={p.id} value={p.id}>
-                  {p.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        {productId && <SigningKeysSection productId={productId} />}
+        <DialogBody>
+          <div className="space-y-2 py-2">
+            <Label>Product</Label>
+            <ProductSelect
+              value={productId}
+              onChange={setProductId}
+              className="w-full"
+              types={RELEASE_PRODUCT_TYPES}
+              placeholder="Select a product"
+            />
+          </div>
+          {productId && <SigningKeysSection productId={productId} />}
+        </DialogBody>
       </DialogContent>
     </Dialog>
   )
@@ -1185,24 +1196,26 @@ function RotateKeyDialog({ productId, onClose }: { productId: string; onClose: (
             public key embedded will fail to verify new releases.
           </DialogDescription>
         </DialogHeader>
-        <div className="space-y-2 py-2">
-          <Label>Reason (audit log)</Label>
-          <textarea
-            rows={3}
-            placeholder="Routine rotation; no key compromise."
-            value={note}
-            onChange={(e) => setNote(e.target.value)}
-            className="flex min-h-[60px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-          />
-        </div>
-        <div className="flex justify-end gap-2 pt-2">
-          <Button variant="outline" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button onClick={() => mut.mutate(note)} disabled={mut.isPending}>
-            {mut.isPending ? "Rotating..." : "Rotate"}
-          </Button>
-        </div>
+        <DialogBody>
+          <div className="space-y-2 py-2">
+            <Label>Reason (audit log)</Label>
+            <textarea
+              rows={3}
+              placeholder="Routine rotation; no key compromise."
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              className="flex min-h-[60px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            />
+          </div>
+          <div className="flex justify-end gap-2 pt-2">
+            <Button variant="outline" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button onClick={() => mut.mutate(note)} disabled={mut.isPending}>
+              {mut.isPending ? "Rotating..." : "Rotate"}
+            </Button>
+          </div>
+        </DialogBody>
       </DialogContent>
     </Dialog>
   )
@@ -1232,24 +1245,26 @@ function DeactivateKeyDialog({ productId, onClose }: { productId: string; onClos
             signature checking will reject them.
           </DialogDescription>
         </DialogHeader>
-        <div className="space-y-2 py-2">
-          <Label>Reason (audit log)</Label>
-          <textarea
-            rows={3}
-            placeholder="Why are you deactivating?"
-            value={note}
-            onChange={(e) => setNote(e.target.value)}
-            className="flex min-h-[60px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-          />
-        </div>
-        <div className="flex justify-end gap-2 pt-2">
-          <Button variant="outline" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button variant="destructive" onClick={() => mut.mutate(note)} disabled={mut.isPending}>
-            {mut.isPending ? "Deactivating..." : "Deactivate"}
-          </Button>
-        </div>
+        <DialogBody>
+          <div className="space-y-2 py-2">
+            <Label>Reason (audit log)</Label>
+            <textarea
+              rows={3}
+              placeholder="Why are you deactivating?"
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              className="flex min-h-[60px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            />
+          </div>
+          <div className="flex justify-end gap-2 pt-2">
+            <Button variant="outline" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={() => mut.mutate(note)} disabled={mut.isPending}>
+              {mut.isPending ? "Deactivating..." : "Deactivate"}
+            </Button>
+          </div>
+        </DialogBody>
       </DialogContent>
     </Dialog>
   )

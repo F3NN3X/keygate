@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strconv"
 	"time"
@@ -44,6 +45,7 @@ func (c *ExpiryChecker) RunAll(ctx context.Context) {
 	c.ExpireTrials(ctx)
 	c.MarkPastDueAsExpired(ctx)
 	c.SendExpiryReminders(ctx)
+	c.SendUpdatesEndingReminders(ctx)
 	c.SendRenewalReminders(ctx)
 	c.SendPaymentFailureReminders(ctx)
 	c.CleanupExpiredActivations(ctx)
@@ -177,6 +179,61 @@ func (c *ExpiryChecker) SendExpiryReminders(ctx context.Context) {
 			c.email.SendLicenseExpiring(lic.Email, productName, c.store.DecryptLicenseKey(lic), expiresAt)
 			c.store.RecordNotification(ctx, lic.ID, r.tag)
 			c.logger.Info("expiry reminder sent", "license_id", lic.ID, "days", r.days)
+		}
+	}
+}
+
+// SendUpdatesEndingReminders tells holders of perpetual licenses that
+// their maintenance period ends within 14 days, once per period end.
+// Only plans that sell renewals get the mail: without one there is
+// nothing the customer can do about it, and the license keeps
+// working either way.
+func (c *ExpiryChecker) SendUpdatesEndingReminders(ctx context.Context) {
+	from := time.Now()
+	to := from.Add(14 * 24 * time.Hour)
+	licenses, err := c.store.FindLicensesWithUpdatesEnding(ctx, from, to)
+	if err != nil {
+		c.logger.Error("updates ending reminder check failed", "error", err)
+		return
+	}
+	for _, lic := range licenses {
+		if lic.Plan == nil || !lic.Plan.OffersRenewal() {
+			continue
+		}
+		// A renewal moves updates_until, so the tag carries the date:
+		// the next period end gets its own reminder.
+		// Claim before sending: every replica runs this loop, and the
+		// unique (license, tag) row is what keeps one mail per period.
+		tag := "updates_14d_" + lic.UpdatesUntil.Format("2006-01-02")
+		token, err := c.store.ClaimNotification(ctx, lic.ID, tag)
+		if err != nil {
+			c.logger.Error("updates ending reminder claim failed", "license_id", lic.ID, "error", err)
+			continue
+		}
+		if token == "" {
+			continue
+		}
+		productName := ""
+		if lic.Product != nil {
+			productName = lic.Product.Name
+		}
+		// Queued, not sent: this loop must not wait on SMTP, and the
+		// queue retries on its own. Queuing the mail and closing the
+		// lease share one transaction, so a crash cannot leave a
+		// queued mail whose lease later expires and queues a second
+		// copy. Failing to queue hands the claim back for the next
+		// run; losing the claim means another pass already owns it.
+		subject, body := c.email.RenderUpdatesEnding(productName, c.store.DecryptLicenseKey(lic), lic.UpdatesUntil.UTC().Format("2006-01-02"))
+		switch err := c.store.EnqueueEmailAndCloseNotification(ctx, lic.Email, subject, body, token); {
+		case err == nil:
+			c.logger.Info("updates ending reminder queued", "license_id", lic.ID)
+		case errors.Is(err, store.ErrNotificationClaimLost):
+			c.logger.Warn("updates ending reminder claim taken over; the other pass sends it", "license_id", lic.ID)
+		default:
+			c.logger.Error("updates ending reminder could not be queued", "license_id", lic.ID, "error", err)
+			if rerr := c.store.ReleaseNotification(ctx, token); rerr != nil {
+				c.logger.Error("updates ending reminder claim not released", "license_id", lic.ID, "error", rerr)
+			}
 		}
 	}
 }

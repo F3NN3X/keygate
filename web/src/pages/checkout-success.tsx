@@ -11,6 +11,7 @@ export default function CheckoutSuccessPage() {
   const { site_name, logo_url, attribution_text, attribution_url } = useSiteConfig()
   const [status, setStatus] = useState<"loading" | "ok" | "error">("loading")
   const [email, setEmail] = useState("")
+  const [renewal, setRenewal] = useState(false)
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
@@ -25,6 +26,7 @@ export default function CheckoutSuccessPage() {
       .then((r) => {
         setStatus(r.status === "ok" ? "ok" : "loading")
         if (r.email) setEmail(r.email)
+        setRenewal(r.kind === "renewal")
       })
       .catch(() => setStatus("error"))
   }, [])
@@ -49,12 +51,23 @@ export default function CheckoutSuccessPage() {
             <div className="flex flex-col items-center gap-3 py-4">
               <CheckCircle className="h-12 w-12 text-green-500" />
               <h3 className="text-xl font-semibold">{t("checkout.success")}</h3>
-              <p className="text-muted-foreground">
-                {email ? t("checkout.licenseSentTo", { email }) : t("checkout.licenseCreated")}
-              </p>
-              <Button className="mt-4" asChild>
-                <a href="/login">{t("checkout.viewLicense")}</a>
-              </Button>
+              {renewal ? (
+                <>
+                  <p className="text-muted-foreground">{t("checkout.renewalSuccess")}</p>
+                  <Button className="mt-4" asChild>
+                    <a href="/portal">{t("checkout.backToPortal")}</a>
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <p className="text-muted-foreground">
+                    {email ? t("checkout.licenseSentTo", { email }) : t("checkout.licenseCreated")}
+                  </p>
+                  <Button className="mt-4" asChild>
+                    <a href="/login">{t("checkout.viewLicense")}</a>
+                  </Button>
+                </>
+              )}
             </div>
           )}
           {status === "error" && (

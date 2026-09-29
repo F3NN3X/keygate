@@ -22,17 +22,23 @@ func (s *Store) FindWebhookByID(ctx context.Context, id string) (*model.Webhook,
 	return w, s.DB.NewSelect().Model(w).Relation("Product").Where("webhook.id = ?", id).Scan(ctx)
 }
 
-func (s *Store) ListWebhooks(ctx context.Context, productID, search string) ([]*model.Webhook, error) {
+func (s *Store) ListWebhooks(ctx context.Context, productID, search string, p Page) ([]*model.Webhook, int, error) {
 	var out []*model.Webhook
-	q := s.DB.NewSelect().Model(&out).Relation("Product").OrderExpr("webhook.created_at DESC")
+	q := s.DB.NewSelect().Model(&out).Relation("Product").OrderExpr("webhook.created_at DESC, webhook.id DESC")
 	if productID != "" {
 		q = q.Where("webhook.product_id = ?", productID)
 	}
 	if search != "" {
 		q = q.Where("webhook.url ILIKE ?", "%"+search+"%")
 	}
-	err := q.Scan(ctx)
-	return out, err
+	total, err := scanPage(ctx, q, p)
+	if err != nil {
+		return nil, 0, err
+	}
+	if p.Limit <= 0 {
+		total = len(out)
+	}
+	return out, total, nil
 }
 
 func (s *Store) UpdateWebhook(ctx context.Context, w *model.Webhook) error {
@@ -88,10 +94,20 @@ type WebhookDeliveryFilter struct {
 	Limit     int
 }
 
+// webhookDeliveryOrder is how a delivery listing is ordered.
+//
+// The trailing id is the tiebreaker, as on every other paginated list.
+// Retries of one event land in the same millisecond often enough, and
+// with only created_at to go on Postgres may order equal rows
+// differently between two queries, so a row can repeat on one page and
+// be missing from the next. It is a named constant so the tiebreaker
+// can be asserted without a database.
+const webhookDeliveryOrder = "created_at DESC, id DESC"
+
 func (s *Store) ListWebhookDeliveries(ctx context.Context, f WebhookDeliveryFilter) ([]*model.WebhookDelivery, int, error) {
 	q := s.DB.NewSelect().Model((*model.WebhookDelivery)(nil)).
 		Where("webhook_id = ?", f.WebhookID).
-		OrderExpr("created_at DESC")
+		OrderExpr(webhookDeliveryOrder)
 	if f.Status != "" {
 		q = q.Where("status = ?", f.Status)
 	}

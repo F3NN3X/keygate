@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/tabloy/keygate/internal/license"
 	"github.com/tabloy/keygate/internal/model"
 	"github.com/tabloy/keygate/internal/service"
 	"github.com/tabloy/keygate/internal/storage"
@@ -42,6 +44,7 @@ type ReleasePublicHandler struct {
 	baseURL     string
 	downloadTTL time.Duration
 	feedTTL     time.Duration
+	verifyKey   ed25519.PublicKey
 }
 
 type ReleasePublicConfig struct {
@@ -51,6 +54,9 @@ type ReleasePublicConfig struct {
 	Logger      *slog.Logger
 	BaseURL     string
 	DownloadTTL time.Duration
+	// VerifyKey checks the signed license tokens updaters may send
+	// instead of the key. Zero value: only the key is accepted.
+	VerifyKey ed25519.PublicKey
 	// FeedTTL is the lifetime of enclosure URLs inside public feeds.
 	// Sparkle shows the appcast and the user may click Install much
 	// later, so this is deliberately long; the licence-gated
@@ -79,6 +85,7 @@ func NewReleasePublicHandler(c ReleasePublicConfig) *ReleasePublicHandler {
 		baseURL:     c.BaseURL,
 		downloadTTL: c.DownloadTTL,
 		feedTTL:     c.FeedTTL,
+		verifyKey:   c.VerifyKey,
 	}
 }
 
@@ -113,12 +120,24 @@ func (h *ReleasePublicHandler) Download(c *gin.Context) {
 
 // ─── Feed endpoints (one per format) ───
 
+// FeedPublicMaxAge is how long shared caches may serve the public
+// feed. Switching a product's feed gate on does not reach those
+// caches, so a bounded update period is refused until this much time
+// has passed since the switch (feedNotGated).
+const FeedPublicMaxAge = model.FeedPublicMaxAge
+
 // feedRequest captures the validated context for a single feed request.
 type feedRequest struct {
 	product  *model.Product
 	platform string
 	channel  string
 	limit    int
+	// publishedBefore is the maintenance cutoff of the license the
+	// updater identified itself with; nil for the public feed.
+	publishedBefore *time.Time
+	// licensed marks a feed built for one license: not cacheable by
+	// shared caches, since another key may see a different list.
+	licensed bool
 }
 
 // parseFeedRequest validates path + query params. All channels (stable
@@ -126,6 +145,32 @@ type feedRequest struct {
 // artifact's ed25519 signature, not by URL secrecy. On any error the
 // response is already written and ok=false.
 func (h *ReleasePublicHandler) parseFeedRequest(c *gin.Context) (req feedRequest, ok bool) {
+	// Every feed response varies on the key header, and a response
+	// built for a key — including a 404 for a bad key and Tauri's
+	// 204 — must never come out of a shared cache for another
+	// client. Set before any early return.
+	c.Header("Vary", "X-License-Key, X-License-Token")
+	// The license key is a long-lived credential that also opens
+	// activate, verify and download, so it is taken from the header
+	// only: a key in the URL is written to CDN, proxy and access logs
+	// before the request reaches this process, and no response header
+	// takes that back. An updater that can only put things in the URL
+	// (Sparkle's feedParametersForUpdater) sends the signed token
+	// instead — it expires, and it is accepted on feeds alone.
+	key := strings.TrimSpace(c.GetHeader("X-License-Key"))
+	tok := strings.TrimSpace(c.Query("license_token"))
+	if tok == "" {
+		tok = strings.TrimSpace(c.GetHeader("X-License-Token"))
+	}
+	if key != "" || tok != "" || c.Query("license_key") != "" {
+		c.Header("Cache-Control", "private, no-store")
+	}
+	if c.Query("license_key") != "" {
+		response.BadRequest(c,
+			"the license key is not accepted in the URL: send it in the X-License-Key header, or put the signed token from /license/verify in license_token")
+		return
+	}
+
 	slug := strings.ToLower(strings.TrimSpace(c.Param("product_slug")))
 	if slug == "" {
 		response.BadRequest(c, "product_slug is required in the URL path")
@@ -172,7 +217,48 @@ func (h *ReleasePublicHandler) parseFeedRequest(c *gin.Context) (req feedRequest
 		}
 		limit = n
 	}
-	return feedRequest{product: prod, platform: platform, channel: channel, limit: limit}, true
+	req = feedRequest{product: prod, platform: platform, channel: channel, limit: limit}
+
+	// A perpetual license with a maintenance period may only install
+	// releases published before it ended. The updater carries its key
+	// (query or header) and the feed hides everything newer; without
+	// a key the feed is the public list. The key is validated the
+	// same way /license/download validates it: a bad key is a 404,
+	// not the public feed, or the gate could be skipped by dropping
+	// the key.
+	if key == "" && tok == "" && prod.FeedLicenseRequired {
+		// The product sells maintenance periods: the public list would
+		// hand a lapsed customer the newer releases. 401 rather than
+		// 404 so the integrator sees what the updater must send.
+		response.Err(c, http.StatusUnauthorized, "LICENSE_KEY_REQUIRED",
+			"this product's update feed requires the license: send the signed token from /license/verify (license_token query or X-License-Token header), or the license key in the X-License-Key header")
+		return
+	}
+	switch {
+	case key != "":
+		cutoff, err := h.svc.FeedCutoff(c.Request.Context(), key, prod.ID)
+		if err != nil {
+			writeAppErr(c, err)
+			return
+		}
+		req.publishedBefore, req.licensed = cutoff, true
+	case tok != "":
+		// A bad or expired token is a 404 like a bad key: answering
+		// with the public list would let the gate be skipped by
+		// sending nonsense.
+		claims, err := license.Verify(tok, h.verifyKey)
+		if err != nil {
+			response.NotFound(c, "license not found")
+			return
+		}
+		cutoff, err := h.svc.FeedCutoffForToken(c.Request.Context(), claims.LicenseID, prod.ID)
+		if err != nil {
+			writeAppErr(c, err)
+			return
+		}
+		req.publishedBefore, req.licensed = cutoff, true
+	}
+	return req, true
 }
 
 // fetchPublishedFeedReleases pulls releases + filters their artifacts to
@@ -183,7 +269,7 @@ func (h *ReleasePublicHandler) parseFeedRequest(c *gin.Context) (req feedRequest
 // within the loop) so renderers can build format-specific signature
 // envelopes (Tauri minisign requires the pubkey to derive its key_id).
 func (h *ReleasePublicHandler) fetchPublishedFeedReleases(c *gin.Context, req feedRequest) ([]*service.FeedRelease, bool) {
-	releases, err := h.svc.ListForFeed(c.Request.Context(), req.product.ID, req.channel, req.platform, req.limit)
+	releases, err := h.svc.ListForFeed(c.Request.Context(), req.product.ID, req.channel, req.platform, req.limit, req.publishedBefore)
 	if err != nil {
 		writeAppErr(c, err)
 		return nil, false
@@ -246,14 +332,41 @@ func (h *ReleasePublicHandler) fetchPublishedFeedReleases(c *gin.Context, req fe
 }
 
 func (h *ReleasePublicHandler) feedInput(req feedRequest, releases []*service.FeedRelease) service.FeedInput {
+	minVersion, minMessage := req.product.MinimumSupportedVersion, req.product.MinimumSupportedMessage
+	if req.publishedBefore != nil {
+		minVersion = capMinimumVersion(minVersion, releases)
+		if minVersion == "" {
+			minMessage = ""
+		}
+	}
 	return service.FeedInput{
 		ProductID:               req.product.ID,
 		ProductName:             req.product.Name,
 		BaseURL:                 h.baseURL,
 		Releases:                releases,
-		MinimumSupportedVersion: req.product.MinimumSupportedVersion,
-		MinimumSupportedMessage: req.product.MinimumSupportedMessage,
+		MinimumSupportedVersion: minVersion,
+		MinimumSupportedMessage: minMessage,
 	}
+}
+
+// capMinimumVersion keeps a product's version floor within what a
+// cutoff-scoped feed can deliver. A license whose update period has
+// ended may only install releases from before the cutoff; telling its
+// client to refuse anything below a newer floor would stop software
+// the perpetual license promises keeps working. The floor becomes the
+// newest entitled release, or nothing when there is none.
+func capMinimumVersion(minimum string, entitled []*service.FeedRelease) string {
+	if minimum == "" {
+		return ""
+	}
+	if len(entitled) == 0 {
+		return ""
+	}
+	newest := entitled[0].Release.Version // sorted newest first
+	if service.VersionAtMost(minimum, newest) {
+		return minimum
+	}
+	return newest
 }
 
 // GET /api/v1/releases/:product_slug/feed.xml — Sparkle appcast
@@ -269,10 +382,10 @@ func (h *ReleasePublicHandler) FeedSparkle(c *gin.Context) {
 	body, err := service.RenderSparkle(h.feedInput(req, feedReleases))
 	if err != nil {
 		h.logger.Error("feed: sparkle render failed", "error", err)
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
-	h.writeFeedCacheHeaders(c, req.channel)
+	h.writeFeedCacheHeaders(c, req)
 	c.Data(http.StatusOK, "application/xml; charset=utf-8", body)
 }
 
@@ -289,10 +402,10 @@ func (h *ReleasePublicHandler) FeedVelopack(c *gin.Context) {
 	body, err := json.Marshal(service.BuildVelopack(h.feedInput(req, feedReleases)))
 	if err != nil {
 		h.logger.Error("feed: velopack marshal failed", "error", err)
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
-	h.writeFeedCacheHeaders(c, req.channel)
+	h.writeFeedCacheHeaders(c, req)
 	c.Data(http.StatusOK, "application/json; charset=utf-8", body)
 }
 
@@ -318,12 +431,17 @@ func (h *ReleasePublicHandler) FeedTauri(c *gin.Context) {
 		c.Status(http.StatusNoContent)
 		return
 	}
-	h.writeFeedCacheHeaders(c, req.channel)
+	h.writeFeedCacheHeaders(c, req)
 	c.JSON(http.StatusOK, manifest)
 }
 
-// writeFeedCacheHeaders sets Cache-Control. All channels are public —
-// CDNs / ISP proxies may safely serve them.
-func (h *ReleasePublicHandler) writeFeedCacheHeaders(c *gin.Context, _ string) {
-	c.Header("Cache-Control", "public, max-age=60")
+// writeFeedCacheHeaders sets Cache-Control for a successful feed. The
+// public feed is the same for everyone, so CDNs / ISP proxies may
+// serve it; a feed built for one license key keeps the no-store
+// policy parseFeedRequest already set.
+func (h *ReleasePublicHandler) writeFeedCacheHeaders(c *gin.Context, req feedRequest) {
+	if req.licensed {
+		return
+	}
+	c.Header("Cache-Control", "public, max-age="+strconv.Itoa(int(FeedPublicMaxAge.Seconds())))
 }

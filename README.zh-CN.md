@@ -13,7 +13,7 @@
 [![License](https://img.shields.io/badge/license-AGPL%20v3-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/tabloy/keygate?label=release&color=green)](https://github.com/tabloy/keygate/releases)
 [![Stars](https://img.shields.io/github/stars/tabloy/keygate?style=flat)](https://github.com/tabloy/keygate/stargazers)
-[![Sponsor](https://img.shields.io/badge/sponsor-❤-ff69b4)](https://keygate.app/sponsorships)
+[![Sponsor](https://img.shields.io/badge/sponsor-❤-ff69b4)](https://ko-fi.com/alanisme)
 
 **[English](README.md)** · **[简体中文](README.zh-CN.md)**
 
@@ -50,13 +50,13 @@
 
 ### 🔑 许可证管理
 
-一个平台覆盖所有模式 — **订阅制**、**永久买断**、**免费试用**和**浮动许可**（并发）。创建、激活、验证、暂停、恢复和吊销，全程审计追踪。按设备或按用户的激活限制，**原子级强制**（重试不会重复计数）。宽限期。许可证密钥 SHA-256 哈希存储，落盘加密。Ed25519 签名 token 支持离线验证（服务端持私钥,客户端通过 `/license/pubkey` 拿公钥本地验签）。**`Idempotency-Key` 头**支持 — 写入重试永不重复。
+一个平台覆盖所有模式 — **订阅制**、**永久买断**、**买断加维护期**（一次付清，含一年更新，门户内续费）、**免费试用**和**浮动许可**（并发）。创建、激活、验证、暂停、恢复和吊销，全程审计追踪。按设备或按用户的激活限制，**原子级强制**（重试不会重复计数）。宽限期。许可证密钥 SHA-256 哈希存储，落盘加密。Ed25519 签名 token 支持离线验证（服务端持私钥,客户端通过 `/license/pubkey` 拿公钥本地验签）。**`Idempotency-Key` 头**支持 — 写入重试永不重复。
 
 公开 SDK 端点（activate / verify / deactivate / usage / download）直接用 `license_key`，无需在二进制里嵌入 API 密钥。客户可在门户自助释放激活槽（丢笔记本不用提工单）。
 
 ### 🚀 软件分发
 
-向已安装客户端推送签名更新。**Sparkle**（macOS）、**Velopack**（Windows）和 **Tauri**（跨平台）的自动更新器消费同一份 release 数据 — 一次发布，所有更新器兼容。每个 release 下挂多平台二进制，**原子发布门控**（绝不泄露半上传状态），**yank** 即时回滚。每产品 **Ed25519 签名密钥**，私钥用 AES-256-GCM + HKDF 派生子密钥落盘加密。服务端算 SHA-256（不信客户端哈希）。stable channel 公开访问 — 客户的自动更新器在 license 轮换时绝不中断。每产品 `minimum_supported_version` 强制升级下限。
+向已安装客户端推送签名更新。**Sparkle**（macOS）、**Velopack**（Windows）和 **Tauri**（跨平台）的自动更新器消费同一份 release 数据 — 一次发布，所有更新器兼容。每个 release 下挂多平台二进制，**原子发布门控**（绝不泄露半上传状态），**yank** 即时回滚。每产品 **Ed25519 签名密钥**，私钥用 AES-256-GCM + HKDF 派生子密钥落盘加密。服务端算 SHA-256（不信客户端哈希）。stable channel 公开访问 — 客户的自动更新器在 license 轮换时绝不中断。按维护期销售的产品打开 `feed_license_required`，更新器随请求带上许可证，feed 只列出客户更新期内发布的版本；软件本身照常运行。每产品 `minimum_supported_version` 强制升级下限。
 
 对象存储兼容 S3 — Cloudflare R2、AWS S3、MinIO 等任何说 SigV4 的存储。Presigned URL 浏览器直传（不经 Keygate 中转），license 校验后短期下载 URL。
 
@@ -66,7 +66,7 @@
 
 ### 💳 支付集成
 
-Stripe 端到端集成，**三层可靠性保障** — Webhook、成功页验证和定时扫描确保每笔付款都不遗漏。客户付款 → 许可证自动创建。付款失败 → 按计划发送催款邮件。支持结账、升降级（按比例计费）、取消、退款和账单管理门户。Stripe Webhook 自动配置 — 只需设置 API 密钥。
+Stripe 端到端集成，**三层可靠性保障** — Webhook、成功页验证和定时扫描确保每笔付款都不遗漏。客户付款 → 许可证自动创建。付款失败 → 按计划发送催款邮件。支持结账、升降级（按比例计费）、取消、退款、账单管理门户，以及客户在门户内一次性续费永久许可证的更新期。Stripe Webhook 自动配置 — 只需设置 API 密钥。
 
 ### 👥 团队席位与权限
 
@@ -148,15 +148,31 @@ make build && ./bin/keygate
 - **[博客](https://keygate.app/blog)** — 产品更新和技术文章
 - **[赞助](https://keygate.app/sponsorships)** — 支持项目发展
 
+## 赞助
+
+Keygate 免费且可自托管。如果它帮你省下了托管授权服务的开销，在 [Ko-fi 上赞助](https://ko-fi.com/alanisme) 能让开发持续下去。
+
+<!-- sponsors:start -->
+_虚位以待。_
+<!-- sponsors:end -->
+
 ## 贡献
 
 欢迎所有形式的贡献 — Bug 修复、新功能、文档改进、翻译等。查看 [open issues](https://github.com/tabloy/keygate/issues) 或发起 [讨论](https://github.com/tabloy/keygate/discussions)，然后提交 PR。
+
+## 商业授权
+
+使用 Keygate 是免费的，商用也免费。自己部署运行、用它给你销售的软件发授权、面向自己的客户提供服务，都不用付费。
+
+AGPL 只要求两件事：界面上保留 **"Powered by Keygate"** 署名；如果你修改了 Keygate 并让别人使用，把改动公开。商业授权解除这两条，白标或以闭源服务转售需要它。
+
+请联系 [hello@keygate.app](mailto:hello@keygate.app)。
 
 ## 许可证
 
 [AGPL v3 License](LICENSE)（附 [Section 7(b)](https://www.gnu.org/licenses/agpl-3.0.en.html#section7) 附加条款）— Copyright © 2026 [Tabloy](https://tabloy.app)
 
-你可以在 AGPL v3 下自由 fork、修改和自托管本软件。UI 中的 **"Powered by Keygate"** 署名须保留（详见 [NOTICE](NOTICE)）。如需移除署名，可购买商业许可 — 联系 [hello@keygate.app](mailto:hello@keygate.app)。
+你可以在 AGPL v3 下自由 fork、修改和自托管本软件。UI 中的 **"Powered by Keygate"** 署名须保留（详见 [NOTICE](NOTICE)）。
 
 ## Star 趋势
 

@@ -91,7 +91,8 @@ export const auth = {
 
 // ─── Checkout ───
 export const checkout = {
-  verify: (sessionId: string) => get<{ status: string; email?: string }>(`/checkout/verify?session_id=${sessionId}`),
+  verify: (sessionId: string) =>
+    get<{ status: string; email?: string; kind?: string }>(`/checkout/verify?session_id=${sessionId}`),
 }
 
 // ─── Invites (public, token-only) ───
@@ -108,12 +109,14 @@ export const invites = {
 
 // ─── Portal ───
 export const portal = {
-  licenses: () => get<{ licenses: PortalLicense[] }>("/portal/licenses"),
+  licenses: () => get<{ licenses: PortalLicense[]; renewals_enabled?: boolean }>("/portal/licenses"),
   listPlans: (productId: string) => get<{ plans: Plan[] }>(`/portal/plans?product_id=${productId}`),
   updateProfile: (data: { name: string }) =>
     put<{ id: string; email: string; name: string; avatar_url: string; role: string }>("/portal/profile", data),
-  recordUsage: (data: { license_key: string; feature: string; quantity?: number }) => post<any>("/portal/usage", data),
-  quotaStatus: (data: { license_key: string; feature: string }) => post<any>("/portal/usage/status", data),
+  recordUsage: (data: { license_key: string; feature: string; quantity?: number }) =>
+    post<{ status?: string }>("/portal/usage", data),
+  quotaStatus: (data: { license_key: string; feature: string }) =>
+    post<{ used?: number; limit?: number; remaining?: number }>("/portal/usage/status", data),
   // Customer-facing team management for multi-seat plans. Session-
   // authed (cookie); the body's license_key only names the target
   // license — the cookie is the actual authentication.
@@ -143,28 +146,39 @@ export const portal = {
     post<{ url: string }>("/portal/subscription/billing-portal", data),
   getInvoices: (licenseId: string) =>
     get<{ invoices: Invoice[] }>(`/portal/subscription/invoices?license_id=${licenseId}`),
+  renewUpdates: (data: { license_id: string }) => post<{ url: string }>("/portal/updates/renew", data),
 }
 
 // ─── Admin ───
+// Every list endpoint answers with its rows under their own name and
+// the same three numbers beside them. `limit` is what the server
+// applied, not what was asked for — it clamps.
+// Builds a list request's query string. Empty and undefined values
+// are left out so a filter that is not set does not become one that
+// matches the empty string.
+function listQuery(params?: Record<string, string | number | undefined>) {
+  const q = new URLSearchParams()
+  for (const [k, v] of Object.entries(params || {})) {
+    if (v !== undefined && v !== "" && v !== null) q.set(k, String(v))
+  }
+  return q.toString()
+}
+
+export type Paged<T> = T & { total: number; limit: number; offset: number }
+
 export const admin = {
   stats: () => get<Stats>("/admin/stats"),
 
-  listProducts: (params?: { search?: string }) => {
-    const q = new URLSearchParams()
-    if (params?.search) q.set("search", params.search)
-    return get<{ products: Product[] }>(`/admin/products?${q}`)
-  },
+  listProducts: (params?: { search?: string; type?: string; limit?: number; offset?: number }) =>
+    get<Paged<{ products: Product[] }>>(`/admin/products?${listQuery(params)}`),
   getProduct: (id: string) => get<Product>(`/admin/products/${id}`),
-  createProduct: (data: { name: string; slug: string; type: string }) => post<Product>("/admin/products", data),
+  createProduct: (data: { name: string; slug: string; type: string; feed_license_required?: boolean }) =>
+    post<Product>("/admin/products", data),
   updateProduct: (id: string, data: Partial<Product>) => put<Product>(`/admin/products/${id}`, data),
   deleteProduct: (id: string) => del(`/admin/products/${id}`),
 
-  listPlans: (productId?: string, search?: string) => {
-    const q = new URLSearchParams()
-    if (productId) q.set("product_id", productId)
-    if (search) q.set("search", search)
-    return get<{ plans: Plan[] }>(`/admin/plans?${q}`)
-  },
+  listPlans: (params?: { product_id?: string; search?: string; limit?: number; offset?: number }) =>
+    get<Paged<{ plans: Plan[] }>>(`/admin/plans?${listQuery(params)}`),
   getPlan: (id: string) => get<Plan>(`/admin/plans/${id}`),
   createPlan: (data: Partial<Plan>) => post<Plan>("/admin/plans", data),
   updatePlan: (id: string, data: Partial<Plan>) => put<Plan>(`/admin/plans/${id}`, data),
@@ -181,6 +195,12 @@ export const admin = {
     search?: string
     external_customer_id?: string
     external_workspace_id?: string
+    // Server-side ordering. The API refuses a column it does not
+    // know rather than quietly serving a different order, so these
+    // have to match its allowlist: created_at, valid_until, email,
+    // status, product, plan.
+    sort?: string
+    order?: "asc" | "desc"
     offset?: number
     limit?: number
   }) => {
@@ -190,11 +210,17 @@ export const admin = {
     if (params?.search) q.set("search", params.search)
     if (params?.external_customer_id) q.set("external_customer_id", params.external_customer_id)
     if (params?.external_workspace_id) q.set("external_workspace_id", params.external_workspace_id)
+    if (params?.sort) q.set("sort", params.sort)
+    if (params?.order) q.set("order", params.order)
     if (params?.offset) q.set("offset", String(params.offset))
     if (params?.limit) q.set("limit", String(params.limit))
-    return get<{ licenses: License[]; total: number; license_key_hints: Record<string, string> }>(
-      `/admin/licenses?${q}`,
-    )
+    return get<{
+      licenses: License[]
+      total: number
+      limit: number
+      offset: number
+      license_key_hints: Record<string, string>
+    }>(`/admin/licenses?${q}`)
   },
   // The licence keeps its own shape; only the key is gone, replaced by
   // a last-four hint.
@@ -202,6 +228,10 @@ export const admin = {
   // The key is never in a list or detail payload — one explicit
   // request per key, audited server-side.
   revealLicenseKey: (id: string) => get<{ license_key: string }>(`/admin/licenses/${id}/key`),
+  // Re-queues the "here is your key" mail. The address is the one on
+  // the licence; the server does not accept one from here.
+  resendLicenseEmail: (id: string) =>
+    post<{ queued: boolean; email: string }>(`/admin/licenses/${id}/resend-email`, {}),
   createLicense: (data: {
     product_id: string
     plan_id: string
@@ -214,6 +244,9 @@ export const admin = {
   // Empty valid_until clears the expiry (perpetual license).
   setLicenseValidUntil: (id: string, validUntil: string) =>
     post<License>(`/admin/licenses/${id}/valid-until`, { valid_until: validUntil }),
+  // Empty updates_until means updates for life.
+  setLicenseUpdatesUntil: (id: string, updatesUntil: string) =>
+    post<License>(`/admin/licenses/${id}/updates-until`, { updates_until: updatesUntil }),
   revokeLicense: (id: string) => post(`/admin/licenses/${id}/revoke`),
   suspendLicense: (id: string) => post(`/admin/licenses/${id}/suspend`),
   reinstateLicense: (id: string) => post(`/admin/licenses/${id}/reinstate`),
@@ -221,23 +254,15 @@ export const admin = {
 
   deleteActivation: (id: string) => del(`/admin/activations/${id}`),
 
-  listAPIKeys: (productId?: string, search?: string) => {
-    const q = new URLSearchParams()
-    if (productId) q.set("product_id", productId)
-    if (search) q.set("search", search)
-    return get<{ api_keys: APIKey[] }>(`/admin/api-keys?${q}`)
-  },
+  listAPIKeys: (params?: { product_id?: string; search?: string; limit?: number; offset?: number }) =>
+    get<Paged<{ api_keys: APIKey[] }>>(`/admin/api-keys?${listQuery(params)}`),
   createAPIKey: (data: { product_id?: string; name: string; scopes?: string[] }) =>
     post<APIKey & { key: string }>("/admin/api-keys", data),
   rotateAPIKey: (id: string) => post<APIKey & { key: string }>(`/admin/api-keys/${id}/rotate`, {}),
   deleteAPIKey: (id: string) => del(`/admin/api-keys/${id}`),
 
-  listWebhooks: (productId?: string, search?: string) => {
-    const q = new URLSearchParams()
-    if (productId) q.set("product_id", productId)
-    if (search) q.set("search", search)
-    return get<{ webhooks: WebhookConfig[] }>(`/admin/webhooks?${q}`)
-  },
+  listWebhooks: (params?: { product_id?: string; search?: string; limit?: number; offset?: number }) =>
+    get<Paged<{ webhooks: WebhookConfig[] }>>(`/admin/webhooks?${listQuery(params)}`),
   createWebhook: (data: { product_id: string; url: string; events: string[] }) =>
     post<WebhookConfig & { secret: string }>("/admin/webhooks", data),
   updateWebhook: (id: string, data: Partial<WebhookConfig>) => put<WebhookConfig>(`/admin/webhooks/${id}`, data),
@@ -270,7 +295,8 @@ export const admin = {
   resetUsageCounter: (id: string, data: { feature: string; period?: string; period_key?: string }) =>
     post(`/admin/licenses/${id}/usage/reset`, data),
 
-  getLicenseSeats: (id: string) => get<{ seats: Seat[]; active_count: number }>(`/admin/licenses/${id}/seats`),
+  getLicenseSeats: (id: string, params?: { limit?: number; offset?: number }) =>
+    get<Paged<{ seats: Seat[]; active_count: number }>>(`/admin/licenses/${id}/seats?${listQuery(params)}`),
 
   getAnalytics: (params?: { product_id?: string; from?: string; to?: string; granularity?: string }) => {
     const q = new URLSearchParams()
@@ -336,24 +362,25 @@ export const admin = {
     return get<{ trend: TrendPoint[] }>(`/admin/analytics/activation-trend?${q}`)
   },
 
+  // Cuts a licence loose from a Stripe subscription that is over, so
+  // it can be managed locally again. Refused (409) while Stripe still
+  // has the subscription.
+  unlinkStripeSubscription: (id: string) => post<{ status: string }>(`/admin/licenses/${id}/stripe/unlink`, {}),
   changeLicensePlan: (id: string, data: { plan_id: string }) => post(`/admin/licenses/${id}/change-plan`, data),
 
   // Addons
-  listAddons: (productId?: string, search?: string) => {
-    const q = new URLSearchParams()
-    if (productId) q.set("product_id", productId)
-    if (search) q.set("search", search)
-    return get<{ addons: Addon[] }>(`/admin/addons?${q}`)
-  },
+  listAddons: (params?: { product_id?: string; search?: string; limit?: number; offset?: number }) =>
+    get<Paged<{ addons: Addon[] }>>(`/admin/addons?${listQuery(params)}`),
   createAddon: (data: Partial<Addon>) => post<Addon>("/admin/addons", data),
   updateAddon: (id: string, data: Partial<Addon>) => put<Addon>(`/admin/addons/${id}`, data),
   deleteAddon: (id: string) => del(`/admin/addons/${id}`),
-  getLicenseAddons: (id: string) => get<{ addons: LicenseAddon[] }>(`/admin/licenses/${id}/addons`),
+  getLicenseAddons: (id: string, params?: { limit?: number; offset?: number }) =>
+    get<Paged<{ addons: LicenseAddon[] }>>(`/admin/licenses/${id}/addons?${listQuery(params)}`),
   addLicenseAddon: (id: string, addonId: string) =>
     post<LicenseAddon>(`/admin/licenses/${id}/addons`, { addon_id: addonId }),
   removeLicenseAddon: (id: string, addonId: string) => del(`/admin/licenses/${id}/addons/${addonId}`),
-  getFloatingSessions: (id: string) =>
-    get<{ sessions: FloatingSession[]; active: number }>(`/admin/licenses/${id}/floating`),
+  getFloatingSessions: (id: string, params?: { limit?: number; offset?: number }) =>
+    get<Paged<{ sessions: FloatingSession[]; active: number }>>(`/admin/licenses/${id}/floating?${listQuery(params)}`),
 
   listAuditLogs: (params?: {
     entity?: string
@@ -380,7 +407,8 @@ export const admin = {
   },
 
   // Team (admin management)
-  listTeam: () => get<{ members: User[] }>("/admin/team"),
+  listTeam: (params?: { limit?: number; offset?: number }) =>
+    get<Paged<{ members: User[] }>>(`/admin/team?${listQuery(params)}`),
   inviteTeamMember: (data: { email: string; role?: string }) => post<User>("/admin/team", data),
   removeTeamMember: (id: string) => del(`/admin/team/${id}`),
 
@@ -397,10 +425,11 @@ export const admin = {
     get<{
       settings: Record<string, string>
       secrets_set?: Record<string, boolean>
-      email?: { configured: boolean; host: string; from: string }
+      email?: { configured: boolean; provider: string; source: string; host: string; from: string }
     }>("/admin/settings"),
   updateSettings: (settings: Record<string, string>) => put<{ status: string }>("/admin/settings", { settings }),
-  sendTestEmail: () => post<{ status: string }>("/admin/settings/test-email"),
+  sendTestEmail: (to?: string) => post<{ status: string }>("/admin/settings/test-email", to ? { to } : {}),
+  clearSecretSetting: (key: string) => del<{ status: string; key: string }>(`/admin/settings/secrets/${key}`),
 
   // Email Templates
   getEmailTemplates: () =>
@@ -502,6 +531,9 @@ export interface Product {
   minimum_supported_version?: string
   minimum_supported_message?: string
   require_signing: boolean
+  // Update feeds answer only with a license key (maintenance-period products).
+  feed_license_required?: boolean
+  feed_gated_at?: string
   created_at: string
 }
 
@@ -521,6 +553,11 @@ export interface Plan {
   trial_days: number
   grace_days: number
   stripe_price_id?: string
+  // Maintenance period (perpetual plans): days of updates a purchase
+  // includes (0 = for life) and the one-time renewal sold in the portal.
+  updates_days?: number
+  renewal_days?: number
+  stripe_renewal_price_id?: string
   active: boolean
   sort_order: number
   created_at: string
@@ -549,9 +586,15 @@ export interface License {
   // Admin list/detail carry a last-four hint instead — see PortalLicense.
   license_key?: string
   payment_provider?: string
+  // Set only for subscription-backed Stripe licenses. A one-time
+  // purchase has no subscription, so nothing to change, cancel, or
+  // update a payment method for.
+  stripe_subscription_id?: string
   status: string
   valid_from: string
   valid_until?: string
+  // End of a perpetual license's update period; absent = no separate limit.
+  updates_until?: string
   canceled_at?: string
   suspended_at?: string
   org_name?: string
@@ -562,6 +605,14 @@ export interface License {
   updated_at: string
   product?: Product
   plan?: Plan
+  // How many activations the licence has. Present on list rows, where
+  // the activations themselves are not; the detail payload carries
+  // both and they agree.
+  activation_count?: number
+  // Floating seats in use right now. A floating plan keeps occupancy
+  // in its own table, so activation_count reads zero for one however
+  // full it is; this is the number that answers "how full" there.
+  active_session_count?: number
   activations?: Activation[]
   seats?: Seat[]
   addons?: LicenseAddon[]

@@ -46,10 +46,15 @@ type VerifyToken struct {
 	// proxy rewrote on the way. exp alone cannot stand in for it —
 	// exp is a check-in interval and says nothing about the licence
 	// term.
-	ValidUntil  int64  `json:"vun,omitempty"`
-	GraceDays   int    `json:"grc"`
-	Nonce       string `json:"nce"`           // unique per-issuance to prevent replay
-	Fingerprint string `json:"fpr,omitempty"` // SHA256(identifier+product_id) for binding
+	ValidUntil int64 `json:"vun,omitempty"`
+	// UpdatesUntil ends the maintenance period of a perpetual license,
+	// as a unix second: a client may install releases published up to
+	// this instant and must refuse newer ones. Zero (field omitted)
+	// means no separate limit. Signed for the same reason as vun.
+	UpdatesUntil int64  `json:"upd,omitempty"`
+	GraceDays    int    `json:"grc"`
+	Nonce        string `json:"nce"`           // unique per-issuance to prevent replay
+	Fingerprint  string `json:"fpr,omitempty"` // SHA256(identifier+product_id) for binding
 }
 
 // PrivateKeyFromHex parses a 32-byte ed25519 seed (64 hex chars) and

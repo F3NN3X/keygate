@@ -33,7 +33,7 @@ func (h *AuthHandler) OTPSend(c *gin.Context) {
 	// Rate limit: max 3 OTP requests per email per 10 minutes
 	count, err := h.Store.CountRecentOTPCodes(c, email)
 	if err != nil {
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
 	if count >= 3 {
@@ -63,7 +63,7 @@ func (h *AuthHandler) OTPSend(c *gin.Context) {
 		ExpiresAt: time.Now().Add(10 * time.Minute),
 	}
 	if err := h.Store.CreateOTPCode(c, otp); err != nil {
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
 
@@ -77,11 +77,28 @@ func (h *AuthHandler) OTPSend(c *gin.Context) {
 		return
 	}
 
-	if h.Email != nil && h.Email.IsConfigured() {
-		h.Email.SendOTPCode(email, code)
-	} else {
+	logCodeFallback := func() {
 		slog.Warn("SMTP not configured — OTP code printed to log (configure SMTP for email delivery)",
 			"email", email, "code", code)
+	}
+	switch {
+	case h.Email == nil:
+		logCodeFallback()
+	default:
+		configured, cErr := h.Email.Configured()
+		switch {
+		case cErr != nil:
+			// A transient config read error (DB blip, decrypt failure)
+			// must NOT fall back to logging the code in plaintext: that
+			// would leak a live login code on an infra hiccup. Fail
+			// closed — the user simply retries once the read recovers.
+			slog.Error("otp email config unavailable; code not sent and not logged",
+				"email", email, "error", cErr)
+		case configured:
+			h.Email.SendOTPCode(email, code)
+		default:
+			logCodeFallback()
+		}
 	}
 
 	response.OK(c, gin.H{"status": "sent"})
@@ -144,12 +161,12 @@ func (h *AuthHandler) OTPVerify(c *gin.Context) {
 	// Upsert user (create on first login)
 	user := &model.User{Email: email}
 	if err := h.Store.UpsertUser(c, user); err != nil {
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
 	user, err = h.Store.FindUserByEmail(c, email)
 	if err != nil {
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
 

@@ -3,71 +3,190 @@ package store
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/uptrace/bun"
 
 	"github.com/tabloy/keygate/internal/model"
 )
 
 // ─── Product ───
 
-func (s *Store) ListProducts(ctx context.Context, search string) ([]*model.Product, error) {
+// ListProducts returns one page of the catalogue and how many
+// products the filter matched.
+//
+// types narrows to the product kinds the caller can actually use — the
+// releases pages ask for the ones that ship binaries. Filtering here
+// rather than over the page the dashboard happens to hold is the
+// difference between "these are the products you can pick" and "these
+// are the ones that were on screen".
+//
+// The order carries id as a tiebreaker: two products created in the
+// same instant would otherwise be free to swap places between two
+// queries, and under paging that means a row shown twice while
+// another is never shown at all.
+func (s *Store) ListProducts(ctx context.Context, search string, types []string, p Page) ([]*model.Product, int, error) {
 	var out []*model.Product
-	q := s.DB.NewSelect().Model(&out).OrderExpr("created_at DESC")
+	q := s.DB.NewSelect().Model(&out).OrderExpr("created_at DESC, id DESC")
+	if len(types) > 0 {
+		q = q.Where("type IN (?)", bun.List(types))
+	}
 	if search != "" {
 		q = q.Where("name ILIKE ? OR slug ILIKE ?", "%"+search+"%", "%"+search+"%")
 	}
-	err := q.Scan(ctx)
-	return out, err
+	total, err := scanPage(ctx, q, p)
+	if err != nil {
+		return nil, 0, err
+	}
+	if p.Limit <= 0 {
+		total = len(out)
+	}
+	return out, total, nil
 }
 
 func (s *Store) FindProductByID(ctx context.Context, id string) (*model.Product, error) {
+	return FindProductByIDIn(ctx, s.DB, id)
+}
+
+// FindProductByIDIn reads the product on a caller's transaction, for
+// writers that re-read its gating state under a lock.
+func FindProductByIDIn(ctx context.Context, db bun.IDB, id string) (*model.Product, error) {
 	p := new(model.Product)
-	return p, s.DB.NewSelect().Model(p).Where("id = ?", id).Scan(ctx)
+	return p, db.NewSelect().Model(p).Where("id = ?", id).Scan(ctx)
 }
 
 func (s *Store) CreateProduct(ctx context.Context, p *model.Product) error {
 	if p.ID == "" {
 		p.ID = newID()
 	}
+	// bun's default RETURNING * fills the row back in, which matters
+	// here beyond created_at: feed_gated_at is stamped by the database
+	// when the row arrives already gated, and the wait before an
+	// update period may be sold runs from that instant.
 	_, err := s.DB.NewInsert().Model(p).Exec(ctx)
 	return err
 }
 
 func (s *Store) UpdateProduct(ctx context.Context, p *model.Product) error {
-	_, err := s.DB.NewUpdate().Model(p).WherePK().Exec(ctx)
+	return UpdateProductIn(ctx, s.DB, p)
+}
+
+// UpdateProductGatingNowIn writes the named columns and stamps
+// feed_gated_at with the database clock, reading the stored instant
+// back into p. The wait a gated feed imposes runs from the moment the
+// public feed actually stopped — this write — not from a time read on
+// some replica before the transaction began.
+func UpdateProductGatingNowIn(ctx context.Context, db bun.IDB, p *model.Product, cols ...string) error {
+	q := db.NewUpdate().Model(p).WherePK().
+		Set("feed_gated_at = clock_timestamp()").
+		Returning("feed_gated_at")
+	if len(cols) > 0 {
+		q = q.Column(cols...)
+	}
+	_, err := q.Exec(ctx, &p.FeedGatedAt)
 	return err
 }
 
-func (s *Store) DeleteProduct(ctx context.Context, id string) error {
-	_, err := s.DB.NewDelete().Model((*model.Product)(nil)).Where("id = ?", id).Exec(ctx)
+// UpdateProductIn writes the product on a caller's transaction. With
+// no columns named it writes the whole row; with columns, only those
+// — a caller that has to refuse the rest of a request can still
+// commit the part it must not lose.
+func UpdateProductIn(ctx context.Context, db bun.IDB, p *model.Product, cols ...string) error {
+	q := db.NewUpdate().Model(p).WherePK()
+	if len(cols) > 0 {
+		q = q.Column(cols...)
+	}
+	_, err := q.Exec(ctx)
 	return err
+}
+
+// DeleteProduct removes the product and the rows the 20260515 bundle
+// refactor left behind for it.
+//
+// releases_legacy is that migration's rollback evidence: the old
+// releases table, renamed and kept whole so the down migration can
+// rename it back. Nothing reads it, no endpoint can clear it, and its
+// product_id still restricts — so on an install that upgraded through
+// that migration, a product whose current releases have all been
+// deleted would still refuse to go, with nothing the admin could do
+// about it. The rows for this one product are dropped with it; the
+// rest of the table, and the rollback it exists for, are untouched.
+func (s *Store) DeleteProduct(ctx context.Context, id string) error {
+	return RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		// Asked before the delete rather than caught after it: a
+		// failed statement poisons the transaction, and an install
+		// created after the refactor has no such table.
+		var legacy bool
+		if err := tx.NewRaw("SELECT to_regclass('public.releases_legacy') IS NOT NULL").Scan(ctx, &legacy); err != nil {
+			return err
+		}
+		if legacy {
+			if _, err := tx.NewRaw("DELETE FROM releases_legacy WHERE product_id = ?", id).Exec(ctx); err != nil {
+				return err
+			}
+		}
+		_, err := tx.NewDelete().Model((*model.Product)(nil)).Where("id = ?", id).Exec(ctx)
+		return err
+	})
 }
 
 // ─── Plan ───
 
-func (s *Store) ListPlans(ctx context.Context, productID, search string) ([]*model.Plan, error) {
+// ListPlans returns one page of a product's plans (or of every
+// product's, unfiltered) and how many the filter matched. Entitlements
+// are a has-many relation, which bun loads in a query of its own, so
+// the limit applies to plans and not to their rows.
+func (s *Store) ListPlans(ctx context.Context, productID, search string, p Page) ([]*model.Plan, int, error) {
 	var out []*model.Plan
-	q := s.DB.NewSelect().Model(&out).Relation("Entitlements").Relation("Product").OrderExpr("sort_order ASC, plan.created_at DESC")
+	q := s.DB.NewSelect().Model(&out).Relation("Entitlements").Relation("Product").
+		OrderExpr("sort_order ASC, plan.created_at DESC, plan.id DESC")
 	if productID != "" {
 		q = q.Where("plan.product_id = ?", productID)
 	}
 	if search != "" {
 		q = q.Where("plan.name ILIKE ? OR plan.slug ILIKE ?", "%"+search+"%", "%"+search+"%")
 	}
-	err := q.Scan(ctx)
-	return out, err
+	total, err := scanPage(ctx, q, p)
+	if err != nil {
+		return nil, 0, err
+	}
+	if p.Limit <= 0 {
+		total = len(out)
+	}
+	return out, total, nil
 }
 
-func (s *Store) CreatePlan(ctx context.Context, p *model.Plan) error {
+// FillPlanIDs gives a new plan the ids CreatePlan would, for callers
+// that insert it on their own transaction with CreatePlanIn.
+func (s *Store) FillPlanIDs(p *model.Plan) {
 	if p.ID == "" {
 		p.ID = newID()
 	}
 	if p.CheckoutID == "" {
 		p.CheckoutID = shortID()
 	}
-	_, err := s.DB.NewInsert().Model(p).Exec(ctx)
+}
+
+func (s *Store) CreatePlan(ctx context.Context, p *model.Plan) error {
+	s.FillPlanIDs(p)
+	return RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		return CreatePlanIn(ctx, tx, p)
+	})
+}
+
+// CreatePlanIn writes the plan on a caller's transaction. The caller
+// fills the ids (CreatePlan does it), so a plan created under the
+// feed gating lock is inserted by the same transaction that checked
+// the gate.
+func CreatePlanIn(ctx context.Context, db bun.IDB, p *model.Plan) error {
+	// The plan's first terms row is written by a trigger, so every
+	// writer leaves one — including an older replica or an operator
+	// at the psql prompt.
+	_, err := db.NewInsert().Model(p).Exec(ctx)
 	return err
 }
 
@@ -82,9 +201,44 @@ func shortID() string {
 // Exported for use by the setup handler.
 func ShortID() string { return shortID() }
 
-func (s *Store) UpdatePlan(ctx context.Context, p *model.Plan) error {
-	_, err := s.DB.NewUpdate().Model(p).WherePK().Exec(ctx)
+func (s *Store) UpdatePlan(ctx context.Context, p *model.Plan, cols ...string) error {
+	return RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		return UpdatePlanIn(ctx, tx, p, cols...)
+	})
+}
+
+// UpdatePlanIn writes the plan on a caller's transaction. With no
+// columns named it writes the whole row; with columns, only those —
+// so an edit of one field cannot put another request's change back.
+func UpdatePlanIn(ctx context.Context, db bun.IDB, p *model.Plan, cols ...string) error {
+	q := db.NewUpdate().Model(p).WherePK()
+	if len(cols) > 0 {
+		q = q.Column(cols...)
+	}
+	// The terms history follows from the row itself: a trigger
+	// appends to it when this write actually moves updates_days or
+	// license_type, so an edit of an unrelated field cannot record a
+	// stale value and a write that bypasses this function cannot skip
+	// the record.
+	_, err := q.Exec(ctx)
 	return err
+}
+
+// PlanTermsAt returns what the plan was selling at t — the update
+// period and the kind of licence — and whether the history reaches
+// back that far.
+func (s *Store) PlanTermsAt(ctx context.Context, planID string, t time.Time) (days int, licenseType string, known bool, err error) {
+	err = s.DB.NewRaw(
+		"SELECT updates_days, license_type FROM plan_update_terms WHERE plan_id = ? AND effective_from <= ? ORDER BY effective_from DESC, recorded_at DESC LIMIT 1",
+		planID, t,
+	).Scan(ctx, &days, &licenseType)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", false, nil
+	}
+	if err != nil {
+		return 0, "", false, err
+	}
+	return days, licenseType, true, nil
 }
 
 func (s *Store) DeletePlan(ctx context.Context, id string) error {
@@ -147,17 +301,24 @@ func (s *Store) DeleteEntitlement(ctx context.Context, id string) error {
 
 // ─── API Key ───
 
-func (s *Store) ListAPIKeys(ctx context.Context, productID, search string) ([]*model.APIKey, error) {
+func (s *Store) ListAPIKeys(ctx context.Context, productID, search string, p Page) ([]*model.APIKey, int, error) {
 	var out []*model.APIKey
-	q := s.DB.NewSelect().Model(&out).Relation("Product").OrderExpr("api_key.created_at DESC")
+	q := s.DB.NewSelect().Model(&out).Relation("Product").
+		OrderExpr("api_key.created_at DESC, api_key.id DESC")
 	if productID != "" {
 		q = q.Where("api_key.product_id = ?", productID)
 	}
 	if search != "" {
 		q = q.Where("api_key.name ILIKE ? OR api_key.prefix ILIKE ?", "%"+search+"%", "%"+search+"%")
 	}
-	err := q.Scan(ctx)
-	return out, err
+	total, err := scanPage(ctx, q, p)
+	if err != nil {
+		return nil, 0, err
+	}
+	if p.Limit <= 0 {
+		total = len(out)
+	}
+	return out, total, nil
 }
 
 func (s *Store) CreateAPIKey(ctx context.Context, ak *model.APIKey, rawKey string) error {
@@ -234,6 +395,25 @@ func (s *Store) FindLicenseByID(ctx context.Context, id string) (*model.License,
 		Scan(ctx)
 }
 
+// FindLicenseByIDWithCounts is FindLicenseByID with the computed
+// fields a list response carries filled in, so a caller reading one
+// license sees the same numbers as the row it clicked on.
+func (s *Store) FindLicenseByIDWithCounts(ctx context.Context, id string) (*model.License, error) {
+	l, err := s.FindLicenseByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	l.ActivationCount = len(l.Activations)
+	if l.Plan != nil && l.Plan.LicenseModel == "floating" {
+		n, err := s.CountActiveFloating(ctx, l.ID)
+		if err != nil {
+			return nil, err
+		}
+		l.ActiveSessionCount = n
+	}
+	return l, nil
+}
+
 func (s *Store) RevokeLicense(ctx context.Context, id string) error {
 	_, _ = s.DB.NewDelete().Model((*model.Activation)(nil)).Where("license_id = ?", id).Exec(ctx)
 	res, err := s.DB.NewUpdate().Model((*model.License)(nil)).
@@ -308,7 +488,7 @@ func (s *Store) ExportLicenses(ctx context.Context, productID, status string) ([
 // is best-effort: 2-hop entities (seat, activation, release_artifact)
 // aren't matched and silently fall out of the filtered view.
 func (s *Store) ListAuditLogs(ctx context.Context, entity, entityID, productID string, offset, limit int) ([]*model.AuditLog, int, error) {
-	q := s.DB.NewSelect().Model((*model.AuditLog)(nil)).OrderExpr("created_at DESC")
+	q := s.DB.NewSelect().Model((*model.AuditLog)(nil)).OrderExpr("created_at DESC, id DESC")
 	if entity != "" {
 		q = q.Where("entity = ?", entity)
 	}
@@ -394,7 +574,7 @@ func (s *Store) ListUsers(ctx context.Context, search string, offset, limit int)
 		return nil, 0, err
 	}
 	var out []*model.User
-	err = q.OrderExpr("created_at DESC").
+	err = q.OrderExpr("created_at DESC, id DESC").
 		Offset(offset).Limit(limit).Scan(ctx, &out)
 	return out, total, err
 }
@@ -434,6 +614,61 @@ func (s *Store) ProductLicenseCount(ctx context.Context, productID string) (int,
 	return s.DB.NewSelect().Model((*model.License)(nil)).Where("product_id = ?", productID).Count(ctx)
 }
 
+// ProductBlockers counts what a product delete would have to destroy
+// and the database refuses to: plans, licences and releases all hold
+// it by a foreign key that restricts. All three are counted in one
+// call so the caller can name the one that matters most rather than
+// whichever query happened to run first.
+//
+// What is NOT counted is what the database removes with the product
+// (api keys, webhooks, addons, signing keys, analytics): those
+// cascade by design.
+func (s *Store) ProductBlockers(ctx context.Context, productID string) (plans, licenses, releases int, err error) {
+	if plans, err = s.DB.NewSelect().Model((*model.Plan)(nil)).
+		Where("product_id = ?", productID).Count(ctx); err != nil {
+		return 0, 0, 0, err
+	}
+	if licenses, err = s.ProductLicenseCount(ctx, productID); err != nil {
+		return 0, 0, 0, err
+	}
+	if releases, err = s.DB.NewSelect().Model((*model.Release)(nil)).
+		Where("product_id = ?", productID).Count(ctx); err != nil {
+		return 0, 0, 0, err
+	}
+	return plans, licenses, releases, nil
+}
+
 func (s *Store) PlanLicenseCount(ctx context.Context, planID string) (int, error) {
-	return s.DB.NewSelect().Model((*model.License)(nil)).Where("plan_id = ?", planID).Count(ctx)
+	return PlanLicenseCountIn(ctx, s.DB, planID)
+}
+
+// PlanLicenseCountIn counts on a caller's transaction, for a writer
+// that holds the plan's row lock across the count and the write.
+func PlanLicenseCountIn(ctx context.Context, db bun.IDB, planID string) (int, error) {
+	return db.NewSelect().Model((*model.License)(nil)).Where("plan_id = ?", planID).Count(ctx)
+}
+
+// ErrPlanHasLicenses: the plan's license type was to change, but a
+// license appeared on it — the type decides what a license carries
+// (a subscription row, an update period), so the licenses move first.
+var ErrPlanHasLicenses = errors.New("plan has licenses")
+
+// ProductHasMaintenance reports whether the product has anything the
+// feed gate protects: a plan selling a bounded update period or
+// renewals, or a license with a finite cutoff (which outlives the
+// plan setting that created it).
+func (s *Store) ProductHasMaintenance(ctx context.Context, productID string) (bool, error) {
+	return ProductHasMaintenanceIn(ctx, s.DB, productID)
+}
+
+// ProductHasMaintenanceIn answers on a caller's transaction, for a
+// writer that decides under the product's lock.
+func ProductHasMaintenanceIn(ctx context.Context, db bun.IDB, productID string) (bool, error) {
+	plans, err := db.NewSelect().Model((*model.Plan)(nil)).
+		Where("product_id = ? AND (updates_days > 0 OR stripe_renewal_price_id <> '')", productID).Exists(ctx)
+	if err != nil || plans {
+		return plans, err
+	}
+	return db.NewSelect().Model((*model.License)(nil)).
+		Where("product_id = ? AND updates_until IS NOT NULL", productID).Exists(ctx)
 }

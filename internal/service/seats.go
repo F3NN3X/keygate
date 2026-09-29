@@ -130,7 +130,7 @@ func (s *SeatService) AddSeat(ctx context.Context, in AddSeatInput) (*model.Seat
 			"license_id": lic.ID, "seat_id": seat.ID, "email": in.Email,
 			"role": in.Role, "outcome": string(outcome),
 		})
-		if s.email != nil && s.email.IsConfigured() {
+		if s.email != nil {
 			productName := ""
 			if lic.Product != nil {
 				productName = lic.Product.Name
@@ -264,7 +264,7 @@ func (s *SeatService) ListSeats(ctx context.Context, licenseKey, productID strin
 		return nil, err
 	}
 
-	seats, err := s.store.ListSeats(ctx, lic.ID)
+	seats, _, err := s.store.ListSeats(ctx, lic.ID, store.All)
 	if err != nil {
 		return nil, apperr.Internal(err)
 	}

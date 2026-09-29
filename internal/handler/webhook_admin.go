@@ -36,12 +36,13 @@ func (h *WebhookAdminHandler) ListWebhooks(c *gin.Context) {
 			productID = ak.ProductID
 		}
 	}
-	webhooks, err := h.Store.ListWebhooks(c, productID, c.Query("search"))
+	page := listPage(c)
+	webhooks, total, err := h.Store.ListWebhooks(c, productID, c.Query("search"), page)
 	if err != nil {
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
-	response.OK(c, gin.H{"webhooks": webhooks})
+	listOK(c, "webhooks", webhooks, total, page)
 }
 
 func (h *WebhookAdminHandler) CreateWebhook(c *gin.Context) {
@@ -82,7 +83,7 @@ func (h *WebhookAdminHandler) CreateWebhook(c *gin.Context) {
 		Active:    true,
 	}
 	if err := h.Store.CreateWebhook(c, w); err != nil {
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
 
@@ -124,13 +125,20 @@ func (h *WebhookAdminHandler) UpdateWebhook(c *gin.Context) {
 		w.URL = *req.URL
 	}
 	if req.Events != nil {
+		// Same rule as creation: a webhook subscribed to nothing is a
+		// row that will never fire, and an empty array reads on the
+		// dashboard exactly like a working endpoint.
+		if len(req.Events) == 0 {
+			response.BadRequest(c, "at least one event type is required")
+			return
+		}
 		w.Events = req.Events
 	}
 	if req.Active != nil {
 		w.Active = *req.Active
 	}
 	if err := h.Store.UpdateWebhook(c, w); err != nil {
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
 	response.OK(c, w)
@@ -141,7 +149,7 @@ func (h *WebhookAdminHandler) DeleteWebhook(c *gin.Context) {
 		return
 	}
 	if err := h.Store.DeleteWebhook(c, c.Param("id")); err != nil {
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
 	response.NoContent(c)
@@ -173,18 +181,24 @@ func (h *WebhookAdminHandler) ListDeliveries(c *gin.Context) {
 		response.BadRequest(c, "status must be pending, delivered, or failed")
 		return
 	}
+	// The same window and the same three numbers every other list
+	// answers with. This one used to read the query itself and reply
+	// with total alone, so a client could not work out how many pages
+	// there were: the limit it asked for is not necessarily the limit
+	// it got.
+	page := listPage(c)
 	deliveries, total, err := h.Store.ListWebhookDeliveries(c, store.WebhookDeliveryFilter{
 		WebhookID: c.Param("id"),
 		Status:    status,
 		Event:     c.Query("event"),
-		Offset:    queryInt(c, "offset", 0),
-		Limit:     queryInt(c, "limit", 50),
+		Offset:    page.Offset,
+		Limit:     page.Limit,
 	})
 	if err != nil {
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
-	response.OK(c, gin.H{"deliveries": deliveries, "total": total})
+	listOK(c, "deliveries", deliveries, total, page)
 }
 
 // GET /admin/webhooks/:id/deliveries/:delivery_id
@@ -241,7 +255,7 @@ func (h *WebhookAdminHandler) ResendDelivery(c *gin.Context) {
 				"webhook is deleted or inactive — re-enable it before resending")
 			return
 		}
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
 	h.Store.Audit(c, &model.AuditLog{
@@ -267,7 +281,7 @@ func (h *WebhookAdminHandler) TestWebhook(c *gin.Context) {
 			response.Err(c, http.StatusConflict, "WEBHOOK_INACTIVE", "enable the webhook before testing it")
 			return
 		}
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
 	response.OK(c, gin.H{

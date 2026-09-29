@@ -24,7 +24,9 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true,
 
-    "baseUrl": ".",
+    /* No baseUrl: it is deprecated in TypeScript 7, and these paths
+       are already relative to this file. Vite resolves the same alias
+       in vite.config.ts. */
     "paths": {
       "@/*": ["./src/*"]
     }

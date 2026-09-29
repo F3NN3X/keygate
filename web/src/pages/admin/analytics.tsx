@@ -28,6 +28,8 @@ import {
   XAxis,
   YAxis,
 } from "recharts"
+import { PlanSelect } from "@/components/plan-select"
+import { ProductSelect } from "@/components/product-select"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import {
@@ -44,7 +46,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { useI18n } from "@/i18n"
+import { type TranslationKeys, useI18n } from "@/i18n"
 import type { AggregatedSnapshot, AnalyticsSnapshot } from "@/lib/api"
 import { admin } from "@/lib/api"
 import { formatDate } from "@/lib/utils"
@@ -59,7 +61,7 @@ function defaultTo(): string {
   return new Date().toISOString().slice(0, 10)
 }
 
-function periodLabel(granularity: string, t: (key: any) => string): string {
+function periodLabel(granularity: string, t: (key: TranslationKeys) => string): string {
   switch (granularity) {
     case "weekly":
       return t("analytics.weekOf")
@@ -97,15 +99,6 @@ export default function AnalyticsPage() {
   const [statusFilter, setStatusFilter] = useState<string>("")
 
   // Products
-  const { data: productsData } = useQuery({ queryKey: ["admin", "products"], queryFn: () => admin.listProducts() })
-  const products = productsData?.products || []
-
-  // Plans (filtered by product)
-  const { data: plansData } = useQuery({
-    queryKey: ["admin", "plans", productFilter],
-    queryFn: () => admin.listPlans(productFilter || undefined),
-  })
-  const plans = plansData?.plans || []
 
   // Shared filter params
   const filterParams = {
@@ -193,7 +186,7 @@ export default function AnalyticsPage() {
     total: snapTotal,
     totalPages: snapTotalPages,
     paginatedItems: paginatedSnapshots,
-  } = useClientPagination(snapshots as any[], 15)
+  } = useClientPagination(snapshots, 15)
 
   // Chart data
   const trendChartData = useMemo(
@@ -238,7 +231,7 @@ export default function AnalyticsPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-bold tracking-tight">{t("analytics.title")}</h1>
+        <h1 className="text-2xl font-bold tracking-tight sr-only md:not-sr-only">{t("analytics.title")}</h1>
         <p className="text-muted-foreground">{t("analytics.subtitle")}</p>
       </div>
 
@@ -246,33 +239,22 @@ export default function AnalyticsPage() {
       <div className="flex gap-4 flex-wrap items-end">
         <div className="space-y-2">
           <Label className="text-xs">{t("common.product")}</Label>
-          <Select
+          <ProductSelect
             value={productFilter}
-            onValueChange={(v) => {
-              setProductFilter(v === "all" ? "" : v)
+            onChange={(v) => {
+              setProductFilter(v)
               setPlanFilter("")
             }}
-          >
-            <SelectTrigger className="w-48">
-              <SelectValue placeholder={t("filter.allProducts")} />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">{t("filter.allProducts")}</SelectItem>
-              {products.map((p) => (
-                <SelectItem key={p.id} value={p.id}>
-                  {p.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+            allLabel={t("filter.allProducts")}
+          />
         </div>
         <div className="space-y-2">
           <Label className="text-xs">{t("analytics.start")}</Label>
-          <Input type="date" value={from} onChange={(e) => setFrom(e.target.value)} className="w-40" />
+          <Input type="date" value={from} onChange={(e) => setFrom(e.target.value)} className="w-full sm:w-40" />
         </div>
         <div className="space-y-2">
           <Label className="text-xs">{t("analytics.end")}</Label>
-          <Input type="date" value={to} onChange={(e) => setTo(e.target.value)} className="w-40" />
+          <Input type="date" value={to} onChange={(e) => setTo(e.target.value)} className="w-full sm:w-40" />
         </div>
         <div className="space-y-2">
           <Label className="text-xs">{t("analytics.granularity")}</Label>
@@ -289,25 +271,17 @@ export default function AnalyticsPage() {
         </div>
         <div className="space-y-2">
           <Label className="text-xs">{t("common.plan")}</Label>
-          <Select
+          <PlanSelect
+            productId={productFilter}
             value={planFilter}
-            onValueChange={(v) => {
-              setPlanFilter(v === "all" ? "" : v)
-              if (v !== "all") setLicenseType("")
+            onChange={(v) => {
+              setPlanFilter(v)
+              if (v) setLicenseType("")
             }}
-          >
-            <SelectTrigger className="w-44" disabled={!productFilter}>
-              <SelectValue placeholder={t("filter.allPlans")} />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">{t("filter.allPlans")}</SelectItem>
-              {plans.map((p) => (
-                <SelectItem key={p.id} value={p.id}>
-                  {p.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+            allLabel={t("filter.allPlans")}
+            className="w-full sm:w-44"
+            disabled={!productFilter}
+          />
         </div>
         <div className="space-y-2">
           <Label className="text-xs">{t("plans.licenseType")}</Label>
@@ -318,7 +292,7 @@ export default function AnalyticsPage() {
               if (v !== "all") setPlanFilter("")
             }}
           >
-            <SelectTrigger className="w-40">
+            <SelectTrigger className="w-full sm:w-40">
               <SelectValue placeholder={t("filter.allTypes")} />
             </SelectTrigger>
             <SelectContent>
@@ -332,7 +306,7 @@ export default function AnalyticsPage() {
         <div className="space-y-2">
           <Label className="text-xs">{t("common.status")}</Label>
           <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v === "all" ? "" : v)}>
-            <SelectTrigger className="w-40">
+            <SelectTrigger className="w-full sm:w-40">
               <SelectValue placeholder={t("filter.allStatuses")} />
             </SelectTrigger>
             <SelectContent>

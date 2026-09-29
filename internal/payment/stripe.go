@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,7 +31,9 @@ import (
 	"github.com/tabloy/keygate/internal/model"
 	"github.com/tabloy/keygate/internal/service"
 	"github.com/tabloy/keygate/internal/store"
+	"github.com/tabloy/keygate/pkg/apperr"
 	"github.com/tabloy/keygate/pkg/response"
+	"github.com/uptrace/bun"
 )
 
 type StripeHandler struct {
@@ -120,6 +124,9 @@ func (h *StripeHandler) CreateCheckoutSession(c *gin.Context) {
 		response.BadRequest(c, "invalid price_id")
 		return
 	}
+	if !h.sellableNow(c, plan) {
+		return
+	}
 
 	success := h.BaseURL + "/checkout/success?session_id={CHECKOUT_SESSION_ID}"
 	if req.SuccessURL != "" && h.isSameOrigin(req.SuccessURL) {
@@ -145,8 +152,10 @@ func (h *StripeHandler) CreateCheckoutSession(c *gin.Context) {
 		AllowPromotionCodes: stripe.Bool(true),
 	}
 	params.Metadata = map[string]string{
-		"plan_id":    plan.ID,
-		"product_id": plan.ProductID,
+		"plan_id":       plan.ID,
+		"product_id":    plan.ProductID,
+		metaUpdatesDays: strconv.Itoa(plan.UpdatesDays),
+		metaLicenseType: plan.LicenseType,
 	}
 	if req.Email != "" {
 		params.CustomerEmail = stripe.String(req.Email)
@@ -154,7 +163,7 @@ func (h *StripeHandler) CreateCheckoutSession(c *gin.Context) {
 
 	s, err := session.New(params)
 	if err != nil {
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
 	response.OK(c, gin.H{"url": s.URL, "session_id": s.ID})
@@ -177,6 +186,10 @@ func (h *StripeHandler) CheckoutByPlan(c *gin.Context) {
 
 	if !plan.Active {
 		c.String(http.StatusGone, "this plan is no longer available")
+		return
+	}
+	if !h.boundedPlanSellable(c, plan) {
+		c.String(http.StatusServiceUnavailable, "this plan is temporarily unavailable")
 		return
 	}
 
@@ -207,8 +220,10 @@ func (h *StripeHandler) CheckoutByPlan(c *gin.Context) {
 		AllowPromotionCodes: stripe.Bool(true),
 	}
 	params.Metadata = map[string]string{
-		"plan_id":    plan.ID,
-		"product_id": plan.ProductID,
+		"plan_id":       plan.ID,
+		"product_id":    plan.ProductID,
+		metaUpdatesDays: strconv.Itoa(plan.UpdatesDays),
+		metaLicenseType: plan.LicenseType,
 	}
 
 	s, err := session.New(params)
@@ -216,8 +231,41 @@ func (h *StripeHandler) CheckoutByPlan(c *gin.Context) {
 		c.String(http.StatusInternalServerError, "checkout unavailable")
 		return
 	}
-
 	c.Redirect(http.StatusTemporaryRedirect, s.URL)
+}
+
+// boundedPlanSellable reports whether a plan that hands out a bounded
+// update period may be sold right now. The period is only enforceable
+// while every replica runs a version that knows about it, so selling
+// one while the operator switch is off would give a customer a cutoff
+// a rolled-back deployment cannot hold up. Plans without a period are
+// always sellable, and sessions already paid for are still fulfilled —
+// refusing those would keep the money and give nothing back.
+func (h *StripeHandler) boundedPlanSellable(c *gin.Context, plan *model.Plan) bool {
+	if plan.InitialUpdatesUntil(time.Now()) == nil {
+		return true
+	}
+	on, err := h.Store.MaintenanceFeaturesEnabled(c)
+	if err != nil {
+		slog.Error("stripe checkout: maintenance switch unreadable", "plan_id", plan.ID, "error", err)
+		return false
+	}
+	if !on {
+		slog.Warn("stripe checkout: plan sells an update period while maintenance features are switched off",
+			"plan_id", plan.ID, "updates_days", plan.UpdatesDays)
+		return false
+	}
+	return true
+}
+
+// sellableNow is boundedPlanSellable for the JSON endpoints; it writes
+// the response itself and reports whether the caller may continue.
+func (h *StripeHandler) sellableNow(c *gin.Context, plan *model.Plan) bool {
+	if h.boundedPlanSellable(c, plan) {
+		return true
+	}
+	response.Err(c, http.StatusServiceUnavailable, "PLAN_UNAVAILABLE", "this plan is temporarily unavailable")
+	return false
 }
 
 func (h *StripeHandler) Webhook(c *gin.Context) {
@@ -387,6 +435,10 @@ func (h *StripeHandler) claimEvent(ctx context.Context, eventID string) (claimed
 	return h.reserve(ctx, processedEventDoneProvider, processedEventClaimProvider, eventID, nil)
 }
 
+// errClaimTaken rolls the reservation back when another caller took
+// the in-flight marker between the two writes.
+var errClaimTaken = errors.New("in-flight marker taken")
+
 // reserve implements the two-row claim for events and sessions.
 // claimed: this caller now handles it. done: nothing to do (finished,
 // or an older binary has it). Neither: another caller is mid-way, or
@@ -394,19 +446,38 @@ func (h *StripeHandler) claimEvent(ctx context.Context, eventID string) (claimed
 // given, is an extra "already done" check — a license row for a
 // session — consulted before taking over a stale in-flight marker.
 func (h *StripeHandler) reserve(ctx context.Context, doneProvider, claimProvider, id string, fulfilled func() (bool, error)) (claimed, done bool, err error) {
-	reserved, err := h.Store.ClaimProcessedEvent(ctx, doneProvider, id)
-	if err != nil {
-		return false, false, err
-	}
-	if reserved {
+	// Both rows are written in one transaction. Written separately, a
+	// crash between them leaves a reservation with no in-flight
+	// marker — which is exactly how a finished event looks, so the
+	// next delivery would answer 2xx and do nothing. A refund has no
+	// sweeper behind it; it would simply be lost.
+	reserved := false
+	err = h.Store.RunInTx(ctx, func(ctx context.Context, tx bun.Tx) error {
+		var err error
+		if reserved, err = store.ClaimProcessedEventIn(ctx, tx, doneProvider, id); err != nil || !reserved {
+			return err
+		}
 		// Ours. An in-flight marker without a reservation can only be
 		// an orphan of a failed release; replace it.
-		_ = h.Store.DeleteProcessedEvent(ctx, claimProvider, id)
-		claimed, err = h.Store.ClaimProcessedEvent(ctx, claimProvider, id)
-		if err != nil || !claimed {
-			_ = h.Store.DeleteProcessedEvent(ctx, doneProvider, id)
-			return false, false, err
+		if err := store.DeleteProcessedEventIn(ctx, tx, claimProvider, id); err != nil {
+			return err
 		}
+		if claimed, err = store.ClaimProcessedEventIn(ctx, tx, claimProvider, id); err != nil {
+			return err
+		}
+		if !claimed {
+			// Another caller took the marker in between: give the
+			// reservation back by rolling this transaction back.
+			return errClaimTaken
+		}
+		return nil
+	})
+	switch {
+	case errors.Is(err, errClaimTaken):
+		return false, false, nil
+	case err != nil:
+		return false, false, err
+	case claimed:
 		return true, false, nil
 	}
 	inflight, err := h.Store.HasProcessedEvent(ctx, claimProvider, id)
@@ -430,14 +501,21 @@ func (h *StripeHandler) reserve(ctx context.Context, doneProvider, claimProvider
 	return claimed, false, err
 }
 
-// release undoes a reservation after a failed handling so a retry
-// can claim it. The reservation goes first: if only the marker were
-// removed the event would read as done and never be retried.
+// release undoes a reservation after a failed handling so a retry can
+// claim it. Both rows go in one transaction, for the same reason
+// reserve writes them in one: between two separate deletes a retry
+// can take the event over, and this caller's second delete would then
+// remove the new handler's in-flight marker. What is left — a
+// reservation with no marker — is exactly how a finished event looks,
+// so the retry after that one would answer 2xx and do nothing. For a
+// refund, which has no sweeper behind it, that is the event lost.
 func (h *StripeHandler) release(ctx context.Context, doneProvider, claimProvider, id string) error {
-	if err := h.Store.DeleteProcessedEvent(ctx, doneProvider, id); err != nil {
-		return err
-	}
-	return h.Store.DeleteProcessedEvent(ctx, claimProvider, id)
+	return h.Store.RunInTx(ctx, func(ctx context.Context, tx bun.Tx) error {
+		if err := store.DeleteProcessedEventIn(ctx, tx, doneProvider, id); err != nil {
+			return err
+		}
+		return store.DeleteProcessedEventIn(ctx, tx, claimProvider, id)
+	})
 }
 
 // onCheckoutCompleted handles checkout.session.completed and
@@ -458,6 +536,7 @@ func (h *StripeHandler) onCheckoutCompleted(ctx context.Context, raw json.RawMes
 		PaymentIntent string            `json:"payment_intent"`
 		PaymentStatus string            `json:"payment_status"`
 		Mode          string            `json:"mode"`
+		Created       int64             `json:"created"`
 		Metadata      map[string]string `json:"metadata"`
 	}
 	if json.Unmarshal(raw, &data) != nil {
@@ -482,6 +561,7 @@ func (h *StripeHandler) onCheckoutCompleted(ctx context.Context, raw json.RawMes
 		data.Metadata = map[string]string{}
 	}
 	data.Metadata["session_id"] = data.ID
+	data.Metadata[metaSessionCreated] = strconv.FormatInt(data.Created, 10)
 	ok, err := h.fulfillCheckout(ctx, email, data.Customer, data.Subscription, data.PaymentIntent, data.Metadata, "webhook")
 	if !ok {
 		// Not fulfilled here — a transient failure, another worker
@@ -505,11 +585,11 @@ func supportedAPIVersion(v string) bool {
 	if v == "" {
 		return false
 	}
-	i := strings.Index(v, ".")
-	if i < 0 {
+	_, after, ok := strings.Cut(v, ".")
+	if !ok {
 		return true // yyyy-MM-dd: legacy layout
 	}
-	switch v[i+1:] {
+	switch after {
 	case "acacia":
 		return true // last pre-Basil train, legacy layout
 	}
@@ -574,6 +654,9 @@ func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, 
 		if done {
 			return true, nil
 		}
+	}
+	if metadata != nil && metadata[metaKind] == kindRenewal {
+		return h.fulfillRenewal(ctx, metadata, sessionID, paymentIntentID, source)
 	}
 	var plan *model.Plan
 	var err error
@@ -663,6 +746,114 @@ func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, 
 		until := time.Now().Add(time.Duration(plan.TrialDays) * 24 * time.Hour)
 		lic.ValidUntil = &until
 	}
+	// What the customer bought was a licence of the kind the plan was
+	// then. A plan retyped since — perpetual to subscription or trial
+	// — cannot deliver it: a one-off payment would become a
+	// subscription with no end, or a trial. Nothing here can repair
+	// that, so the sale waits for the merchant to put the plan back
+	// or refund it.
+	// A Stripe Payment Link carries no metadata, so there is no frozen
+	// type to compare. The plan's history says what it was selling
+	// when the checkout was stamped; failing that — a plan whose
+	// history does not reach back — the session's own shape still
+	// tells a one-off purchase from a recurring one, which is the
+	// difference that matters most.
+	soldType := strings.TrimSpace(metadata[metaLicenseType])
+	// Present but blank says nothing: that is a session with no
+	// frozen type, not a type that fails to match the plan.
+	frozen := soldType != ""
+	if !frozen {
+		if created, ok := sessionCreatedAt(metadata); ok {
+			_, sold, known, err := h.Store.PlanTermsAt(ctx, plan.ID, created)
+			if err != nil {
+				return false, fmt.Errorf("read plan terms for %s: %w", plan.ID, err)
+			}
+			if known && sold != "" {
+				soldType, frozen = sold, true
+			}
+		}
+	}
+	if !frozen {
+		recurringSold := subscriptionID != ""
+		recurringNow := plan.LicenseType == "subscription" || plan.LicenseType == "trial"
+		if recurringSold != recurringNow {
+			soldType, frozen = "subscription", true
+			if !recurringSold {
+				soldType = "perpetual"
+			}
+		}
+	}
+	if sold := soldType; frozen && sold != plan.LicenseType {
+		slog.Error("stripe checkout: paid session left pending, the plan is no longer the kind that was bought",
+			"session_id", sessionID, "plan_id", plan.ID, "email", email,
+			"sold_as", sold, "plan_is_now", plan.LicenseType,
+			"hint", "put the plan's license_type back, move the customer to a plan of the kind they bought, or refund the session")
+		if sessionID != "" {
+			if derr := h.release(ctx, fulfilledSessionProvider, sessionClaimProvider, sessionID); derr != nil {
+				slog.Error("stripe checkout: failed to release session claim", "session_id", sessionID, "error", derr)
+			}
+		}
+		return false, fmt.Errorf("%w: sold as %s, plan is now %s", store.ErrPlanChanged, sold, plan.LicenseType)
+	}
+
+	// The update period is the one that was on offer at checkout.
+	// Sessions Keygate created carry it; sessions created elsewhere
+	// (Stripe Payment Links) carry no terms, so those fall back to
+	// the plan as it reads now.
+	updatesDays := plan.UpdatesDays
+	switch v, frozen := metadata[metaUpdatesDays]; {
+	case frozen:
+		if d, err := strconv.Atoi(v); err == nil {
+			updatesDays = d
+		} else {
+			slog.Warn("stripe checkout: unreadable updates_days in session metadata, using the plan",
+				"session_id", sessionID, "value", v, "plan_id", plan.ID)
+		}
+	default:
+		// A session Keygate did not create — a Stripe Payment Link —
+		// carries no terms. The plan's history says which period was
+		// on offer when the buyer opened that checkout, whatever the
+		// plan has been edited to since.
+		if created, ok := sessionCreatedAt(metadata); ok {
+			sold, _, known, err := h.Store.PlanTermsAt(ctx, plan.ID, created)
+			if err != nil {
+				return false, fmt.Errorf("read plan terms for %s: %w", plan.ID, err)
+			}
+			if known && sold != updatesDays {
+				slog.Info("stripe checkout: unmanaged session predates a change to the plan's period; granting the period it was sold at",
+					"session_id", sessionID, "plan_id", plan.ID, "granted_days", sold, "current_days", plan.UpdatesDays)
+				updatesDays = sold
+			}
+		}
+	}
+	lic.UpdatesUntil, lic.UpdatesTermsSet = model.UpdatesUntilFor(plan.LicenseType, updatesDays, time.Now()), true
+	// The switch is what stops a period being sold: Keygate's own
+	// checkout is refused while it is off. It does not reach the
+	// sessions already open in Stripe, and a Payment Link the
+	// merchant made answers to nobody at all — a customer can open
+	// and pay one at any time. Issuing the period would hand out a cutoff the
+	// replicas still serving public feeds cannot hold up, and issuing
+	// the licence without it would grant updates for life — more than
+	// was sold. The sale stays pending, as it does for a product whose
+	// feeds went public: gate it again, switch the features back on,
+	// or refund.
+	if lic.UpdatesUntil != nil {
+		on, serr := h.Store.MaintenanceFeaturesEnabled(ctx)
+		if serr != nil {
+			return false, fmt.Errorf("read the maintenance switch: %w", serr)
+		}
+		if !on {
+			slog.Error("stripe checkout: paid session left pending, the maintenance features are switched off",
+				"session_id", sessionID, "plan_id", plan.ID, "email", email,
+				"hint", "switch maintenance_features_enabled back on once every replica understands update periods, or refund the session")
+			if sessionID != "" {
+				if derr := h.release(ctx, fulfilledSessionProvider, sessionClaimProvider, sessionID); derr != nil {
+					slog.Error("stripe checkout: failed to release session claim", "session_id", sessionID, "error", derr)
+				}
+			}
+			return false, store.ErrUpdatePeriodNotEnforceable
+		}
+	}
 
 	if subscriptionID != "" {
 		lic.StripeSubscriptionID = subscriptionID
@@ -673,7 +864,39 @@ func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, 
 	// Ensure user record exists so they appear in Customers
 	_ = h.Store.UpsertUser(ctx, &model.User{Email: email})
 
-	if err := h.Store.CreateLicenseWithSubscription(ctx, lic, plan); err != nil {
+	err = h.Store.CreateLicenseWithSubscription(ctx, lic, plan)
+	if errors.Is(err, store.ErrPlanChanged) {
+		// The plan was retyped between resolving it and this write.
+		// Everything about the license follows from that type, so the
+		// claim goes back and the next retry builds from the plan as
+		// it reads then.
+		slog.Warn("stripe checkout: plan changed type mid-fulfilment, retrying",
+			"session_id", sessionID, "plan_id", plan.ID, "email", email, "reason", err)
+	}
+	if errors.Is(err, store.ErrUpdatePeriodNotEnforceable) {
+		// The buyer paid for a period this product cannot enforce
+		// right now: its update feeds were made public again after
+		// the checkout was opened, or gated again so recently that
+		// the links the public feed handed out still work. Issuing
+		// the license without the period would hand out updates for
+		// life — more than was sold, and nothing takes it back;
+		// issuing it with the period would sell a cutoff the buyer
+		// can walk around through those links. The sale stays pending
+		// instead: the claim is released so a webhook retry, the
+		// success page or a sync fulfils it once the feeds are gated
+		// and the old links have expired, and the merchant can refund
+		// it if that is the answer they want.
+		slog.Error("stripe checkout: paid session left pending, the product cannot enforce the update period it includes",
+			"session_id", sessionID, "plan_id", plan.ID, "product_id", plan.ProductID, "email", email, "reason", err,
+			"hint", "switch feed_license_required back on for the product, wait out the feed drain it names, or refund the session")
+		if sessionID != "" {
+			if derr := h.release(ctx, fulfilledSessionProvider, sessionClaimProvider, sessionID); derr != nil {
+				slog.Error("stripe checkout: failed to release session claim", "session_id", sessionID, "error", derr)
+			}
+		}
+		return false, fmt.Errorf("create license: %w", err)
+	}
+	if err != nil {
 		if store.IsCheckoutSessionConflict(err) {
 			// Another worker fulfilled this session while we held (or
 			// had lost) the claim — its license stands, ours is refused
@@ -781,7 +1004,11 @@ func (h *StripeHandler) VerifyCheckoutSession(c *gin.Context) {
 		return
 	}
 
-	response.OK(c, gin.H{"status": "ok", "email": sessionEmail(sess)})
+	out := gin.H{"status": "ok", "email": sessionEmail(sess)}
+	if sess.Metadata[metaKind] == kindRenewal {
+		out["kind"] = kindRenewal
+	}
+	response.OK(c, out)
 }
 
 // sessionFulfilled reports whether a license already exists for the
@@ -793,6 +1020,14 @@ func (h *StripeHandler) sessionFulfilled(ctx context.Context, sessionID string) 
 		return true, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	// A renewal session's record is its ledger row, not a license. It
+	// is the durable proof; a claim marker left behind by a failed
+	// cleanup after the commit must not read as still in flight.
+	if _, err := h.Store.FindLicenseRenewalBySession(ctx, sessionID); err == nil {
+		return true, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
 	reserved, err := h.Store.HasProcessedEvent(ctx, fulfilledSessionProvider, sessionID)
@@ -813,6 +1048,33 @@ const (
 	sessionClaimProvider     = "stripe_fulfill_claim"
 	fulfilledSessionProvider = "stripe_fulfill"
 )
+
+// SubscriptionEnded reports whether Stripe is finished with a
+// subscription: cancelled, never completed, or no longer there at
+// all. The admin API asks before letting a licence off a Stripe
+// subscription, because no local state answers it — "canceled" is
+// also what an unpaid subscription reads as, and paying its invoice
+// brings it back.
+func (h *StripeHandler) SubscriptionEnded(ctx context.Context, subscriptionID string) (bool, error) {
+	sub, err := subscription.Get(subscriptionID, nil)
+	if err != nil {
+		// A 404 says this API key cannot see the subscription, not
+		// that the subscription is over: a key rotated to another
+		// account, or pointed at the other side of test/live, answers
+		// exactly the same way about one that is still charging a
+		// card. Only Stripe saying "ended" is evidence of an ending.
+		if stripeNotFound(err) {
+			return false, apperr.New(409, "STRIPE_NOT_VISIBLE",
+				"Stripe cannot see this subscription with the API key this install uses — check that the key belongs to the right account and to the same test/live mode; until then there is no way to tell a deleted subscription from one that is still billing")
+		}
+		return false, err
+	}
+	switch sub.Status {
+	case stripe.SubscriptionStatusCanceled, stripe.SubscriptionStatusIncompleteExpired:
+		return true, nil
+	}
+	return false, nil
+}
 
 // stripeNotFound reports a 404 from Stripe: the object is gone for
 // good, which is a permanent condition, not a transient failure.
@@ -862,6 +1124,7 @@ func (h *StripeHandler) fulfillSession(ctx context.Context, sess *stripe.Checkou
 		meta = map[string]string{}
 	}
 	meta["session_id"] = sess.ID
+	meta[metaSessionCreated] = strconv.FormatInt(sess.Created, 10)
 	return h.fulfillCheckout(ctx, sessionEmail(sess), custID, subID, paymentIntentID(sess), meta, source)
 }
 
@@ -1030,6 +1293,34 @@ func (e *subscriptionEvent) PeriodEnd() int64 {
 	return end
 }
 
+// applyLicenseFromSubscription writes what a subscription event says
+// about its licence and reports whether the write landed.
+//
+// "No longer linked" is the ordinary outcome it looks like: an admin
+// unlinked the licence after Stripe confirmed the subscription had
+// ended, and this event — already in flight, or replayed — must not
+// put the old billing state back.
+//
+// Callers must stop on false. Everything that follows one of these
+// writes describes it to the outside world — an audit line, a
+// license.canceled webhook, a dunning email — and saying a licence was
+// cancelled while the row stays active is worse than silence: the
+// downstream system revokes access the database still grants.
+func (h *StripeHandler) applyLicenseFromSubscription(ctx context.Context, lic *model.License, event string, cols ...string) bool {
+	err := h.Store.UpdateLicenseFromSubscription(ctx, lic, cols...)
+	if errors.Is(err, store.ErrSubscriptionUnlinked) {
+		slog.Info("stripe webhook: license was unlinked from this subscription, event ignored",
+			"event", event, "license_id", lic.ID, "subscription_id", lic.StripeSubscriptionID)
+		return false
+	}
+	if err != nil {
+		slog.Error("stripe webhook: license write failed",
+			"event", event, "license_id", lic.ID, "error", err)
+		return false
+	}
+	return true
+}
+
 func (h *StripeHandler) onInvoicePaid(ctx context.Context, raw json.RawMessage) {
 	var data invoiceEvent
 	if json.Unmarshal(raw, &data) != nil || data.SubscriptionID() == "" {
@@ -1053,7 +1344,9 @@ func (h *StripeHandler) onInvoicePaid(ctx context.Context, raw json.RawMessage) 
 	lic.ValidUntil = &until
 	lic.Status = model.StatusActive
 	lic.PastDueAt = nil
-	_ = h.Store.UpdateLicenseAndSubscription(ctx, lic, "valid_until", "status", "past_due_at")
+	if !h.applyLicenseFromSubscription(ctx, lic, "invoice.paid", "valid_until", "status", "past_due_at") {
+		return
+	}
 
 	// Recovery notification — shares the dedup path with
 	// onSubscriptionUpdated. Some flows emit invoice.paid without a
@@ -1122,7 +1415,9 @@ func (h *StripeHandler) onSubscriptionUpdated(ctx context.Context, raw json.RawM
 	} else {
 		cols = []string{"status", "canceled_at", "past_due_at"}
 	}
-	_ = h.Store.UpdateLicenseAndSubscription(ctx, lic, cols...)
+	if !h.applyLicenseFromSubscription(ctx, lic, "customer.subscription.updated", cols...) {
+		return
+	}
 
 	// Recovery notification fires only on past_due → active. Routed
 	// through notifyPaymentRecovered so concurrent webhooks (Stripe
@@ -1186,7 +1481,9 @@ func (h *StripeHandler) onSubscriptionDeleted(ctx context.Context, raw json.RawM
 	now := time.Now()
 	lic.CanceledAt = &now
 	lic.PastDueAt = nil
-	_ = h.Store.UpdateLicenseAndSubscription(ctx, lic, "status", "canceled_at", "past_due_at")
+	if !h.applyLicenseFromSubscription(ctx, lic, "customer.subscription.deleted", "status", "canceled_at", "past_due_at") {
+		return
+	}
 
 	h.Store.Audit(ctx, &model.AuditLog{
 		Entity: "license", EntityID: lic.ID, Action: "canceled",
@@ -1215,7 +1512,9 @@ func (h *StripeHandler) onPaymentFailed(ctx context.Context, raw json.RawMessage
 		now := time.Now()
 		lic.Status = model.StatusPastDue
 		lic.PastDueAt = &now
-		_ = h.Store.UpdateLicenseAndSubscription(ctx, lic, "status", "past_due_at")
+		if !h.applyLicenseFromSubscription(ctx, lic, "invoice.payment_failed", "status", "past_due_at") {
+			return
+		}
 
 		h.Store.Audit(ctx, &model.AuditLog{
 			Entity: "license", EntityID: lic.ID, Action: "payment_failed",
@@ -1232,15 +1531,91 @@ func (h *StripeHandler) onPaymentFailed(ctx context.Context, raw json.RawMessage
 
 func (h *StripeHandler) onChargeRefunded(ctx context.Context, raw json.RawMessage) error {
 	var data struct {
-		ID             string `json:"id"`
-		Customer       string `json:"customer"`
-		Amount         int64  `json:"amount"`
-		AmountRefunded int64  `json:"amount_refunded"`
-		Refunded       bool   `json:"refunded"`
-		PaymentIntent  string `json:"payment_intent"`
-		Invoice        string `json:"invoice"`
+		ID             string            `json:"id"`
+		Customer       string            `json:"customer"`
+		Amount         int64             `json:"amount"`
+		AmountRefunded int64             `json:"amount_refunded"`
+		Refunded       bool              `json:"refunded"`
+		PaymentIntent  string            `json:"payment_intent"`
+		Invoice        string            `json:"invoice"`
+		Metadata       map[string]string `json:"metadata"`
 	}
 	if json.Unmarshal(raw, &data) != nil {
+		return nil
+	}
+
+	// A renewal's payment intent is on its renewal row, not on a
+	// license; looked up first so the customer fallback below cannot
+	// mistake a refunded renewal for a refunded purchase. Done under
+	// the renewal lock so the lookup and the fulfilment of the same
+	// payment intent cannot interleave.
+	if data.PaymentIntent != "" {
+		handled := false
+		var reverted *model.LicenseRenewal
+		var partialOf *model.LicenseRenewal
+		earlyRefund := false
+		err := h.Store.WithXactLock(ctx, renewalLockKey(data.PaymentIntent, ""), func(ctx context.Context, tx bun.Tx) error {
+			renewal, err := store.FindLicenseRenewalByPaymentIntentIn(ctx, tx, data.PaymentIntent)
+			if err == nil {
+				handled = true
+				switch {
+				case !data.Refunded:
+					if data.AmountRefunded > 0 {
+						partialOf = renewal
+					}
+				case renewal.RefundedAt != nil:
+					// a second event for the same refund
+				default:
+					if err := store.RevertLicenseRenewalIn(ctx, tx, renewal); err != nil {
+						return fmt.Errorf("revert renewal %s: %w", renewal.ID, err)
+					}
+					reverted = renewal
+				}
+				return nil
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("locate renewal for charge %s: %w", data.ID, err)
+			}
+			// No row yet, but the charge says it paid for a renewal:
+			// Stripe may deliver the refund before the completion, or
+			// fulfilment may still be pending. It must never reach the
+			// purchase path below. A full refund is remembered so the
+			// renewal, once applied, is recorded as refunded.
+			if data.Metadata[metaKind] == kindRenewal {
+				handled = true
+				if data.Refunded {
+					if _, err := store.ClaimProcessedEventIn(ctx, tx, renewalRefundProvider, data.PaymentIntent); err != nil {
+						return fmt.Errorf("record early renewal refund %s: %w", data.PaymentIntent, err)
+					}
+					earlyRefund = true
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if partialOf != nil {
+			h.Store.Audit(ctx, &model.AuditLog{
+				Entity: "license", EntityID: partialOf.LicenseID, Action: "partial_refund",
+				ActorType: "webhook",
+				Changes:   map[string]any{"amount_refunded": data.AmountRefunded, "provider": "stripe", "renewal_id": partialOf.ID},
+			})
+		}
+		if reverted != nil {
+			h.Store.Audit(ctx, &model.AuditLog{
+				Entity: "license", EntityID: reverted.LicenseID, Action: "updates_renewal_refunded",
+				ActorType: "webhook",
+				Changes:   map[string]any{"days": reverted.Days, "provider": "stripe", "charge_id": data.ID, "renewal_id": reverted.ID},
+			})
+		}
+		if earlyRefund {
+			slog.Info("stripe refund: renewal refunded before it was applied", "payment_intent", data.PaymentIntent, "license_id", data.Metadata[metaLicenseID])
+		}
+		if handled {
+			return nil
+		}
+	} else if data.Metadata[metaKind] == kindRenewal {
 		return nil
 	}
 
@@ -1276,6 +1651,323 @@ func (h *StripeHandler) onChargeRefunded(ctx context.Context, raw json.RawMessag
 	return nil
 }
 
+// Checkout session metadata for maintenance renewals. A renewal
+// session is created by RenewUpdates only: it names the license it
+// extends and freezes the days bought, so a plan edited between
+// checkout and fulfilment cannot change what the customer paid for.
+const (
+	metaKind        = "kind"
+	kindRenewal     = "renewal"
+	metaLicenseID   = "license_id"
+	metaRenewalDays = "renewal_days"
+	// metaUpdatesDays freezes the update period a purchase includes,
+	// as the plan read when the session was created. The plan may be
+	// edited before the payment settles; the customer gets what was
+	// on offer when they paid, not what the plan says later.
+	metaUpdatesDays = "updates_days"
+	// metaLicenseType freezes what kind of licence the purchase is
+	// for. The period alone is not enough: a plan retyped to
+	// subscription or trial before the payment settles would have
+	// fulfilment build something the customer never bought — a
+	// subscription with no end from a one-off payment, or a trial.
+	metaLicenseType = "license_type"
+	// metaSessionCreated carries the instant Stripe created the
+	// checkout session. Injected locally like session_id, never sent
+	// to Stripe; it dates a session against a later plan edit.
+	metaSessionCreated = "session_created"
+)
+
+// sessionCreatedAt reports when Stripe created the checkout session,
+// and whether that is known at all.
+func sessionCreatedAt(metadata map[string]string) (time.Time, bool) {
+	sec, err := strconv.ParseInt(metadata[metaSessionCreated], 10, 64)
+	if err != nil || sec <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(sec, 0), true
+}
+
+// renewalRefundProvider keys processed_events rows for renewals whose
+// full refund arrived before the renewal itself was applied; keyed by
+// payment intent, the one id both events share.
+const renewalRefundProvider = "stripe_renewal_refunded"
+
+// renewalIneligibleProvider marks renewal sessions the operator has
+// already been told about: the paid session stays pending and is
+// retried every sync round, and one audit entry per session is enough.
+const renewalIneligibleProvider = "stripe_renewal_ineligible"
+
+// renewalLockKey names the transaction-scoped advisory lock under
+// which a renewal is applied and refunded. Both handlers read and
+// write the same two facts (the renewal row, the early-refund marker)
+// from independent webhook deliveries; without mutual exclusion a
+// refund can slip between the marker check and the commit and be
+// lost. Keyed by payment intent, the id both events share; a session
+// without one (nothing was charged) is keyed by itself.
+func renewalLockKey(paymentIntentID, sessionID string) int64 {
+	hash := fnv.New64a()
+	if paymentIntentID != "" {
+		hash.Write([]byte("renewal:" + paymentIntentID))
+	} else {
+		hash.Write([]byte("renewal-session:" + sessionID))
+	}
+	return int64(hash.Sum64())
+}
+
+// fulfillRenewal applies a paid renewal session to its license. Same
+// contract as fulfillCheckout: (true, nil) applied or already applied,
+// (false, nil) needs operator attention, (false, err) retry later.
+//
+// It does not consult the rollout switch, and that is deliberate: switching the maintenance
+// features off stops new bounded licences being issued and stops new
+// renewal checkouts being created, but a renewal checkout already out
+// there is paid for an update period the licence *already has* — no
+// data shape a replica on the previous version has not already been
+// living with. Refusing it would keep the money and give nothing
+// back, which is worse than extending a date those replicas ignore
+// either way. Switching the features off does not reach the checkout
+// sessions already open in Stripe.
+func (h *StripeHandler) fulfillRenewal(ctx context.Context, metadata map[string]string, sessionID, paymentIntentID, source string) (bool, error) {
+	licenseID := metadata[metaLicenseID]
+	days, _ := strconv.Atoi(metadata[metaRenewalDays])
+	if sessionID == "" || licenseID == "" || days <= 0 {
+		slog.Warn("stripe renewal: session lacks renewal metadata", "session_id", sessionID, "metadata", metadata, "source", source)
+		return false, nil
+	}
+	if _, err := h.Store.FindLicenseRenewalBySession(ctx, sessionID); err == nil {
+		return true, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("check renewal: %w", err)
+	}
+	lic, err := h.Store.FindLicenseByID(ctx, licenseID)
+	if errors.Is(err, sql.ErrNoRows) {
+		slog.Warn("stripe renewal: license no longer exists", "session_id", sessionID, "license_id", licenseID)
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("find license %s: %w", licenseID, err)
+	}
+
+	claimed, done, err := h.reserve(ctx, fulfilledSessionProvider, sessionClaimProvider, sessionID, func() (bool, error) {
+		_, err := h.Store.FindLicenseRenewalBySession(ctx, sessionID)
+		if err == nil {
+			return true, nil
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	})
+	if err != nil {
+		return false, fmt.Errorf("claim session: %w", err)
+	}
+	if !claimed {
+		if done {
+			return true, nil // applied by another caller meanwhile
+		}
+		return h.sessionFulfilled(ctx, sessionID)
+	}
+
+	renewal := &model.LicenseRenewal{
+		LicenseID:               lic.ID,
+		StripeCheckoutSessionID: sessionID,
+		StripePaymentIntentID:   paymentIntentID,
+		Days:                    days,
+	}
+	// A full refund that arrived first means there is nothing to
+	// grant: the ledger gets the row, the license stays as it is.
+	// Marker check, eligibility and apply all happen in one
+	// transaction under the renewal lock, so a refund handled
+	// meanwhile either sees the committed row or has left its marker
+	// before this check, and an admin edit cannot slip between the
+	// eligibility check and the write.
+	refundedFirst := false
+	err = h.Store.WithXactLock(ctx, renewalLockKey(paymentIntentID, sessionID), func(ctx context.Context, tx bun.Tx) error {
+		if paymentIntentID != "" {
+			var err error
+			if refundedFirst, err = store.HasProcessedEventIn(ctx, tx, renewalRefundProvider, paymentIntentID); err != nil {
+				return fmt.Errorf("check early refund: %w", err)
+			}
+		}
+		if refundedFirst {
+			if err := store.RecordRefundedRenewalIn(ctx, tx, renewal); err != nil {
+				return err
+			}
+			return store.DeleteProcessedEventIn(ctx, tx, renewalRefundProvider, paymentIntentID)
+		}
+		return store.ApplyLicenseRenewalIn(ctx, tx, renewal)
+	})
+	switch {
+	case err == nil:
+	case store.IsRenewalSessionConflict(err):
+		slog.Warn("stripe renewal: session applied concurrently", "session_id", sessionID)
+		return true, nil
+	case errors.Is(err, store.ErrRenewalIneligible):
+		// The customer paid, but the license has nothing to extend
+		// any more (updates for life, or no longer perpetual). Not
+		// fulfilled: the session stays pending for an operator, who
+		// refunds it in Stripe — that refund's event then records
+		// the renewal as refunded and clears the session — or gives
+		// the license a finite period again, after which the sync
+		// applies it.
+		if derr := h.release(ctx, fulfilledSessionProvider, sessionClaimProvider, sessionID); derr != nil {
+			slog.Error("stripe renewal: failed to release session claim", "session_id", sessionID, "error", derr)
+		}
+		if first, _ := h.Store.ClaimProcessedEvent(ctx, renewalIneligibleProvider, sessionID); first {
+			h.Store.Audit(ctx, &model.AuditLog{
+				Entity: "license", EntityID: lic.ID, Action: "updates_renewal_ineligible",
+				ActorType: "webhook",
+				Changes:   map[string]any{"session_id": sessionID, "payment_intent": paymentIntentID, "days": days, "provider": "stripe", "source": source},
+			})
+		}
+		slog.Warn("stripe renewal: paid renewal cannot be applied — the licence is not active, or has no finite update period; refund it, or make it eligible again",
+			"license_id", lic.ID, "session_id", sessionID, "payment_intent", paymentIntentID, "source", source)
+		return false, nil
+	default:
+		if derr := h.release(ctx, fulfilledSessionProvider, sessionClaimProvider, sessionID); derr != nil {
+			slog.Error("stripe renewal: failed to release session claim", "session_id", sessionID, "error", derr)
+		}
+		return false, fmt.Errorf("apply renewal: %w", err)
+	}
+	if err := h.Store.CompleteProcessedEvent(ctx, sessionClaimProvider, sessionID); err != nil {
+		slog.Error("stripe renewal: failed to record session completion", "session_id", sessionID, "error", err)
+	}
+	_ = h.Store.DeleteProcessedEvent(ctx, pendingSessionProvider, sessionID)
+	_ = h.Store.DeleteProcessedEvent(ctx, renewalIneligibleProvider, sessionID)
+
+	action, until := "updates_renewed", ""
+	if refundedFirst {
+		action = "updates_renewal_refunded"
+	} else {
+		until = renewal.UpdatesUntil.Format(time.RFC3339)
+	}
+	h.Store.Audit(ctx, &model.AuditLog{
+		Entity: "license", EntityID: lic.ID, Action: action,
+		ActorType: "webhook",
+		Changes: map[string]any{
+			"days": days, "updates_until": until,
+			"session_id": sessionID, "provider": "stripe", "source": source,
+		},
+	})
+	slog.Info("stripe renewal: applied", "license_id", lic.ID, "days", days, "action", action, "source", source)
+	return true, nil
+}
+
+// RenewUpdates starts a one-time checkout that extends the
+// maintenance period of one of the caller's perpetual licenses.
+//
+// POST /portal/updates/renew  { license_id }  → { url }
+func (h *StripeHandler) RenewUpdates(c *gin.Context) {
+	var req struct {
+		LicenseID string `json:"license_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "license_id is required")
+		return
+	}
+	lic, err := h.Store.FindLicenseByID(c, req.LicenseID)
+	if err != nil {
+		response.NotFound(c, "license not found")
+		return
+	}
+	// Ownership is by address, case-insensitively: the session email
+	// is normalised to lower case at login while fulfilment stores
+	// the address as Stripe sent it.
+	emailVal, _ := c.Get("email")
+	if e, ok := emailVal.(string); !ok || !strings.EqualFold(lic.Email, e) {
+		response.Forbidden(c, "not your license")
+		return
+	}
+	plan, err := h.Store.FindPlanByID(c, lic.PlanID)
+	if err != nil {
+		response.Internal(c, err)
+		return
+	}
+	// Nothing to sell: the plan offers no renewal, or the license
+	// includes updates for life.
+	if !plan.OffersRenewal() || lic.UpdatesUntil == nil {
+		response.Err(c, http.StatusBadRequest, "RENEWAL_NOT_AVAILABLE", "this license does not offer update renewals")
+		return
+	}
+	if lic.Status != model.StatusActive {
+		response.Err(c, http.StatusBadRequest, "LICENSE_NOT_ACTIVE", "only active licenses can renew updates")
+		return
+	}
+	// Selling is gated by the operator's switch: while it is off,
+	// replicas that do not understand renewal fulfilment or refunds
+	// may still be serving. Fulfilment of an already paid renewal is
+	// deliberately NOT gated — refusing that would keep the money and
+	// give nothing back.
+	on, err := h.Store.MaintenanceFeaturesEnabled(c)
+	if err != nil {
+		response.Internal(c, err)
+		return
+	}
+	if !on {
+		response.Conflict(c, "MAINTENANCE_FEATURES_DISABLED",
+			"update renewals are not on sale right now; try again later", nil)
+		return
+	}
+
+	// A renewal is bought once, so the session is always payment mode
+	// and the price must be a live one-time price. Stripe, not local
+	// config, is the source of truth for what a price is (the same
+	// reason CheckoutByPlan reads it); handing a recurring price to a
+	// payment-mode session would fail inside Stripe and reach the
+	// customer as a 500.
+	sp, perr := stripeprice.Get(plan.StripeRenewalPriceID, nil)
+	if perr != nil || sp.Type != "one_time" || !sp.Active {
+		switch {
+		case perr != nil:
+			slog.Error("stripe renewal: failed to fetch the renewal price",
+				"plan_id", plan.ID, "price_id", plan.StripeRenewalPriceID, "error", perr)
+		case sp.Type != "one_time":
+			slog.Error("stripe renewal: the plan's renewal price is recurring; a renewal is a one-time purchase",
+				"plan_id", plan.ID, "price_id", plan.StripeRenewalPriceID, "price_type", sp.Type)
+		default:
+			slog.Error("stripe renewal: the plan's renewal price is archived in Stripe",
+				"plan_id", plan.ID, "price_id", plan.StripeRenewalPriceID)
+		}
+		response.Err(c, http.StatusServiceUnavailable, "RENEWAL_UNAVAILABLE",
+			"update renewals are temporarily unavailable; please try again later")
+		return
+	}
+
+	params := &stripe.CheckoutSessionParams{
+		Mode: stripe.String(string(stripe.CheckoutSessionModePayment)),
+		LineItems: []*stripe.CheckoutSessionLineItemParams{
+			{Price: stripe.String(plan.StripeRenewalPriceID), Quantity: stripe.Int64(1)},
+		},
+		SuccessURL:          stripe.String(h.BaseURL + "/checkout/success?session_id={CHECKOUT_SESSION_ID}"),
+		CancelURL:           stripe.String(h.BaseURL + "/portal"),
+		AllowPromotionCodes: stripe.Bool(true),
+	}
+	if lic.StripeCustomerID != "" {
+		params.Customer = stripe.String(lic.StripeCustomerID)
+	} else {
+		params.CustomerEmail = stripe.String(lic.Email)
+	}
+	params.Metadata = map[string]string{
+		metaKind:        kindRenewal,
+		metaLicenseID:   lic.ID,
+		metaRenewalDays: strconv.Itoa(plan.RenewalDays),
+		"product_id":    lic.ProductID,
+	}
+	// The charge inherits the payment intent's metadata, so a
+	// charge.refunded that arrives before the renewal is applied can
+	// still be told apart from a purchase refund.
+	params.PaymentIntentData = &stripe.CheckoutSessionPaymentIntentDataParams{
+		Metadata: map[string]string{metaKind: kindRenewal, metaLicenseID: lic.ID},
+	}
+	sess, err := session.New(params)
+	if err != nil {
+		slog.Error("stripe renewal: failed to create checkout session", "license_id", lic.ID, "error", err)
+		response.Internal(c, err)
+		return
+	}
+	response.OK(c, gin.H{"url": sess.URL})
+}
+
 func (h *StripeHandler) CancelSubscription(c *gin.Context) {
 	var req struct {
 		LicenseID string `json:"license_id" binding:"required"`
@@ -1293,7 +1985,7 @@ func (h *StripeHandler) CancelSubscription(c *gin.Context) {
 	}
 
 	emailVal, _ := c.Get("email")
-	if e, ok := emailVal.(string); !ok || lic.Email != e {
+	if e, ok := emailVal.(string); !ok || !strings.EqualFold(lic.Email, e) {
 		response.Forbidden(c, "not your license")
 		return
 	}
@@ -1306,7 +1998,7 @@ func (h *StripeHandler) CancelSubscription(c *gin.Context) {
 	if req.Immediate {
 		_, err = subscription.Cancel(lic.StripeSubscriptionID, nil)
 		if err != nil {
-			response.Internal(c)
+			response.Internal(c, err)
 			return
 		}
 		now := time.Now()
@@ -1319,7 +2011,7 @@ func (h *StripeHandler) CancelSubscription(c *gin.Context) {
 			CancelAtPeriodEnd: stripe.Bool(true),
 		})
 		if updateErr != nil {
-			response.Internal(c)
+			response.Internal(c, updateErr)
 			return
 		}
 		// Set ValidUntil to when Stripe will cancel the subscription
@@ -1373,7 +2065,7 @@ func (h *StripeHandler) ChangePlan(c *gin.Context) {
 	}
 
 	emailVal, _ := c.Get("email")
-	if e, ok := emailVal.(string); !ok || lic.Email != e {
+	if e, ok := emailVal.(string); !ok || !strings.EqualFold(lic.Email, e) {
 		response.Forbidden(c, "not your license")
 		return
 	}
@@ -1415,8 +2107,15 @@ func (h *StripeHandler) ChangePlan(c *gin.Context) {
 	}
 
 	sub, err := subscription.Get(lic.StripeSubscriptionID, nil)
-	if err != nil || len(sub.Items.Data) == 0 {
-		response.Internal(c)
+	if err != nil {
+		response.Internal(c, err)
+		return
+	}
+	// A subscription Stripe knows about but with nothing on it. The
+	// lookup succeeded, so err is nil here; passing it would answer
+	// 500 and log no reason at all.
+	if len(sub.Items.Data) == 0 {
+		response.Internal(c, fmt.Errorf("stripe subscription %s has no items", lic.StripeSubscriptionID))
 		return
 	}
 
@@ -1437,7 +2136,7 @@ func (h *StripeHandler) ChangePlan(c *gin.Context) {
 
 	updatedSub, err := subscription.Update(lic.StripeSubscriptionID, params)
 	if err != nil {
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
 
@@ -1619,7 +2318,7 @@ func (h *StripeHandler) CreatePortalSession(c *gin.Context) {
 
 	// Verify ownership
 	emailVal, _ := c.Get("email")
-	if e, ok := emailVal.(string); !ok || lic.Email != e {
+	if e, ok := emailVal.(string); !ok || !strings.EqualFold(lic.Email, e) {
 		response.Forbidden(c, "not your license")
 		return
 	}
@@ -1640,7 +2339,7 @@ func (h *StripeHandler) CreatePortalSession(c *gin.Context) {
 	}
 	s, err := portalsession.New(params)
 	if err != nil {
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
 
@@ -1663,7 +2362,7 @@ func (h *StripeHandler) ListInvoices(c *gin.Context) {
 
 	// Verify ownership
 	emailVal, _ := c.Get("email")
-	if e, ok := emailVal.(string); !ok || lic.Email != e {
+	if e, ok := emailVal.(string); !ok || !strings.EqualFold(lic.Email, e) {
 		response.Forbidden(c, "not your license")
 		return
 	}
@@ -1711,11 +2410,11 @@ func (h *StripeHandler) ListInvoices(c *gin.Context) {
 		})
 	}
 	if err := iter.Err(); err != nil {
-		response.Internal(c)
+		response.Internal(c, err)
 		return
 	}
 
-	response.OK(c, gin.H{"invoices": invoices})
+	response.OK(c, gin.H{"invoices": response.Array(invoices)})
 }
 
 func (h *StripeHandler) onPaymentActionRequired(ctx context.Context, raw json.RawMessage) {
@@ -1752,7 +2451,9 @@ func (h *StripeHandler) onSubscriptionPaused(ctx context.Context, raw json.RawMe
 	lic.Status = model.StatusSuspended
 	now := time.Now()
 	lic.SuspendedAt = &now
-	_ = h.Store.UpdateLicenseAndSubscription(ctx, lic, "status", "suspended_at")
+	if !h.applyLicenseFromSubscription(ctx, lic, "customer.subscription.paused", "status", "suspended_at") {
+		return
+	}
 
 	h.Store.Audit(ctx, &model.AuditLog{
 		Entity: "license", EntityID: lic.ID, Action: "suspended",
@@ -1778,7 +2479,9 @@ func (h *StripeHandler) onSubscriptionResumed(ctx context.Context, raw json.RawM
 	}
 	lic.Status = model.StatusActive
 	lic.SuspendedAt = nil
-	_ = h.Store.UpdateLicenseAndSubscription(ctx, lic, "status", "suspended_at")
+	if !h.applyLicenseFromSubscription(ctx, lic, "customer.subscription.resumed", "status", "suspended_at") {
+		return
+	}
 
 	h.Store.Audit(ctx, &model.AuditLog{
 		Entity: "license", EntityID: lic.ID, Action: "reinstated",

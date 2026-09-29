@@ -118,20 +118,18 @@ func TestFulfillCheckout_UsesCustomLicenseTemplate(t *testing.T) {
 		t.Fatal("fulfilment did not succeed")
 	}
 
-	emails, err := s.ListPendingEmails(ctx, 500)
-	if err != nil {
-		t.Fatalf("list pending emails: %v", err)
+	// Read the queue row directly: ClaimNextEmail would lease whatever is
+	// oldest, not necessarily this buyer's mail.
+	var emails []*store.QueuedEmail
+	if err := s.DB.NewRaw(
+		"SELECT id, to_addr, subject, body FROM email_queue WHERE to_addr = ?", buyer,
+	).Scan(ctx, &emails); err != nil {
+		t.Fatalf("read queued email: %v", err)
 	}
-	var found *store.QueuedEmail
-	for _, e := range emails {
-		if e.ToAddr == buyer {
-			found = e
-			break
-		}
-	}
-	if found == nil {
+	if len(emails) == 0 {
 		t.Fatalf("no licence email queued for %s", buyer)
 	}
+	found := emails[0]
 	if !strings.Contains(found.Body, marker) {
 		t.Errorf("purchase email did not use the custom template (missing %q):\n%s", marker, found.Body)
 	}
@@ -266,13 +264,13 @@ func TestChargeRefunded_TargetsPaidLicense(t *testing.T) {
 	}
 
 	// Customer-only charge, two licenses: ambiguous → nothing revoked.
-	h.onChargeRefunded(ctx, []byte(fmt.Sprintf(`{"id":"ch_amb_%s","customer":"%s","refunded":true}`, suffix, customer)))
+	h.onChargeRefunded(ctx, fmt.Appendf(nil, `{"id":"ch_amb_%s","customer":"%s","refunded":true}`, suffix, customer))
 	if status(first.ID) != model.StatusActive || status(second.ID) != model.StatusActive {
 		t.Fatalf("ambiguous refund revoked a license: first=%s second=%s", status(first.ID), status(second.ID))
 	}
 
 	// Refund of the first purchase revokes the first license only.
-	h.onChargeRefunded(ctx, []byte(fmt.Sprintf(`{"id":"ch_1_%s","customer":"%s","payment_intent":"%s","refunded":true}`, suffix, customer, first.StripePaymentIntentID)))
+	h.onChargeRefunded(ctx, fmt.Appendf(nil, `{"id":"ch_1_%s","customer":"%s","payment_intent":"%s","refunded":true}`, suffix, customer, first.StripePaymentIntentID))
 	if status(first.ID) != model.StatusRevoked {
 		t.Fatalf("first license not revoked: %s", status(first.ID))
 	}
@@ -337,9 +335,9 @@ func TestCheckoutCompleted_WaitsForAsyncPayment(t *testing.T) {
 	email := "async-" + suffix + "@example.com"
 	sessionID := "cs_test_async_" + suffix
 	payload := func(status string) []byte {
-		return []byte(fmt.Sprintf(`{"id":"%s","mode":"payment","payment_status":"%s","customer_email":null,"customer":null,
+		return fmt.Appendf(nil, `{"id":"%s","mode":"payment","payment_status":"%s","customer_email":null,"customer":null,
 			"customer_details":{"email":"%s"},"payment_intent":"pi_async_%s","metadata":{"plan_id":"%s"}}`,
-			sessionID, status, email, suffix, plan.ID))
+			sessionID, status, email, suffix, plan.ID)
 	}
 
 	h.onCheckoutCompleted(ctx, payload("unpaid"))
@@ -379,8 +377,8 @@ func TestChargeRefunded_SecondFullRefundEventIsNoop(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	h := &StripeHandler{Store: s}
-	raw := []byte(fmt.Sprintf(`{"id":"ch_r2_%s","payment_intent":"%s","refunded":true}`, plan.Slug, lic.StripePaymentIntentID))
-	for i := 0; i < 2; i++ {
+	raw := fmt.Appendf(nil, `{"id":"ch_r2_%s","payment_intent":"%s","refunded":true}`, plan.Slug, lic.StripePaymentIntentID)
+	for i := range 2 {
 		if err := h.onChargeRefunded(ctx, raw); err != nil {
 			t.Fatalf("refund %d: %v", i, err)
 		}
@@ -463,7 +461,7 @@ func TestChargeRefunded_SubscriptionViaInvoicePayments(t *testing.T) {
 	})
 
 	h := &StripeHandler{Store: s}
-	h.onChargeRefunded(ctx, []byte(fmt.Sprintf(`{"id":"ch_ren_%s","customer":"%s","payment_intent":"%s","refunded":true}`, suffix, customer, renewalPI)))
+	h.onChargeRefunded(ctx, fmt.Appendf(nil, `{"id":"ch_ren_%s","customer":"%s","payment_intent":"%s","refunded":true}`, suffix, customer, renewalPI))
 
 	if atomic.LoadInt32(&hits) != 1 {
 		t.Fatalf("expected one invoice_payments lookup, got %d", hits)
@@ -514,7 +512,7 @@ func TestSyncPendingCheckouts(t *testing.T) {
 	paidLater := "cs_test_pend_paid_" + suffix
 	expired := "cs_test_pend_exp_" + suffix
 	unpaid := func(id string) []byte {
-		return []byte(fmt.Sprintf(`{"id":"%s","mode":"payment","status":"complete","payment_status":"unpaid","customer_details":{"email":"%s"},"metadata":{"plan_id":"%s"}}`, id, email, plan.ID))
+		return fmt.Appendf(nil, `{"id":"%s","mode":"payment","status":"complete","payment_status":"unpaid","customer_details":{"email":"%s"},"metadata":{"plan_id":"%s"}}`, id, email, plan.ID)
 	}
 
 	h := &StripeHandler{Store: s}
@@ -665,7 +663,7 @@ func TestListPendingCheckoutSessions_OldestFirst(t *testing.T) {
 	// the shared database holds.
 	var mine []string
 	var after *store.PendingCheckoutSession
-	for i := 0; i < 10000; i++ {
+	for range 10000 {
 		rows, err := s.ListPendingCheckoutSessions(ctx, 24*time.Hour, after, 1)
 		if err != nil {
 			t.Fatalf("list: %v", err)
@@ -930,7 +928,7 @@ func openStore(t *testing.T) (*store.Store, context.Context) {
 func seedPlan(t *testing.T, s *store.Store, ctx context.Context, tag, licenseType string) *model.Plan {
 	t.Helper()
 	suffix := tag + "-" + time.Now().Format("150405.000")
-	prod := &model.Product{Name: tag, Slug: "p-" + suffix, Type: "hybrid"}
+	prod := &model.Product{Name: tag, Slug: "p-" + suffix, Type: "hybrid", FeedLicenseRequired: true}
 	if err := s.CreateProduct(ctx, prod); err != nil {
 		t.Fatalf("create product: %v", err)
 	}
@@ -1238,7 +1236,7 @@ func TestCheckoutCompleted_UnfulfilledIsScheduled(t *testing.T) {
 	s.TryRecordProcessedEvent(ctx, fulfilledSessionProvider, sessionID) // someone else, mid-way:
 	s.TryRecordProcessedEvent(ctx, sessionClaimProvider, sessionID)     // reservation + in-flight marker
 	h := &StripeHandler{Store: s}
-	raw := []byte(fmt.Sprintf(`{"id":"%s","mode":"payment","payment_status":"paid","customer_details":{"email":"u-%s@example.com"},"metadata":{"plan_id":"%s"}}`, sessionID, plan.Slug, plan.ID))
+	raw := fmt.Appendf(nil, `{"id":"%s","mode":"payment","payment_status":"paid","customer_details":{"email":"u-%s@example.com"},"metadata":{"plan_id":"%s"}}`, sessionID, plan.Slug, plan.ID)
 	if err := h.onCheckoutCompleted(ctx, raw); err != nil {
 		t.Fatalf("no transient error expected, got %v", err)
 	}
@@ -1258,7 +1256,7 @@ func fetchSession(id string) (*stripe.CheckoutSession, error) {
 // many rows match; polls up to two seconds.
 func auditCount(s *store.Store, ctx context.Context, entityID, action string) int {
 	var n int
-	for i := 0; i < 40; i++ {
+	for range 40 {
 		s.DB.NewRaw("SELECT count(*) FROM audit_logs WHERE entity_id = ? AND action = ?", entityID, action).Scan(ctx, &n)
 		if n > 0 {
 			break

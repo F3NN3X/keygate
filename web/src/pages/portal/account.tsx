@@ -1,13 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Check, Key, Mail, Pencil, Shield, User, X } from "lucide-react"
 import { useState } from "react"
+import { showToast } from "@/components/toast"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Separator } from "@/components/ui/separator"
 import { useAuth } from "@/hooks/use-auth"
-import { useI18n } from "@/i18n"
+import { type TranslationKeys, useI18n } from "@/i18n"
 import { portal } from "@/lib/api"
 import { formatDate, statusColor } from "@/lib/utils"
 
@@ -29,7 +30,9 @@ export default function PortalAccountPage() {
       setEditing(false)
       refetch() // Refresh auth user context
       qc.invalidateQueries({ queryKey: ["portal"] })
+      showToast(t("portal.profileSaved"), "success")
     },
+    onError: (e: Error) => showToast(e.message, "error"),
   })
 
   const licenses = data?.licenses || []
@@ -116,9 +119,6 @@ export default function PortalAccountPage() {
                   </div>
                 </>
               )}
-              {saveMut.isSuccess && !editing && (
-                <p className="text-xs text-emerald-600 mt-1">{t("portal.profileSaved")}</p>
-              )}
             </div>
           </div>
 
@@ -183,7 +183,7 @@ export default function PortalAccountPage() {
                       {lic.plan?.name} &middot; {t("licenses.validUntil")} {formatDate(lic.valid_until)}
                     </p>
                   </div>
-                  <Badge className={statusColor(lic.status)}>{t(`status.${lic.status}` as any)}</Badge>
+                  <Badge className={statusColor(lic.status)}>{t(`status.${lic.status}` as TranslationKeys)}</Badge>
                 </div>
               ))}
             </div>
