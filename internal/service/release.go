@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/mod/semver"
 
@@ -323,6 +325,7 @@ func (s *ReleaseService) AddArtifact(ctx context.Context, in AddArtifactInput) (
 	artifact := &model.ReleaseArtifact{
 		ReleaseID:   in.ReleaseID,
 		Platform:    in.Platform,
+		Filename:    cleanUploadFilename(in.Filename),
 		FileKey:     fileKey,
 		ContentType: in.ContentType,
 	}
@@ -574,7 +577,7 @@ func (s *ReleaseService) Publish(ctx context.Context, releaseID string) (*model.
 	if !signRelease && prod.RequireSigning {
 		return nil, apperr.New(409, "SIGNING_NOT_CONFIGURED",
 			"this product requires release signing — generate a signing key, "+
-				"or set require_signing=false to ship unsigned releases")
+				"or turn off \"Block publishing without a signing key\" in Update settings (require_signing=false) to ship unsigned releases")
 	}
 	if !signRelease {
 		// Shipping unsigned (require_signing=false, no active key): drop
@@ -614,7 +617,7 @@ func (s *ReleaseService) Publish(ctx context.Context, releaseID string) (*model.
 					return nil, apperr.Internal(err)
 				}
 			}
-			if storeErr := s.store.UpdateArtifactSignature(ctx, a.ID, result.Signature, result.GlobalSignature, result.SigningKeyID); storeErr != nil {
+			if storeErr := s.store.UpdateArtifactSignature(ctx, a.ID, result.Signature, result.SigningKeyID, result.TauriSignature); storeErr != nil {
 				if errors.Is(storeErr, store.ErrReleaseNotPublishable) {
 					// Another publish won while we were signing.
 					return nil, apperr.New(409, "NOT_PUBLISHABLE", "release must be a draft")
@@ -1064,6 +1067,38 @@ func buildFileKey(productID, platform, version, originalFilename string) string 
 		safeKeyComponent(version),
 		safeKeyComponent(platform),
 		ext)
+}
+
+// maxUploadFilenameBytes caps the recorded upload name. Filesystems
+// cap a name at 255 bytes, so a longer one is not a real file name.
+const maxUploadFilenameBytes = 255
+
+// cleanUploadFilename reduces the name a browser reported for an upload
+// to something safe to store and display: the last path element only
+// (a client may send a full path, with either separator), no control
+// characters, trimmed, and at most maxUploadFilenameBytes bytes without
+// splitting a character. It is display text only — never part of a key.
+func cleanUploadFilename(name string) string {
+	if i := strings.LastIndexAny(name, `/\`); i >= 0 {
+		name = name[i+1:]
+	}
+	name = strings.Map(func(r rune) rune {
+		// Cc controls, and Cf format characters such as the bidi
+		// overrides that can make "x\u202Egpj.exe" display as "xexe.jpg".
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == utf8.RuneError {
+			return -1
+		}
+		return r
+	}, name)
+	name = strings.TrimSpace(name)
+	if name == "." || name == ".." {
+		return ""
+	}
+	for len(name) > maxUploadFilenameBytes {
+		_, size := utf8.DecodeLastRuneInString(name)
+		name = name[:len(name)-size]
+	}
+	return name
 }
 
 func normalizeExt(filename string) string {

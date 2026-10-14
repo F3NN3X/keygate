@@ -20,6 +20,7 @@ import {
 import { useState } from "react"
 import { Link, Navigate, Outlet, useLocation } from "react-router-dom"
 import { ErrorBoundary } from "@/components/error-boundary"
+import { ServiceUnavailableScreen } from "@/components/service-unavailable"
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
@@ -36,7 +37,7 @@ import { useI18n } from "@/i18n"
 import { cn } from "@/lib/utils"
 
 export function AdminLayout() {
-  const { user, loading, logout } = useAuth()
+  const { user, loading, unavailable, logout, refetch } = useAuth()
   const { site_name, logo_url, attribution_text, attribution_url } = useSiteConfig()
   const { t } = useI18n()
   const [navOpen, setNavOpen] = useState(false)
@@ -85,6 +86,8 @@ export function AdminLayout() {
   const isActive = (to: string) => (to === "/admin" ? location.pathname === "/admin" : location.pathname.startsWith(to))
 
   if (loading) return <LoadingScreen />
+  // Out of reach is not signed out: retry, don't send them to login.
+  if (!user && unavailable) return <ServiceUnavailableScreen onRetry={refetch} />
   if (!user) return <Navigate to="/login" replace />
   if (!user.is_admin) return <Navigate to="/portal" replace />
 
@@ -271,7 +274,7 @@ export function AdminLayout() {
 }
 
 export function PortalLayout() {
-  const { user, loading, logout } = useAuth()
+  const { user, loading, unavailable, logout, refetch } = useAuth()
   const { site_name, logo_url, attribution_text, attribution_url } = useSiteConfig()
   const { t } = useI18n()
 
@@ -282,6 +285,8 @@ export function PortalLayout() {
   const location = useLocation()
 
   if (loading) return <LoadingScreen />
+  // Out of reach is not signed out: retry, don't send them to login.
+  if (!user && unavailable) return <ServiceUnavailableScreen onRetry={refetch} />
   if (!user) return <Navigate to="/login" replace />
 
   return (

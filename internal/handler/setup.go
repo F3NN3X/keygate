@@ -6,7 +6,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/tabloy/keygate/internal/model"
 	"github.com/tabloy/keygate/internal/store"
 	"github.com/tabloy/keygate/pkg/apperr"
 	"github.com/tabloy/keygate/pkg/response"
@@ -200,10 +199,25 @@ func (h *SetupHandler) Initialize(c *gin.Context) {
 		return
 	}
 
-	// Build response objects
-	user := &model.User{ID: actualUserID, Email: req.AdminEmail, Name: req.AdminName, Role: model.RoleOwner}
-	product := &model.Product{ID: productID, Name: req.ProductName, Slug: req.ProductSlug, Type: req.ProductType}
-	plan := &model.Plan{ID: planID, ProductID: productID, Name: "Pro", Slug: "pro", LicenseType: "subscription"}
+	// Answer with the rows as stored. Objects built here by hand carried
+	// zero values for every column the inserts left to the database
+	// (require_signing, active, created_at, the plan's limits and
+	// checkout id), so the response contradicted what was saved.
+	user, err := h.Store.FindUserByID(c, actualUserID)
+	if err != nil {
+		response.Internal(c, err)
+		return
+	}
+	product, err := h.Store.FindProductByID(c, productID)
+	if err != nil {
+		response.Internal(c, err)
+		return
+	}
+	plan, err := h.Store.FindPlanByID(c, planID)
+	if err != nil {
+		response.Internal(c, err)
+		return
+	}
 
 	response.Created(c, gin.H{
 		"user":    user,

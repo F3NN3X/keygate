@@ -264,10 +264,6 @@ func (h *ReleasePublicHandler) parseFeedRequest(c *gin.Context) (req feedRequest
 // fetchPublishedFeedReleases pulls releases + filters their artifacts to
 // the requested platform. Returns the filtered slice + per-product feed
 // metadata. ok=false means the response has already been written.
-//
-// Each artifact's signing public key is resolved (cached per-key-id
-// within the loop) so renderers can build format-specific signature
-// envelopes (Tauri minisign requires the pubkey to derive its key_id).
 func (h *ReleasePublicHandler) fetchPublishedFeedReleases(c *gin.Context, req feedRequest) ([]*service.FeedRelease, bool) {
 	releases, err := h.svc.ListForFeed(c.Request.Context(), req.product.ID, req.channel, req.platform, req.limit, req.publishedBefore)
 	if err != nil {
@@ -275,7 +271,6 @@ func (h *ReleasePublicHandler) fetchPublishedFeedReleases(c *gin.Context, req fe
 		return nil, false
 	}
 
-	pubKeyCache := map[string]string{} // signing_key_id → base64 pubkey
 	out := make([]*service.FeedRelease, 0, len(releases))
 	for _, rel := range releases {
 		// Pick the artifact for this platform. If the release has no
@@ -304,40 +299,23 @@ func (h *ReleasePublicHandler) fetchPublishedFeedReleases(c *gin.Context, req fe
 			continue
 		}
 
-		var signingPubKey string
-		if artifact.SigningKeyID != "" {
-			if cached, ok := pubKeyCache[artifact.SigningKeyID]; ok {
-				signingPubKey = cached
-			} else {
-				k, err := h.store.FindSigningKeyByID(c.Request.Context(), artifact.SigningKeyID)
-				if err == nil {
-					signingPubKey = k.PublicKey
-					pubKeyCache[artifact.SigningKeyID] = signingPubKey
-				} else {
-					// Key was deleted post-publish. Leave empty;
-					// renderers will emit unsigned manifests.
-					pubKeyCache[artifact.SigningKeyID] = ""
-				}
-			}
-		}
-
 		out = append(out, &service.FeedRelease{
-			Release:          rel,
-			Artifact:         artifact,
-			DownloadURL:      url,
-			SigningPublicKey: signingPubKey,
+			Release:     rel,
+			Artifact:    artifact,
+			DownloadURL: url,
 		})
 	}
 	return out, true
 }
 
 func (h *ReleasePublicHandler) feedInput(req feedRequest, releases []*service.FeedRelease) service.FeedInput {
-	minVersion, minMessage := req.product.MinimumSupportedVersion, req.product.MinimumSupportedMessage
-	if req.publishedBefore != nil {
-		minVersion = capMinimumVersion(minVersion, releases)
-		if minVersion == "" {
-			minMessage = ""
-		}
+	// The floor never asks for more than this feed can deliver: not past
+	// a license's update cutoff, and not past the newest release still
+	// published here, as after the release the floor named was yanked.
+	minVersion := capMinimumVersion(req.product.MinimumSupportedVersion, releases)
+	minMessage := ""
+	if minVersion != "" {
+		minMessage = req.product.MinimumSupportedMessage
 	}
 	return service.FeedInput{
 		ProductID:               req.product.ID,
@@ -350,7 +328,7 @@ func (h *ReleasePublicHandler) feedInput(req feedRequest, releases []*service.Fe
 }
 
 // capMinimumVersion keeps a product's version floor within what a
-// cutoff-scoped feed can deliver. A license whose update period has
+// feed can deliver. A license whose update period has
 // ended may only install releases from before the cutoff; telling its
 // client to refuse anything below a newer floor would stop software
 // the perpetual license promises keeps working. The floor becomes the
@@ -399,7 +377,11 @@ func (h *ReleasePublicHandler) FeedVelopack(c *gin.Context) {
 	if !ok {
 		return
 	}
-	body, err := json.Marshal(service.BuildVelopack(h.feedInput(req, feedReleases)))
+	packageID := strings.TrimSpace(c.Query("id"))
+	if packageID == "" {
+		packageID = req.product.Slug
+	}
+	body, err := json.Marshal(service.BuildVelopack(h.feedInput(req, feedReleases), packageID))
 	if err != nil {
 		h.logger.Error("feed: velopack marshal failed", "error", err)
 		response.Internal(c, err)
@@ -407,6 +389,99 @@ func (h *ReleasePublicHandler) FeedVelopack(c *gin.Context) {
 	}
 	h.writeFeedCacheHeaders(c, req)
 	c.Data(http.StatusOK, "application/json; charset=utf-8", body)
+}
+
+// GET /api/v1/releases/:product_slug/velopack/:file — Velopack's own URL.
+//
+// Velopack is given a base URL (.../releases/:product_slug/velopack,
+// optionally ending in a platform) and requests releases.{channel}.json
+// under it. The C# client adds rid and keeps the base URL's query; the
+// Rust core replaces the query with localVersion, id and stagingId. The
+// Keygate channel comes from the file name unless a channel query
+// parameter is given.
+func (h *ReleasePublicHandler) FeedVelopackIndex(c *gin.Context) {
+	// {base}/{file}, where the base URL may end in a platform:
+	// /velopack/releases.win.json or /velopack/windows-x64/releases.win.json.
+	pathPlatform, file := "", strings.Trim(c.Param("path"), "/")
+	if i := strings.IndexByte(file, '/'); i >= 0 {
+		pathPlatform, file = file[:i], file[i+1:]
+	}
+	if file == "" || strings.Contains(file, "/") {
+		response.NotFound(c, "not a Velopack release feed")
+		return
+	}
+	if strings.HasSuffix(file, ".nupkg") {
+		h.velopackPackage(c, file)
+		return
+	}
+	if !strings.HasPrefix(file, "releases.") || !strings.HasSuffix(file, ".json") {
+		response.NotFound(c, "not a Velopack release feed")
+		return
+	}
+	q := c.Request.URL.Query()
+	channel, channelPlatform := service.VelopackChannel(strings.TrimSuffix(strings.TrimPrefix(file, "releases."), ".json"))
+	// The platform comes from, in order: the base URL's path
+	// (/velopack/{platform}), which every Velopack client keeps; a
+	// per runtime channel name; the rid the C# client sends, which is
+	// the machine's architecture rather than the app's. The Rust core
+	// that Velopack's other SDKs use sends no rid and replaces the query.
+	platform := service.NormalizePlatform(pathPlatform)
+	if pathPlatform != "" && !service.IsValidPlatform(platform) {
+		response.BadRequest(c, "unknown platform in the Velopack base URL; use one such as windows-x64, darwin-arm64 or linux-x64")
+		return
+	}
+	if platform == "" {
+		platform = channelPlatform
+	}
+	if platform == "" {
+		platform = q.Get("platform")
+	}
+	if platform == "" {
+		platform = service.VelopackPlatform(q.Get("rid"))
+	}
+	if platform == "" {
+		response.BadRequest(c, "no platform: end the Velopack base URL with one, such as /velopack/windows-x64, or send a rid Keygate serves")
+		return
+	}
+	q.Set("platform", platform)
+	if q.Get("channel") == "" {
+		q.Set("channel", channel)
+	}
+	c.Request.URL.RawQuery = q.Encode()
+	h.FeedVelopack(c)
+}
+
+// velopackPackage answers {base}/{FileName}, the download Velopack makes
+// for a package listed in the feed, with a redirect to storage. It goes
+// through the same feed checks (license, maintenance cutoff, channel,
+// platform) as the feed that listed the package.
+func (h *ReleasePublicHandler) velopackPackage(c *gin.Context, file string) {
+	version, channel, platform, ok := service.ParseVelopackFileName(file)
+	if !ok {
+		response.NotFound(c, "release not found")
+		return
+	}
+	q := c.Request.URL.Query()
+	q.Set("platform", platform)
+	q.Set("channel", channel)
+	q.Set("limit", "100")
+	c.Request.URL.RawQuery = q.Encode()
+	req, ok := h.parseFeedRequest(c)
+	if !ok {
+		return
+	}
+	feedReleases, ok := h.fetchPublishedFeedReleases(c, req)
+	if !ok {
+		return
+	}
+	for _, r := range feedReleases {
+		if r.Release.Version == version {
+			c.Header("Cache-Control", "private, no-store")
+			c.Redirect(http.StatusFound, r.DownloadURL)
+			return
+		}
+	}
+	response.NotFound(c, "release not found")
 }
 
 // GET /api/v1/releases/:product_slug/upgrade.json — Tauri (single-release manifest)

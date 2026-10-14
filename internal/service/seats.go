@@ -131,11 +131,11 @@ func (s *SeatService) AddSeat(ctx context.Context, in AddSeatInput) (*model.Seat
 			"role": in.Role, "outcome": string(outcome),
 		})
 		if s.email != nil {
-			productName := ""
+			productName, downloadURL := "", ""
 			if lic.Product != nil {
-				productName = lic.Product.Name
+				productName, downloadURL = lic.Product.Name, lic.Product.DownloadURL
 			}
-			s.email.SendSeatInvite(in.Email, productName, lic.Email, s.inviteURL(plainToken))
+			s.email.SendSeatInvite(in.Email, productName, lic.Email, s.inviteURL(plainToken), downloadURL)
 		}
 		s.logger.Info("seat added", "license_id", lic.ID, "email", in.Email, "outcome", outcome)
 	}

@@ -6,13 +6,16 @@ import {
   Copy,
   Eye,
   EyeOff,
+  History,
   Package,
+  Pause,
   Play,
   Plus,
   RefreshCw,
+  Send,
   Trash2,
 } from "lucide-react"
-import { useState } from "react"
+import { Fragment, useState } from "react"
 import { Link } from "react-router-dom"
 import { ProductSelect } from "@/components/product-select"
 import { showToast } from "@/components/toast"
@@ -204,7 +207,7 @@ export default function WebhooksPage() {
                     <DataTableHead>{t("webhooks.events")}</DataTableHead>
                     <DataTableHead>{t("common.status")}</DataTableHead>
                     <DataTableHead>{t("common.created")}</DataTableHead>
-                    <DataTableHead className="w-32" />
+                    <DataTableHead className="w-40 text-right">{t("common.actions")}</DataTableHead>
                   </DataTableRow>
                 </DataTableHeader>
                 <DataTableBody>
@@ -238,42 +241,34 @@ export default function WebhooksPage() {
                         {formatDate(wh.created_at)}
                       </DataTableCell>
                       <DataTableCell>
-                        <div className="flex gap-1">
-                          {/* Per-row pending state via mutation.variables.
-                              The global testMut.isPending / toggleMut.isPending
-                              flags would disable EVERY button in the table
-                              while ANY one is in-flight — looks like a
-                              "ghost click" cascade. Pinning to the specific
-                              wh.id keeps the visual state local. */}
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            title={wh.active ? t("common.inactive") : t("common.active")}
-                            onClick={() => toggleMut.mutate({ id: wh.id, active: !wh.active })}
-                            disabled={toggleMut.isPending && toggleMut.variables?.id === wh.id}
-                          >
-                            {wh.active ? <Eye className="h-4 w-4" /> : <EyeOff className="h-4 w-4" />}
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            title={t("webhooks.test")}
+                        {/* One icon per action, each named by its tooltip and
+                          aria-label. The icons say what happens: a send for the
+                          test event, pause/play for stopping or resuming
+                          delivery (not an eye, which reads as "view"), and the
+                          log opens from a history icon. Pending state is per
+                          row via mutation.variables, so one busy webhook does
+                          not disable the others. */}
+                        <div className="flex items-center justify-end gap-1">
+                          <IconAction label={t("webhooks.deliveries")} onClick={() => setViewingDeliveries(wh.id)}>
+                            <History className="h-4 w-4" />
+                          </IconAction>
+                          <IconAction
+                            label={t("webhooks.sendTest")}
                             onClick={() => testMut.mutate(wh.id)}
                             disabled={testMut.isPending && testMut.variables === wh.id}
                           >
-                            <Play className="h-4 w-4" />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            title={t("webhooks.deliveries")}
-                            onClick={() => setViewingDeliveries(wh.id)}
+                            <Send className="h-4 w-4" />
+                          </IconAction>
+                          <IconAction
+                            label={wh.active ? t("webhooks.disable") : t("webhooks.enable")}
+                            onClick={() => toggleMut.mutate({ id: wh.id, active: !wh.active })}
+                            disabled={toggleMut.isPending && toggleMut.variables?.id === wh.id}
                           >
-                            <ChevronRight className="h-4 w-4" />
-                          </Button>
-                          <Button variant="ghost" size="icon" onClick={() => setDeleting(wh)}>
+                            {wh.active ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+                          </IconAction>
+                          <IconAction label={t("common.delete")} onClick={() => setDeleting(wh)}>
                             <Trash2 className="h-4 w-4 text-destructive" />
-                          </Button>
+                          </IconAction>
                         </div>
                       </DataTableCell>
                     </DataTableRow>
@@ -495,142 +490,121 @@ function DeliveryLogDialog({ webhookId, onClose }: { webhookId: string; onClose:
 
   return (
     <Dialog open onOpenChange={onClose}>
-      <DialogContent className="max-w-3xl">
+      <DialogContent className="max-w-3xl h-[min(760px,85vh)]">
         <DialogHeader>
           <DialogTitle>{t("webhooks.deliveries")}</DialogTitle>
           <DialogDescription>
             {total} {t("webhooks.deliveriesCount")}
           </DialogDescription>
         </DialogHeader>
+        {/* Status filter: lets admins drill into failed deliveries
+          without scrolling past every delivered row. It sits outside the
+          scrolling body, so it stays in view and nothing clips it. The
+          page resets on change so the first matching page shows. */}
+        <div className="flex shrink-0 flex-wrap items-center gap-2">
+          <span className="text-xs text-muted-foreground">{t("common.status")}</span>
+          {(["", "pending", "delivered", "failed"] as const).map((s) => (
+            <Button
+              key={s || "all"}
+              size="sm"
+              variant={statusFilter === s ? "default" : "outline"}
+              className="h-7 px-2.5 text-xs"
+              onClick={() => {
+                setStatusFilter(s)
+                setPage(0)
+              }}
+            >
+              {s === "" ? t("webhooks.statusAll") : t(`status.${s}` as const)}
+            </Button>
+          ))}
+        </div>
         <DialogBody>
-          {/* Status filter: lets admins drill into failed deliveries
-            without scrolling past every delivered row. Pagination
-            resets on change so the user sees the first matching page. */}
-          <div className="flex items-center gap-2 -mt-2">
-            <span className="text-xs text-muted-foreground">{t("common.status")}:</span>
-            {(["", "pending", "delivered", "failed"] as const).map((s) => (
-              <button
-                type="button"
-                key={s || "all"}
-                onClick={() => {
-                  setStatusFilter(s)
-                  setPage(0)
-                }}
-                className={
-                  "text-xs px-2 py-1 rounded border " +
-                  (statusFilter === s
-                    ? "bg-primary text-primary-foreground border-primary"
-                    : "bg-background hover:bg-muted")
-                }
-              >
-                {s === "" ? t("webhooks.statusAll") : t(`status.${s}` as const)}
-              </button>
-            ))}
-          </div>
           {isLoading ? (
             <div className="h-48 animate-pulse bg-muted rounded-lg" />
           ) : deliveries.length === 0 ? (
             <p className="text-sm text-muted-foreground py-8 text-center">{t("webhooks.noDeliveries")}</p>
           ) : (
             <div className="space-y-4">
-              <DataTable>
-                <DataTableHeader>
-                  <DataTableRow>
-                    <DataTableHead className="w-8" />
-                    <DataTableHead>{t("webhooks.event")}</DataTableHead>
-                    <DataTableHead>{t("common.status")}</DataTableHead>
-                    <DataTableHead>{t("webhooks.response")}</DataTableHead>
-                    <DataTableHead>{t("webhooks.attempts")}</DataTableHead>
-                    <DataTableHead>{t("webhooks.delivered")}</DataTableHead>
-                  </DataTableRow>
-                </DataTableHeader>
-                <DataTableBody>
-                  {deliveries.map((d) => (
-                    <>
-                      <DataTableRow
-                        key={d.id}
-                        className="cursor-pointer"
+              {/* One card per delivery rather than a six column table: the
+                fields wrap on a narrow screen instead of scrolling the row
+                (and the Resend button) out of reach. */}
+              <ul className="divide-y rounded-md border">
+                {deliveries.map((d) => (
+                  <Fragment key={d.id}>
+                    <li>
+                      <button
+                        type="button"
+                        className="flex w-full flex-wrap items-center gap-x-3 gap-y-1.5 px-3 py-2.5 text-left hover:bg-muted/50"
+                        aria-expanded={expandedId === d.id}
                         onClick={() => setExpandedId(expandedId === d.id ? null : d.id)}
                       >
-                        <DataTableCell>
-                          {expandedId === d.id ? (
-                            <ChevronDown className="h-4 w-4" />
-                          ) : (
-                            <ChevronRight className="h-4 w-4" />
-                          )}
-                        </DataTableCell>
-                        <DataTableCell>
-                          <Badge variant="secondary" className="text-xs">
-                            {d.event}
-                          </Badge>
-                        </DataTableCell>
-                        <DataTableCell>
-                          <Badge
-                            className={
-                              d.status === "delivered"
-                                ? "bg-emerald-100 text-emerald-800"
-                                : d.status === "failed"
-                                  ? "bg-red-100 text-red-800"
-                                  : "bg-amber-100 text-amber-800"
-                            }
-                          >
-                            {t(`status.${d.status}` as TranslationKeys)}
-                          </Badge>
-                        </DataTableCell>
-                        <DataTableCell className="text-muted-foreground">{d.response_code ?? "-"}</DataTableCell>
-                        <DataTableCell className="text-muted-foreground">{d.attempts}</DataTableCell>
-                        <DataTableCell className="text-muted-foreground text-xs">
-                          {formatDate(d.delivered_at)}
-                        </DataTableCell>
-                      </DataTableRow>
+                        {expandedId === d.id ? (
+                          <ChevronDown className="h-4 w-4 shrink-0" />
+                        ) : (
+                          <ChevronRight className="h-4 w-4 shrink-0" />
+                        )}
+                        <Badge variant="secondary" className="text-xs">
+                          {d.event}
+                        </Badge>
+                        <Badge
+                          className={
+                            d.status === "delivered"
+                              ? "bg-emerald-100 text-emerald-800"
+                              : d.status === "failed"
+                                ? "bg-red-100 text-red-800"
+                                : "bg-amber-100 text-amber-800"
+                          }
+                        >
+                          {t(`status.${d.status}` as TranslationKeys)}
+                        </Badge>
+                        <span className="text-xs text-muted-foreground">
+                          {t("webhooks.response")} {d.response_code ?? "-"} · {t("webhooks.attempts")} {d.attempts}
+                        </span>
+                        <span className="ml-auto text-xs text-muted-foreground">{formatDate(d.delivered_at)}</span>
+                      </button>
                       {expandedId === d.id && (
-                        <DataTableRow key={`${d.id}-detail`}>
-                          <DataTableCell colSpan={6}>
-                            <div className="space-y-2 p-2">
-                              <div className="flex items-center justify-between">
-                                <span className="text-[11px] font-mono text-muted-foreground break-all">
-                                  id: {d.id}
-                                </span>
-                                {/* Resend re-fires the same event payload as a
-                                  new delivery. We disable it while the
-                                  mutation is in-flight to avoid double-send
-                                  on a slow connection. */}
-                                <Button
-                                  size="sm"
-                                  variant="outline"
-                                  onClick={() => resendMut.mutate(d.id)}
-                                  disabled={resendMut.isPending}
-                                >
-                                  <RefreshCw className="h-3 w-3 mr-1" />
-                                  {resendMut.isPending && resendMut.variables === d.id
-                                    ? t("common.loading")
-                                    : t("webhooks.resend")}
-                                </Button>
-                              </div>
-                              {d.payload && (
-                                <div>
-                                  <p className="text-xs font-medium text-muted-foreground mb-1">Payload</p>
-                                  <pre className="text-xs bg-muted rounded p-2 overflow-auto max-h-40">
-                                    {JSON.stringify(d.payload, null, 2)}
-                                  </pre>
-                                </div>
-                              )}
-                              {d.response_body && (
-                                <div>
-                                  <p className="text-xs font-medium text-muted-foreground mb-1">Response Body</p>
-                                  <pre className="text-xs bg-muted rounded p-2 overflow-auto max-h-40">
-                                    {d.response_body}
-                                  </pre>
-                                </div>
-                              )}
+                        <div className="space-y-3 border-t bg-muted/20 px-3 py-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="text-[11px] font-mono text-muted-foreground break-all">id: {d.id}</span>
+                            {/* Resend re-fires the same event payload as a
+                              new delivery. Disabled while in flight so a slow
+                              connection cannot double send. */}
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => resendMut.mutate(d.id)}
+                              disabled={resendMut.isPending}
+                            >
+                              <RefreshCw className="h-3 w-3 mr-1" />
+                              {resendMut.isPending && resendMut.variables === d.id
+                                ? t("common.loading")
+                                : t("webhooks.resend")}
+                            </Button>
+                          </div>
+                          {d.payload && (
+                            <div>
+                              <p className="text-xs font-medium text-muted-foreground mb-1">{t("webhooks.payload")}</p>
+                              <pre className="text-xs bg-muted rounded p-2 overflow-auto max-h-48 whitespace-pre-wrap break-all">
+                                {JSON.stringify(d.payload, null, 2)}
+                              </pre>
                             </div>
-                          </DataTableCell>
-                        </DataTableRow>
+                          )}
+                          {d.response_body && (
+                            <div>
+                              <p className="text-xs font-medium text-muted-foreground mb-1">
+                                {t("webhooks.responseBody")}
+                              </p>
+                              <pre className="text-xs bg-muted rounded p-2 overflow-auto max-h-48 whitespace-pre-wrap break-all">
+                                {d.response_body}
+                              </pre>
+                            </div>
+                          )}
+                        </div>
                       )}
-                    </>
-                  ))}
-                </DataTableBody>
-              </DataTable>
+                    </li>
+                  </Fragment>
+                ))}
+              </ul>
               {total > 0 && (
                 <DataTablePagination
                   page={page}
@@ -645,5 +619,24 @@ function DeliveryLogDialog({ webhookId, onClose }: { webhookId: string; onClose:
         </DialogBody>
       </DialogContent>
     </Dialog>
+  )
+}
+
+// An icon button whose name is its tooltip and its accessible label.
+function IconAction({
+  label,
+  onClick,
+  disabled,
+  children,
+}: {
+  label: string
+  onClick: () => void
+  disabled?: boolean
+  children: React.ReactNode
+}) {
+  return (
+    <Button variant="ghost" size="icon" title={label} aria-label={label} onClick={onClick} disabled={disabled}>
+      {children}
+    </Button>
   )
 }

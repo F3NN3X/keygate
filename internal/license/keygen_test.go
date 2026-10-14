@@ -65,3 +65,23 @@ func TestHashKeyNormalization(t *testing.T) {
 		t.Error("normalization should make these equal")
 	}
 }
+
+// TestRandomSegmentUnbiased checks every alphabet character is drawn
+// about equally often. The old bound of 248 (a multiple of 31) made 8 of
+// the 32 characters come up 7/8 as often as the rest.
+func TestRandomSegmentUnbiased(t *testing.T) {
+	counts := map[rune]int{}
+	const n = 320000
+	for _, r := range randomSegment(n) {
+		counts[r]++
+	}
+	if len(counts) != len(alphabet) {
+		t.Fatalf("expected all %d characters, got %d", len(alphabet), len(counts))
+	}
+	want := n / len(alphabet)
+	for r, c := range counts {
+		if c < want*95/100 || c > want*105/100 {
+			t.Errorf("character %q drawn %d times, want about %d", r, c, want)
+		}
+	}
+}

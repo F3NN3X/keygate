@@ -156,7 +156,7 @@ export default function APIKeysPage() {
                   <DataTableHead>{t("apiKeys.prefix")}</DataTableHead>
                   <DataTableHead>{t("apiKeys.lastUsed")}</DataTableHead>
                   <DataTableHead>{t("common.created")}</DataTableHead>
-                  <DataTableHead className="w-24" />
+                  <DataTableHead className="w-24 text-right">{t("common.actions")}</DataTableHead>
                 </DataTableRow>
               </DataTableHeader>
               <DataTableBody>
@@ -195,7 +195,7 @@ export default function APIKeysPage() {
                     </DataTableCell>
                     <DataTableCell className="text-muted-foreground text-xs">{formatDate(k.created_at)}</DataTableCell>
                     <DataTableCell>
-                      <div className="flex gap-1">
+                      <div className="flex justify-end gap-1">
                         <Button
                           variant="ghost"
                           size="icon"
@@ -331,7 +331,7 @@ function CreateAPIKeyDialog({
 
   return (
     <Dialog open={open} onOpenChange={onClose}>
-      <DialogContent>
+      <DialogContent className="h-[min(540px,85vh)]">
         <DialogHeader>
           <DialogTitle>{t("apiKeys.new")}</DialogTitle>
           <DialogDescription>{t("apiKeys.subtitle")}</DialogDescription>

@@ -1417,6 +1417,17 @@ func TestFeedDrainFollowsTheRecordedBound(t *testing.T) {
 		t.Fatalf("migrations: %v", err)
 	}
 	ctx := context.Background()
+	// The test ends by recording an unreadable bound; leave the setting
+	// as it found it, or every later test reading it inherits the 500.
+	before, _ := s.GetSetting(ctx, store.SettingFeedURLTTLBound)
+	// A defer, not t.Cleanup: it must run before the deferred s.Close.
+	defer func() {
+		if before != "" {
+			_ = s.SetSettings(context.Background(), map[string]string{store.SettingFeedURLTTLBound: before})
+			return
+		}
+		_, _ = s.DB.NewRaw("DELETE FROM settings WHERE key = ?", store.SettingFeedURLTTLBound).Exec(context.Background())
+	}()
 	gin.SetMode(gin.TestMode)
 	prevBound, _ := s.GetSetting(ctx, store.SettingFeedURLTTLBound)
 	defer func() {

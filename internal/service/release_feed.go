@@ -1,13 +1,13 @@
 package service
 
 import (
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/xml"
 	"fmt"
 	"regexp"
 	"strings"
 	"time"
+
+	"golang.org/x/mod/semver"
 
 	"github.com/tabloy/keygate/internal/model"
 )
@@ -43,10 +43,11 @@ type FeedInput struct {
 	Releases    []*FeedRelease
 
 	// MinimumSupportedVersion: optional product-level version floor.
-	// Only the Tauri-style JSON feed carries it (that format tolerates
-	// extra fields). Sparkle's XML schema and Velopack's array shape
-	// have no place for it, so clients on those formats never see the
-	// floor — the server does not enforce it either.
+	// The Tauri feed carries it with the message as extra fields; the
+	// Sparkle appcast marks updates that reach the floor as critical
+	// for apps below it (no message: Sparkle has no field for one).
+	// Velopack's feed has no place for it, and the server does not
+	// enforce it either.
 	MinimumSupportedVersion string
 	MinimumSupportedMessage string
 }
@@ -55,16 +56,10 @@ type FeedInput struct {
 // per platform, since the wire formats for Sparkle/Velopack/Tauri all carry
 // per-platform binary metadata. The handler resolves which artifact within
 // each release matches the caller's `?platform=` and bundles it here.
-//
-// SigningPublicKey is the raw base64 pubkey (32-byte ed25519) used to
-// produce Artifact.Ed25519Sig. Required for Tauri's minisign-formatted
-// signature envelope, which embeds an 8-byte key_id derived from the
-// pubkey. Empty when the artifact is unsigned.
 type FeedRelease struct {
-	Release          *model.Release
-	Artifact         *model.ReleaseArtifact
-	DownloadURL      string
-	SigningPublicKey string
+	Release     *model.Release
+	Artifact    *model.ReleaseArtifact
+	DownloadURL string
 }
 
 // ─── Sparkle (appcast.xml) ───
@@ -93,7 +88,15 @@ type sparkleItem struct {
 	SparkleVersion  string             `xml:"sparkle:version,omitempty"`
 	SparkleShortVer string             `xml:"sparkle:shortVersionString,omitempty"`
 	Description     sparkleDescription `xml:"description"`
+	CriticalUpdate  *sparkleCritical   `xml:"sparkle:criticalUpdate,omitempty"`
 	Enclosure       sparkleEnclosure   `xml:"enclosure"`
+}
+
+// sparkleCritical marks an update critical for apps older than Version:
+// Sparkle compares the running CFBundleVersion with it and, when lower,
+// removes the option to skip the update.
+type sparkleCritical struct {
+	Version string `xml:"sparkle:version,attr"`
 }
 
 type sparkleDescription struct {
@@ -150,6 +153,12 @@ func RenderSparkle(in FeedInput) ([]byte, error) {
 		if sparkleSigPattern.MatchString(a.Ed25519Sig) {
 			sig = a.Ed25519Sig
 		}
+		// Only an update that reaches the floor gets an app below it
+		// back to a supported version, so only those are critical.
+		var critical *sparkleCritical
+		if min := in.MinimumSupportedVersion; min != "" && semver.Compare("v"+rel.Version, "v"+min) >= 0 {
+			critical = &sparkleCritical{Version: min}
+		}
 		feed.Channel.Items = append(feed.Channel.Items, sparkleItem{
 			Title:           rel.Version,
 			PubDate:         pubDate,
@@ -158,6 +167,7 @@ func RenderSparkle(in FeedInput) ([]byte, error) {
 			Description: sparkleDescription{
 				Body: sanitizeCDATA(rel.ReleaseNotes),
 			},
+			CriticalUpdate: critical,
 			Enclosure: sparkleEnclosure{
 				URL:          r.DownloadURL,
 				Length:       a.FileSize,
@@ -186,84 +196,116 @@ func sanitizeCDATA(s string) string {
 	return strings.ReplaceAll(s, "]]>", "]]]]><![CDATA[>")
 }
 
-// ─── Velopack (releases.json) ───
-// Velopack consumes a JSON array of releases. The wire shape is opinionated:
+// ─── Velopack (releases.{channel}.json) ───
 //
-//	[
-//	  {
-//	    "id": "v1.2.3",
-//	    "type": "Full",
-//	    "filename": "MyApp-1.2.3-full.nupkg",
-//	    "size": 12345678,
-//	    "sha256": "abc...",
-//	    "url": "https://...",
-//	    "notes": "...",
-//	    "publishedAt": "2026-05-10T..."
-//	  },
-//	  ...
-//	]
-//
-// Spec: https://docs.velopack.io/category/distributing
-//
-// Note: Velopack also supports delta releases. We only emit "Full" entries
-// in Phase 1 — clients fall back to full downloads when no delta is present.
+// Velopack's client (SimpleWebSource) is configured with a base URL and
+// requests {base}/releases.{channel}.json?arch=&os=&rid=&id=&localVersion=,
+// then deserializes a VelopackAssetFeed: {"Assets": [...]} with the
+// property names below. It picks the highest Version among Type "Full",
+// downloads {base}/{FileName} and compares the file's SHA256 with the
+// feed's, as upper case hex, ordinal. FileName must be a plain file
+// name: Velopack also names its local cache file after it, so a
+// presigned URL there (query string and all) breaks the download. The
+// handler answers {base}/{FileName} with a redirect to storage.
+// Velopack does not check signatures; the hash and HTTPS carry the trust.
 
-// VelopackEntry is one release in the Velopack feed.
-type VelopackEntry struct {
-	ID          string `json:"id"`
-	Type        string `json:"type"`
-	Filename    string `json:"filename"`
-	Size        int64  `json:"size"`
-	SHA256      string `json:"sha256"`
-	URL         string `json:"url"`
-	Notes       string `json:"notes,omitempty"`
-	PublishedAt string `json:"publishedAt,omitempty"`
+// VelopackAsset is one release in a Velopack feed.
+type VelopackAsset struct {
+	PackageId     string `json:"PackageId"`
+	Version       string `json:"Version"`
+	Type          string `json:"Type"`
+	FileName      string `json:"FileName"`
+	SHA256        string `json:"SHA256"`
+	Size          int64  `json:"Size"`
+	NotesMarkdown string `json:"NotesMarkdown,omitempty"`
 }
 
-// VelopackFeed is the JSON array Velopack expects.
-type VelopackFeed []VelopackEntry
+// VelopackFeed is the body of releases.{channel}.json.
+type VelopackFeed struct {
+	Assets []VelopackAsset `json:"Assets"`
+}
 
-// BuildVelopack assembles the Velopack JSON-ready slice. Use json.Marshal on
-// the return value to produce the wire bytes.
-func BuildVelopack(in FeedInput) VelopackFeed {
-	out := make(VelopackFeed, 0, len(in.Releases))
+// BuildVelopack assembles a Velopack feed. packageID is the app's
+// Velopack id; Velopack does not filter on it, but it is reported back.
+func BuildVelopack(in FeedInput, packageID string) VelopackFeed {
+	out := VelopackFeed{Assets: make([]VelopackAsset, 0, len(in.Releases))}
 	for _, r := range in.Releases {
 		if r == nil || r.Release == nil || r.Artifact == nil {
 			continue
 		}
-		rel := r.Release
-		a := r.Artifact
-		entry := VelopackEntry{
-			ID:       "v" + rel.Version,
-			Type:     "Full",
-			Filename: velopackFilename(rel, a),
-			Size:     a.FileSize,
-			SHA256:   strings.ToLower(a.SHA256),
-			URL:      r.DownloadURL,
-			Notes:    rel.ReleaseNotes,
-		}
-		if rel.PublishedAt != nil {
-			entry.PublishedAt = rel.PublishedAt.UTC().Format(time.RFC3339)
-		}
-		out = append(out, entry)
+		out.Assets = append(out.Assets, VelopackAsset{
+			PackageId:     packageID,
+			Version:       r.Release.Version,
+			Type:          "Full",
+			FileName:      VelopackFileName(r.Release, r.Artifact),
+			SHA256:        strings.ToUpper(r.Artifact.SHA256),
+			Size:          r.Artifact.FileSize,
+			NotesMarkdown: r.Release.ReleaseNotes,
+		})
 	}
 	return out
 }
 
-// velopackFilename builds the filename Velopack expects for a "full" release.
-// Extension comes from the artifact's storage key so Windows clients
-// receiving a nupkg don't see a misleading .zip name.
-func velopackFilename(rel *model.Release, a *model.ReleaseArtifact) string {
-	name := rel.Name
-	if name == "" {
-		name = a.Platform
+// VelopackFileName names a package in a Velopack feed:
+// {version}_{channel}_{platform}.nupkg. Semantic versions cannot contain
+// an underscore, so the name splits back unambiguously.
+func VelopackFileName(rel *model.Release, a *model.ReleaseArtifact) string {
+	channel := rel.Channel
+	if channel == "" {
+		channel = model.ReleaseChannelStable
 	}
-	name = safeKeyComponent(name)
-	ext := normalizeExt(a.FileKey)
-	if ext == "" {
-		ext = ".zip"
+	return rel.Version + "_" + channel + "_" + a.Platform + ".nupkg"
+}
+
+// ParseVelopackFileName reverses VelopackFileName.
+func ParseVelopackFileName(name string) (version, channel, platform string, ok bool) {
+	parts := strings.Split(strings.TrimSuffix(name, ".nupkg"), "_")
+	if len(parts) != 3 || !strings.HasSuffix(name, ".nupkg") || parts[0] == "" {
+		return "", "", "", false
 	}
-	return fmt.Sprintf("%s-%s-full%s", name, rel.Version, ext)
+	return parts[0], parts[1], parts[2], true
+}
+
+// VelopackPlatform maps a .NET runtime identifier, which Velopack sends
+// as rid, to a Keygate platform. "" when it is not one Keygate serves.
+func VelopackPlatform(rid string) string {
+	switch strings.ToLower(rid) {
+	case "win-x64":
+		return "windows-x64"
+	case "win-arm64":
+		return "windows-arm64"
+	case "osx-x64":
+		return "darwin-x64"
+	case "osx-arm64":
+		return "darwin-arm64"
+	case "linux-x64":
+		return "linux-x64"
+	case "linux-arm64":
+		return "linux-arm64"
+	case "linux-arm":
+		return "linux-armhf"
+	}
+	return ""
+}
+
+// VelopackChannel maps the channel in releases.{channel}.json to a
+// Keygate channel, and to a platform when the name carries one.
+// Velopack's default channels are the OS names (win, osx, linux), which
+// mean stable here; a package built with --channel beta (or alpha, dev,
+// stable) reads that Keygate channel. Velopack's docs name a channel per
+// runtime when an app ships several architectures, such as win-x64 or
+// win-x64-beta: the runtime picks the platform and a trailing Keygate
+// channel name picks the channel.
+func VelopackChannel(name string) (channel, platform string) {
+	name = strings.ToLower(name)
+	if model.IsValidReleaseChannel(name) {
+		return name, ""
+	}
+	channel = model.ReleaseChannelStable
+	if i := strings.LastIndex(name, "-"); i > 0 && model.IsValidReleaseChannel(name[i+1:]) {
+		channel, name = name[i+1:], name[:i]
+	}
+	return channel, VelopackPlatform(name)
 }
 
 // ─── Tauri ───
@@ -300,12 +342,8 @@ type TauriManifest struct {
 // is expected to be the latest after semver sort). Returns a zero value when
 // no releases are present — callers should 204/404 in that case.
 //
-// The Signature field is the base64-wrapped full minisign .sig file
-// TauriSignatureEnvelope produces, because that is what Tauri v2's verifier
-// consumes: it base64-DECODES the whole `signature` string into minisign file
-// text, then parses and verifies a 4-line signature (file sig + global sig).
-// The raw ed25519 base64 we store for Sparkle, or an un-wrapped envelope,
-// fails at that base64-decode step before any signature is checked.
+// The Signature field is the artifact's stored minisign signature (see
+// TauriSignature), made when the artifact was signed.
 func BuildTauri(in FeedInput) TauriManifest {
 	for _, r := range in.Releases {
 		if r == nil || r.Release == nil || r.Artifact == nil {
@@ -316,10 +354,13 @@ func BuildTauri(in FeedInput) TauriManifest {
 		m := TauriManifest{
 			Version:                 rel.Version,
 			URL:                     r.DownloadURL,
-			Signature:               TauriSignatureEnvelope(a.Ed25519Sig, a.Ed25519GlobalSig, r.SigningPublicKey),
+			Signature:               a.TauriSignature,
 			Notes:                   rel.ReleaseNotes,
 			MinimumSupportedVersion: in.MinimumSupportedVersion,
-			MinimumSupportedMessage: in.MinimumSupportedMessage,
+		}
+		// The message explains the floor; without one it explains nothing.
+		if in.MinimumSupportedVersion != "" {
+			m.MinimumSupportedMessage = in.MinimumSupportedMessage
 		}
 		if rel.PublishedAt != nil {
 			m.PubDate = rel.PublishedAt.UTC().Format(time.RFC3339)
@@ -327,88 +368,6 @@ func BuildTauri(in FeedInput) TauriManifest {
 		return m
 	}
 	return TauriManifest{}
-}
-
-// tauriTrustedComment is the body of the minisign signature's "trusted comment: " line — the text the
-// global signature is computed over (see SignArtifactWith). It is a fixed string so sign-time and
-// feed-time agree without storing it; minisign-verify treats the content as opaque.
-const tauriTrustedComment = "keygate release"
-
-// TauriSignatureEnvelope builds the signature string the Tauri v2 updater consumes.
-//
-// Tauri's verifier (tauri-plugin-updater ≥2 / minisign-verify) does NOT read the raw minisign text: it
-// base64-DECODES the whole `signature` field into the .sig file's text, then parses a FULL minisign
-// signature — four lines, including a `trusted comment:` and a 64-byte GLOBAL signature over
-// (raw_sig || trusted_comment). The older two-line envelope (comment + one base64 line) fails to
-// base64-decode and never reaches the parser. So this returns:
-//
-//	base64(
-//	  "untrusted comment: signature from keygate\n" +
-//	  base64("Ed" + key_id + raw_sig) + "\n" +          // 74 bytes
-//	  "trusted comment: " + tauriTrustedComment + "\n" +
-//	  globalSigB64                                       // base64 of the 64-byte global sig
-//	)
-//
-// Returns "" when any input is empty or malformed (unsigned artifact, a pre-global-sig artifact, or an
-// unresolved pubkey) so the feed simply omits the signature rather than shipping a broken one.
-func TauriSignatureEnvelope(rawSigB64, globalSigB64, rawPubKeyB64 string) string {
-	if rawSigB64 == "" || globalSigB64 == "" || rawPubKeyB64 == "" {
-		return ""
-	}
-	rawSig, err := base64.StdEncoding.DecodeString(rawSigB64)
-	if err != nil || len(rawSig) != 64 {
-		return ""
-	}
-	if gs, err := base64.StdEncoding.DecodeString(globalSigB64); err != nil || len(gs) != 64 {
-		return ""
-	}
-	rawPub, err := base64.StdEncoding.DecodeString(rawPubKeyB64)
-	if err != nil || len(rawPub) != 32 {
-		return ""
-	}
-	keyID := tauriKeyID(rawPub)
-	blob := make([]byte, 0, 2+8+64)
-	blob = append(blob, 'E', 'd')
-	blob = append(blob, keyID[:]...)
-	blob = append(blob, rawSig...)
-	sigFile := "untrusted comment: signature from keygate\n" +
-		base64.StdEncoding.EncodeToString(blob) + "\n" +
-		"trusted comment: " + tauriTrustedComment + "\n" +
-		globalSigB64
-	return base64.StdEncoding.EncodeToString([]byte(sigFile))
-}
-
-// TauriPublicKey emits the public key in the form the Tauri v2 updater's config `pubkey` expects: the
-// verifier base64-DECODES it into a minisign `.pub` file's text and parses two lines (untrusted
-// comment, then base64("Ed" + key_id + raw 32-byte key)). So this returns base64 of that two-line file,
-// NOT the bare base64("Ed"+key_id+key) blob — pasting the bare blob fails the verifier's decode step
-// (it is not valid UTF-8) before any signature is checked.
-func TauriPublicKey(rawPubKeyB64 string) string {
-	if rawPubKeyB64 == "" {
-		return ""
-	}
-	rawPub, err := base64.StdEncoding.DecodeString(rawPubKeyB64)
-	if err != nil || len(rawPub) != 32 {
-		return ""
-	}
-	keyID := tauriKeyID(rawPub)
-	blob := make([]byte, 0, 2+8+32)
-	blob = append(blob, 'E', 'd')
-	blob = append(blob, keyID[:]...)
-	blob = append(blob, rawPub...)
-	pubFile := "untrusted comment: minisign public key\n" + base64.StdEncoding.EncodeToString(blob)
-	return base64.StdEncoding.EncodeToString([]byte(pubFile))
-}
-
-// tauriKeyID derives the 8-byte minisign-style key_id deterministically
-// from the public key. minisign uses random IDs but Tauri only checks
-// that sig.key_id == pubkey.key_id, so a stable derivation is safe and
-// avoids storing an extra column.
-func tauriKeyID(rawPub []byte) [8]byte {
-	h := sha256.Sum256(rawPub)
-	var id [8]byte
-	copy(id[:], h[:8])
-	return id
 }
 
 // ─── Helpers ───

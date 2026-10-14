@@ -1,8 +1,8 @@
 # Fork patches — what `custom` carries on top of upstream
 
 `license.deckshot.app` builds from this fork's **`custom`** branch, which is upstream
-`tabloy/keygate`'s `main` plus the patch set below. **Currently tracking upstream v0.1.11** (merged
-2026-09-29; previously v0.1.5, 2026-09-07). The fork's own `main` is kept as a clean mirror of
+`tabloy/keygate`'s `main` plus the patch set below. **Currently tracking upstream v0.1.13** (merged
+2026-10-14; previously v0.1.11, 2026-09-29). The fork's own `main` is kept as a clean mirror of
 upstream, so `git log --oneline main..custom` is the authoritative, current list of deviations — this
 document is its annotated form: what each patch is, why it exists, and where the detail lives.
 
@@ -31,7 +31,8 @@ Grouped by area, newest first within each group. SHAs are the `custom` commits a
   answered without the attribution being repurposed. `LicenseService` gained a `baseURL` field, wired from
   config in `cmd/server/main.go`. `responseMeta` is therefore a method: new upstream call sites that use
   the bare `responseMeta()` function won't compile after a merge and need `s.` added (v0.1.11's
-  activation-race path was one). Files: `internal/service/license.go`, `cmd/server/main.go`.
+  activation-race path was one). v0.1.13 dropped the `entitlements` helper that sat beside it in
+  `license.go`; the merge keeps only our `responseMeta`. Files: `internal/service/license.go`, `cmd/server/main.go`.
 
 - **`/license/verify` returns owner email + activation usage** — `b5e3d33` (2026-09-07).
   Adds `email`, `activations_used`, `max_activations` to the `VerifyResult` so an SDK client can show a
@@ -42,14 +43,21 @@ Grouped by area, newest first within each group. SHAs are the `custom` commits a
 
 ### Release feed — signing & Tauri
 
-- **Tauri v2-compatible signature & public-key format** — `7887733`, `014c074` (+ migration
-  `20260906_release_artifact_global_sig`). keygate emitted a raw, un-base64-wrapped 2-line minisign
-  signature and a bare pubkey; Tauri v2's updater requires base64-wrapped full minisign files and a
-  4-line signature with a **global signature**. Without this every self-update failed in the field at
-  the pubkey-decode step. Adds an `ed25519_global_sig` column and computes the global signature at
-  publish. Files: `internal/service/release_signing.go`, `internal/service/release_feed.go`,
-  `internal/store/release.go`, `internal/handler/release_signing_admin.go`, `internal/model/model.go`.
-  **Full detail: [`tauri-v2-signature-format.md`](tauri-v2-signature-format.md).**
+- **Tauri v2-compatible signature & public-key format** — ~~`7887733`, `014c074`~~ **UPSTREAMED in
+  v0.1.13, patch dropped (2026-10-14).** Upstream fixed the same bug with its own design: a
+  `tauri_signature` column holding the whole base64 minisign file (migration
+  `20261005_artifact_tauri_signature`), built at publish in `internal/service/tauri_minisign.go`, and
+  `BackfillTauriSignatures` on startup to fill it for artifacts signed before it existed. All signing
+  and feed files were taken from upstream on the merge. The key id is derived the same way as ours
+  (`sha256(pubkey)[:8]`), so signatures still verify against the pubkey DeckShot pinned from our build
+  (key id `76eebeb39d2456fa`). What remains of our patch: migration
+  `20260906_release_artifact_global_sig` and the `Ed25519GlobalSig` model field, kept only because the
+  column exists in deployed databases (the migrator checksums applied files). Nothing reads or writes
+  it now. Background: [`tauri-v2-signature-format.md`](tauri-v2-signature-format.md).
+- **Signing-disabled error names everything signing needs** — part of `4ef2d15`. `ErrSigningDisabled`
+  and the admin handler's messages name object storage as well as `RELEASE_KEY_ENCRYPTION_KEY`, since
+  both are required. Upstream still says only the key is missing. Files:
+  `internal/service/release_signing.go`, `internal/handler/release_signing_admin.go`.
 
 ### Release hosting — object storage (RustFS)
 
@@ -58,7 +66,8 @@ Grouped by area, newest first within each group. SHAs are the `custom` commits a
   (`deploy/rustfs/docker-compose.yml`) and the config to reach it over its **public** hostname
   (`s3.deckshot.app`), because presigned URLs bind the host into the SigV4 signature and a container
   reaching its host's public address hairpins — fixed with an `extra_hosts` host-gateway entry on the
-  keygate service. `.env.example` documents the `STORAGE_*` variables. Files: `docker-compose.yml`,
+  keygate service. `.env.example` documents the `STORAGE_*` variables (on top of upstream's v0.1.13 text it adds
+  `STORAGE_PUBLIC_URL` and `MAX_RELEASE_SIGN_SIZE_MB`, which upstream reads but doesn't list). Files: `docker-compose.yml`,
   `deploy/rustfs/docker-compose.yml`, `.env.example`, `internal/service/release.go`. Operational detail
   (bucket creation, the hairpin) lives in the DeckShot runbook's "Object storage — RustFS" section.
 
@@ -72,18 +81,12 @@ Grouped by area, newest first within each group. SHAs are the `custom` commits a
 
 ### Email
 
-- **Purchase emails honour the custom licence template** — 2026-09-08. The Stripe fulfilment path
-  (`fulfillCheckout`) hardcoded the licence-delivery email's HTML inline and enqueued it directly,
-  bypassing the `email_template_license_created` setting — so an admin's saved template reached only
-  *admin-created* licences (which go through `SendLicenseCreated` → `getTemplate`), never real buyers.
-  Renders the purchase email through `EmailService.RenderLicenseCreated` (a zero-value `EmailService`
-  when none is wired, which falls back to the built-in template). Upstream v0.1.11 added its own
-  identical `RenderLicenseCreated` (for its resend feature), so our copy of that method was dropped on
-  the merge — the patch is now only the `fulfillCheckout` call site, which upstream still inlines. The
-  integration test (`TestFulfillCheckout_UsesCustomLicenseTemplate`) pins the money-path behaviour; it
-  reads `email_queue` directly since upstream replaced `ListPendingEmails` with lease-based
-  `ClaimNextEmail`. Candidate to upstream. Files: `internal/payment/stripe.go`,
-  `internal/payment/fulfill_test.go`.
+- **Purchase emails honour the custom licence template** — ~~`90c98a8`~~ **UPSTREAMED in v0.1.13, patch
+  dropped (2026-10-14).** Upstream's `fulfillCheckout` now renders through
+  `EmailService.RenderLicenseCreated` itself, and also passes the product's download URL, so
+  `stripe.go` was taken from upstream. Our integration test
+  (`TestFulfillCheckout_UsesCustomLicenseTemplate` in `internal/payment/fulfill_test.go`) is kept: it
+  still passes and pins the money-path behaviour.
 
 - **Implicit-TLS SMTP (SMTPS, port 465)** — ~~`531d927`~~ **UPSTREAMED in v0.1.11, patch dropped
   (2026-09-29).** Upstream's mailer now picks implicit TLS for port 465 itself (`resolvedEmail.implicitTLS`)

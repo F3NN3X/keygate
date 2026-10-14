@@ -1,6 +1,7 @@
 import * as DialogPrimitive from "@radix-ui/react-dialog"
 import { X } from "lucide-react"
 import * as React from "react"
+import { useI18n } from "@/i18n"
 import { cn } from "@/lib/utils"
 
 // A panel that slides in from the edge of the screen. It is the same
@@ -43,7 +44,7 @@ const SheetContent = React.forwardRef<
       {children}
       <DialogPrimitive.Close className="absolute right-3 top-3 rounded-sm opacity-70 transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring">
         <X className="h-4 w-4" />
-        <span className="sr-only">Close</span>
+        <CloseLabel />
       </DialogPrimitive.Close>
     </DialogPrimitive.Content>
   </DialogPrimitive.Portal>
@@ -51,3 +52,9 @@ const SheetContent = React.forwardRef<
 SheetContent.displayName = "SheetContent"
 
 export { Sheet, SheetClose, SheetContent, SheetTrigger }
+
+// The close button's name for screen readers, in the UI language.
+function CloseLabel() {
+  const { t } = useI18n()
+  return <span className="sr-only">{t("common.close")}</span>
+}

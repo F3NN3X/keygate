@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { Cloud, Laptop, Layers, Pencil, Plus, Search, Trash2 } from "lucide-react"
+import { Cloud, Laptop, Layers, Pencil, Plus, Search, Settings2, Trash2 } from "lucide-react"
 import { useState } from "react"
-import { HelpTip } from "@/components/help-tip"
+import { CopyableId } from "@/components/copyable-id"
 import { showToast } from "@/components/toast"
 import {
   AlertDialog,
@@ -37,6 +37,7 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RELEASE_PRODUCT_TYPES, UpdateSettingsDialog } from "@/components/update-settings"
 import { useI18n } from "@/i18n"
 import { admin, type Product } from "@/lib/api"
 import { formatDate } from "@/lib/utils"
@@ -53,6 +54,7 @@ export default function ProductsPage() {
   const [editing, setEditing] = useState<Product | null>(null)
   const [creating, setCreating] = useState(false)
   const [deleting, setDeleting] = useState<Product | null>(null)
+  const [updateSettingsFor, setUpdateSettingsFor] = useState<Product | null>(null)
 
   const createMut = useMutation({
     mutationFn: admin.createProduct,
@@ -123,7 +125,7 @@ export default function ProductsPage() {
                     <DataTableHead>{t("products.slug")}</DataTableHead>
                     <DataTableHead>{t("common.type")}</DataTableHead>
                     <DataTableHead>{t("common.created")}</DataTableHead>
-                    <DataTableHead className="w-24" />
+                    <DataTableHead className="w-32 text-right">{t("common.actions")}</DataTableHead>
                   </DataTableRow>
                 </DataTableHeader>
                 <DataTableBody>
@@ -141,11 +143,35 @@ export default function ProductsPage() {
                         {formatDate(p.created_at)}
                       </DataTableCell>
                       <DataTableCell>
-                        <div className="flex gap-1">
-                          <Button variant="ghost" size="icon" onClick={() => setEditing(p)}>
+                        <div className="flex justify-end gap-1">
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            title={t("common.edit")}
+                            aria-label={t("common.edit")}
+                            onClick={() => setEditing(p)}
+                          >
                             <Pencil className="h-4 w-4" />
                           </Button>
-                          <Button variant="ghost" size="icon" onClick={() => setDeleting(p)}>
+                          {/* Only products that ship releases have updates to set up. */}
+                          {RELEASE_PRODUCT_TYPES.includes(p.type) && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              title={t("products.updateSettings")}
+                              aria-label={t("products.updateSettings")}
+                              onClick={() => setUpdateSettingsFor(p)}
+                            >
+                              <Settings2 className="h-4 w-4" />
+                            </Button>
+                          )}
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            title={t("common.delete")}
+                            aria-label={t("common.delete")}
+                            onClick={() => setDeleting(p)}
+                          >
                             <Trash2 className="h-4 w-4 text-destructive" />
                           </Button>
                         </div>
@@ -168,6 +194,15 @@ export default function ProductsPage() {
           )}
         </CardContent>
       </Card>
+
+      {updateSettingsFor && (
+        <UpdateSettingsDialog
+          initialProductId={updateSettingsFor.id}
+          initialTab="signing"
+          lockProduct
+          onClose={() => setUpdateSettingsFor(null)}
+        />
+      )}
 
       {/* Create. Mounted only while open, so the form starts empty
           every time — the state lives in the component, not the
@@ -229,7 +264,13 @@ function ProductDialog({
   open: boolean
   onClose: () => void
   product?: Product
-  onSubmit: (data: { name: string; slug: string; type: string; feed_license_required?: boolean }) => void
+  onSubmit: (data: {
+    name: string
+    slug: string
+    type: string
+    feed_license_required?: boolean
+    download_url?: string
+  }) => void
   loading: boolean
   title: string
 }) {
@@ -237,19 +278,39 @@ function ProductDialog({
   const [name, setName] = useState(product?.name || "")
   const [slug, setSlug] = useState(product?.slug || "")
   const [type, setType] = useState(product?.type || "desktop")
-  const [feedLicenseRequired, setFeedLicenseRequired] = useState(product?.feed_license_required ?? false)
+  const [downloadURL, setDownloadURL] = useState(product?.download_url ?? "")
+
+  // Update settings live in Releases. The one exception is a saas
+  // product becoming one that ships releases while a plan of it sells
+  // an update period: the server wants its new feeds to require a
+  // license in that same change, so the dialog asks for it and says so.
+  const gainsFeeds = !!product && product.type === "saas" && type !== "saas"
+  const { data: plansData } = useQuery({
+    queryKey: ["admin", "plans", "for-access", product?.id],
+    queryFn: () => admin.listPlans({ product_id: product?.id, limit: 100 }),
+    enabled: gainsFeeds,
+  })
+  const needsGate =
+    gainsFeeds && (plansData?.plans || []).some((p) => (p.updates_days ?? 0) > 0 || (p.renewal_days ?? 0) > 0)
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    onSubmit({ name, slug, type, feed_license_required: feedLicenseRequired })
+    onSubmit({
+      name,
+      slug,
+      type,
+      download_url: downloadURL.trim(),
+      ...(needsGate && { feed_license_required: true }),
+    })
   }
 
   return (
     <Dialog open={open} onOpenChange={onClose}>
-      <DialogContent>
+      <DialogContent className="h-[min(650px,85vh)]">
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>{t("products.formDesc")}</DialogDescription>
+          {product && <CopyableId id={product.id} />}
         </DialogHeader>
         <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col gap-4">
           <DialogBody className="space-y-4">
@@ -303,30 +364,19 @@ function ProductDialog({
                 />
               </div>
             </div>
-            {/* Only products that ship releases have a feed to gate.
-              Offered at creation too: a product that has published
-              nothing handed out no feed, so gating it then costs no
-              waiting at all. */}
-            {type !== "saas" && (
-              <div className="space-y-1">
-                <div className="flex items-center gap-3">
-                  <input
-                    type="checkbox"
-                    id="feed-license-required"
-                    checked={feedLicenseRequired}
-                    onChange={(e) => setFeedLicenseRequired(e.target.checked)}
-                    className="h-4 w-4 rounded border-input accent-primary"
-                  />
-                  <Label htmlFor="feed-license-required">{t("products.feedLicenseRequired")}</Label>
-                  {/* The rollout order and the header/token detail are
-                    for the one operator setting this up, not for
-                    everyone who opens the dialog: one line here, the
-                    rest on hover. */}
-                  <HelpTip text={t("products.feedLicenseRequiredHelp")} />
-                </div>
-                <p className="text-xs text-muted-foreground">{t("products.feedLicenseRequiredHint")}</p>
-              </div>
-            )}
+            {needsGate && <p className="text-xs text-muted-foreground">{t("products.feedGateOnTypeChange")}</p>}
+            <div className="space-y-2">
+              <Label htmlFor="product-download-url">{t("products.downloadURL")}</Label>
+              <Input
+                id="product-download-url"
+                type="url"
+                inputMode="url"
+                placeholder="https://example.com/download"
+                value={downloadURL}
+                onChange={(e) => setDownloadURL(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">{t("products.downloadURLHint")}</p>
+            </div>
           </DialogBody>
           <DialogFooter>
             <Button type="button" variant="outline" onClick={onClose}>

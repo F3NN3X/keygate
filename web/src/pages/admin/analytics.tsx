@@ -49,7 +49,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { type TranslationKeys, useI18n } from "@/i18n"
 import type { AggregatedSnapshot, AnalyticsSnapshot } from "@/lib/api"
 import { admin } from "@/lib/api"
-import { formatDate } from "@/lib/utils"
+import { dateLocale, formatDate } from "@/lib/utils"
 
 function defaultFrom(): string {
   const d = new Date()
@@ -77,7 +77,7 @@ function snapshotPeriod(s: AnalyticsSnapshot | AggregatedSnapshot, granularity: 
   if (!raw) return "-"
   const d = new Date(raw)
   if (Number.isNaN(d.getTime())) return raw
-  const locale = document.documentElement.lang || navigator.language
+  const locale = dateLocale()
   switch (granularity) {
     case "monthly":
       return d.toLocaleDateString(locale, { year: "numeric", month: "2-digit" })

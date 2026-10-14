@@ -153,20 +153,21 @@ function CustomerDetailDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-3xl">
+      <DialogContent className="max-w-3xl h-[min(760px,85vh)]">
         <DialogHeader>
           <DialogTitle>{t("customers.detail")}</DialogTitle>
           <DialogDescription>{detail?.user?.email || t("common.loading")}</DialogDescription>
         </DialogHeader>
-        <DialogBody>
+        {/* Fixed height; the tab bar stays put and each tab scrolls. */}
+        <DialogBody className="flex flex-col overflow-hidden">
           {isLoading || !detail ? (
             <div className="space-y-4">
               <div className="h-24 bg-muted rounded-lg animate-pulse" />
               <div className="h-48 bg-muted rounded-lg animate-pulse" />
             </div>
           ) : (
-            <Tabs defaultValue="overview">
-              <TabsList>
+            <Tabs defaultValue="overview" className="flex min-h-0 flex-1 flex-col">
+              <TabsList className="shrink-0">
                 <TabsTrigger value="overview">{t("customers.overview")}</TabsTrigger>
                 <TabsTrigger value="licenses">{t("customers.licenses")}</TabsTrigger>
                 <TabsTrigger value="subscriptions">{t("customers.subscriptions")}</TabsTrigger>
@@ -174,7 +175,7 @@ function CustomerDetailDialog({
               </TabsList>
 
               {/* Overview Tab */}
-              <TabsContent value="overview">
+              <TabsContent value="overview" className="min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable]">
                 <div className="space-y-4">
                   {/* User info */}
                   <Card>
@@ -227,7 +228,7 @@ function CustomerDetailDialog({
               </TabsContent>
 
               {/* Licenses Tab */}
-              <TabsContent value="licenses">
+              <TabsContent value="licenses" className="min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable]">
                 {(detail.licenses || []).length === 0 ? (
                   <Card>
                     <CardContent className="py-8">
@@ -278,7 +279,7 @@ function CustomerDetailDialog({
               </TabsContent>
 
               {/* Subscriptions Tab */}
-              <TabsContent value="subscriptions">
+              <TabsContent value="subscriptions" className="min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable]">
                 {(detail.subscriptions || []).length === 0 ? (
                   <Card>
                     <CardContent className="py-8">
@@ -337,7 +338,7 @@ function CustomerDetailDialog({
               </TabsContent>
 
               {/* Activity Tab */}
-              <TabsContent value="activity">
+              <TabsContent value="activity" className="min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable]">
                 {(detail.recent_audit_logs || []).length === 0 ? (
                   <Card>
                     <CardContent className="py-8">

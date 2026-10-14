@@ -44,3 +44,42 @@ func TestSubscriptionEvent_PeriodEnd_BothShapes(t *testing.T) {
 		t.Fatalf("no period: got %d, want 0", e.PeriodEnd())
 	}
 }
+
+// ServiceEnd reads the billing period from the lines that bill the
+// subscription — its recurring charge and prorations, in either API
+// shape — and ignores other invoice items, whose service period (say a
+// year of support) is no licence period. Shapes as Stripe sends them.
+func TestInvoiceServiceEnd(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		want       int64
+	}{
+		{"legacy: subscription line, one-off year ignored", `{"period_end":100,"lines":{"data":[
+			{"type":"invoiceitem","proration":false,"period":{"end":36500}},
+			{"type":"subscription","period":{"end":3100}}]}}`, 3100},
+		{"basil: subscription_item_details, one-off year ignored", `{"period_end":100,"lines":{"data":[
+			{"parent":{"type":"invoice_item_details","invoice_item_details":{"proration":false}},"period":{"end":36500}},
+			{"parent":{"type":"subscription_item_details"},"period":{"end":3100}}]}}`, 3100},
+		{"legacy proration lines (type invoiceitem)", `{"period_end":100,"lines":{"data":[
+			{"type":"invoiceitem","proration":true,"period":{"end":3100}}]}}`, 3100},
+		{"pending proration invoice item (basil)", `{"period_end":100,"lines":{"data":[
+			{"parent":{"type":"invoice_item_details","invoice_item_details":{"proration":true}},"period":{"end":3100}}]}}`, 3100},
+		{"yearly → monthly: the unused-year credit is not paid service", `{"period_end":100,"lines":{"data":[
+			{"amount":-9000,"type":"invoiceitem","proration":true,"parent":{"type":"subscription_item_details"},"period":{"end":36500}},
+			{"amount":900,"type":"subscription","parent":{"type":"subscription_item_details"},"period":{"end":3100}}]}}`, 3100},
+		{"a zero line (100% coupon) still counts", `{"period_end":100,"lines":{"data":[
+			{"amount":0,"type":"subscription","period":{"end":3100}}]}}`, 3100},
+		{"only one-off items: the invoice period_end", `{"period_end":100,"lines":{"data":[
+			{"type":"invoiceitem","period":{"end":36500}}]}}`, 100},
+		{"no lines: the invoice period_end", `{"period_end":100}`, 100},
+		{"nothing set", `{}`, 0},
+	} {
+		var e invoiceEvent
+		if err := json.Unmarshal([]byte(tc.body), &e); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got := e.ServiceEnd(); got != tc.want {
+			t.Errorf("%s: ServiceEnd = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}

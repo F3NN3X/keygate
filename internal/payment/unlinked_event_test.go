@@ -49,7 +49,7 @@ func TestUnlinkedSubscriptionEventIsNotApplied(t *testing.T) {
 	canceled := time.Now()
 	inFlight.Status = model.StatusCanceled
 	inFlight.CanceledAt = &canceled
-	if h.applyLicenseFromSubscription(ctx, inFlight, "customer.subscription.deleted", "status", "canceled_at") {
+	if h.applyLicenseFromSubscription(ctx, inFlight, "customer.subscription.deleted", nil, "status", "canceled_at") {
 		t.Fatal("stale event reported as applied; the caller would then audit and dispatch a cancellation that never happened")
 	}
 
@@ -82,7 +82,7 @@ func TestUnlinkedSubscriptionEventIsNotApplied(t *testing.T) {
 		t.Fatalf("find second: %v", err)
 	}
 	live.Status = model.StatusCanceled
-	if !h.applyLicenseFromSubscription(ctx, live, "customer.subscription.deleted", "status") {
+	if !h.applyLicenseFromSubscription(ctx, live, "customer.subscription.deleted", nil, "status") {
 		t.Fatal("a licence still on its subscription was not written")
 	}
 	if reloaded, err := s.FindLicenseByID(ctx, lic2.ID); err != nil || reloaded.Status != model.StatusCanceled {
@@ -99,7 +99,7 @@ func TestEveryCallerChecksTheApplyResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read stripe.go: %v", err)
 	}
-	calls := regexp.MustCompile(`(?m)^(\s*)(.*)h\.applyLicenseFromSubscription\(`).FindAllStringSubmatch(string(src), -1)
+	calls := regexp.MustCompile(`(?m)^(\s*)(.*)h\.(?:applyLicenseFromSubscription|endLicenseFromSubscription)\(`).FindAllStringSubmatch(string(src), -1)
 	if len(calls) == 0 {
 		t.Fatal("no call sites found — did the helper get renamed?")
 	}

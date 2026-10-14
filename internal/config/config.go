@@ -152,7 +152,10 @@ func Load() (*Config, error) {
 
 	if admins := os.Getenv("ADMIN_EMAILS"); admins != "" {
 		for e := range strings.SplitSeq(admins, ",") {
-			cfg.AdminEmails = append(cfg.AdminEmails, strings.TrimSpace(e))
+			// User rows are keyed by the lower-cased address.
+			if e = strings.ToLower(strings.TrimSpace(e)); e != "" {
+				cfg.AdminEmails = append(cfg.AdminEmails, e)
+			}
 		}
 	}
 

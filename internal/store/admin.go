@@ -430,37 +430,186 @@ func (s *Store) RevokeLicense(ctx context.Context, id string) error {
 	return nil
 }
 
+// ErrLicenseNotSuspendable refuses to suspend a licence that is not in
+// use: suspending is for an active, trialing or past-due one. Above all
+// not a revoked one — reinstating would then hand back what was revoked.
+var ErrLicenseNotSuspendable = errors.New("only an active, trialing or past-due license can be suspended")
+
 func (s *Store) SuspendLicense(ctx context.Context, id string) error {
 	now := time.Now()
 	res, err := s.DB.NewUpdate().Model((*model.License)(nil)).
-		Set("status = ?, suspended_at = ?, updated_at = ?", model.StatusSuspended, now, now).
-		Where("id = ?", id).Exec(ctx)
-	if err != nil {
-		return err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("license not found")
-	}
-	_, _ = s.DB.NewRaw(`UPDATE subscriptions SET status = ?, updated_at = now() WHERE license_id = ?`, model.StatusSuspended, id).Exec(ctx)
-	return nil
-}
-
-func (s *Store) ReinstateLicense(ctx context.Context, id string) error {
-	res, err := s.DB.NewUpdate().Model((*model.License)(nil)).
-		Set("status = ?, suspended_at = NULL, canceled_at = NULL, updated_at = ?", model.StatusActive, time.Now()).
+		Set("status = ?, suspended_at = ?, suspended_by = ?, updated_at = ?", model.StatusSuspended, now, model.SuspendedByAdmin, now).
 		Where("id = ?", id).
-		Where("status IN ('suspended', 'expired', 'canceled')").
+		Where("status IN (?)", bun.In([]string{model.StatusActive, model.StatusTrialing, model.StatusPastDue})).
 		Exec(ctx)
 	if err != nil {
 		return err
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("license not found or cannot be reinstated from current status")
+		var exists bool
+		if err := s.DB.NewRaw("SELECT EXISTS (SELECT 1 FROM licenses WHERE id = ?)", id).Scan(ctx, &exists); err == nil && exists {
+			return ErrLicenseNotSuspendable
+		}
+		return fmt.Errorf("license not found")
 	}
-	_, _ = s.DB.NewRaw(`UPDATE subscriptions SET status = ?, updated_at = now() WHERE license_id = ?`, model.StatusActive, id).Exec(ctx)
+	_, _ = s.DB.NewRaw(`UPDATE subscriptions SET status = ?, updated_at = now() WHERE license_id = ?`, model.StatusSuspended, id).Exec(ctx)
 	return nil
+}
+
+// usableStatusSQL is the status a usable licence takes back: "trialing"
+// for a trial issued here, so the hourly trial sweep and the trial-ended
+// mail still apply to it, and "active" for everything else.
+//
+// A Stripe-billed licence is always "active". The plan's type says how
+// it started, not where it is now: a trial plan sold through Stripe goes
+// on to be paid while the plan stays "trial", and only Stripe knows
+// which side of that it is on. Its events move the licence from here —
+// the charge at the trial end, a failed payment, a cancellation — while
+// "trialing" would hand a paying customer to the trial sweep, which
+// expires without the grace period, and cost them the renewal reminder.
+const usableStatusSQL = `CASE WHEN COALESCE(licenses.stripe_subscription_id, '') = ''
+	AND (SELECT license_type FROM plans WHERE plans.id = licenses.plan_id) = 'trial'
+	THEN 'trialing' ELSE 'active' END`
+
+// ErrReinstateNeedsNewExpiry refuses to reinstate an expired or canceled
+// licence whose expiry date has passed: it would show as active, yet stay
+// unusable and be expired again by the next hourly sweep. Setting a new
+// expiry date reactivates it instead (SetLicenseValidUntil).
+var ErrReinstateNeedsNewExpiry = errors.New("this license's expiry date has passed — set a new expiry date instead, which reactivates it")
+
+// ReinstateLicense gives a suspended, expired or canceled licence back
+// and returns the status it now has. The licence and its subscription
+// row change in one transaction.
+func (s *Store) ReinstateLicense(ctx context.Context, id string) (string, error) {
+	var status string
+	err := RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		err := tx.NewRaw(`
+			UPDATE licenses SET status = `+usableStatusSQL+`,
+				suspended_at = NULL, suspended_by = NULL, canceled_at = NULL, updated_at = now()
+			WHERE id = ? AND (status = 'suspended' OR
+				(status IN ('expired', 'canceled') AND (valid_until IS NULL OR valid_until > now())))
+			RETURNING status`, id).Scan(ctx, &status)
+		if errors.Is(err, sql.ErrNoRows) {
+			var lapsed bool
+			if qerr := tx.NewRaw(`SELECT status IN ('expired', 'canceled') AND valid_until <= now()
+				FROM licenses WHERE id = ?`, id).Scan(ctx, &lapsed); qerr == nil && lapsed {
+				return ErrReinstateNeedsNewExpiry
+			}
+			return fmt.Errorf("license not found or cannot be reinstated from current status")
+		}
+		if err != nil {
+			return err
+		}
+		return syncSubscriptionStatus(ctx, tx, id, status)
+	})
+	return status, err
+}
+
+// SetLicenseValidUntil moves a licence's expiry and returns its status
+// before and after. An expired licence given a future (or no) expiry is
+// usable again, so it takes back the status of its plan. Every other
+// status is left alone: suspended, revoked and canceled are somebody's
+// decision about the licence, and a date edit must not undo them.
+//
+// The row is locked while the decision is made, so a concurrent
+// reinstate, suspend or expiry sweep cannot interleave with it.
+func (s *Store) SetLicenseValidUntil(ctx context.Context, id string, validUntil *time.Time) (prev, status string, err error) {
+	err = RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		var licenseType, stripeSub sql.NullString
+		if err := tx.NewRaw(`
+			SELECT l.status, p.license_type, l.stripe_subscription_id FROM licenses l
+			LEFT JOIN plans p ON p.id = l.plan_id
+			WHERE l.id = ? FOR UPDATE OF l`, id).Scan(ctx, &prev, &licenseType, &stripeSub); err != nil {
+			return err
+		}
+		// A trial issued here; a Stripe-billed licence's trial is
+		// Stripe's to run (see usableStatusSQL).
+		localTrial := licenseType.String == "trial" && stripeSub.String == ""
+		status = prev
+		if prev == model.StatusExpired && (validUntil == nil || validUntil.After(time.Now())) {
+			status = model.StatusActive
+			if localTrial {
+				status = model.StatusTrialing
+			}
+		}
+		if _, err := tx.NewRaw(`UPDATE licenses SET valid_until = ?, status = ?, updated_at = now() WHERE id = ?`,
+			validUntil, status, id).Exec(ctx); err != nil {
+			return err
+		}
+		// A trial's window is derived from the licence's deadline (see
+		// SyncLicenseSubscriptionIn), and the customer page shows it.
+		// Move it with the date so the two never disagree. Not for a
+		// Stripe-billed licence: a date set here does not move Stripe's
+		// trial, and on a paid one it would show a trial that is over.
+		if localTrial {
+			if _, err := tx.NewRaw(`
+				UPDATE subscriptions SET trial_end = ?, updated_at = now()
+				WHERE id = (SELECT id FROM subscriptions WHERE license_id = ? ORDER BY created_at DESC LIMIT 1)
+				  AND trial_start IS NOT NULL`, validUntil, id).Exec(ctx); err != nil {
+				return err
+			}
+		}
+		if status == prev {
+			return nil
+		}
+		return syncSubscriptionStatus(ctx, tx, id, status)
+	})
+	return prev, status, err
+}
+
+// ExpireLicenseIf marks a licence expired only while it still qualifies:
+// its status is one of statuses and, when before is set, its valid_until
+// is still earlier than before. The expiry sweeps read their candidates
+// first and write later. In between an admin may have extended or
+// reinstated the licence, and an unconditional write would undo that.
+// ok is false when the licence no longer qualified and nothing changed.
+func (s *Store) ExpireLicenseIf(ctx context.Context, id string, statuses []string, before *time.Time) (ok bool, err error) {
+	return s.expireLicenseWhere(ctx, id, func(q *bun.UpdateQuery) *bun.UpdateQuery {
+		q = q.Where("status IN (?)", bun.List(statuses))
+		if before != nil {
+			q = q.Where("valid_until IS NOT NULL AND valid_until < ?", *before)
+		}
+		return q
+	})
+}
+
+// ExpireStalePastDueLicenseIf is ExpireLicenseIf for the dunning sweep:
+// the licence must still be past_due, and past due since before the
+// threshold — a licence that was paid and fell past due again after the
+// sweep read it starts a fresh dunning clock.
+func (s *Store) ExpireStalePastDueLicenseIf(ctx context.Context, id string, threshold time.Time) (bool, error) {
+	return s.expireLicenseWhere(ctx, id, func(q *bun.UpdateQuery) *bun.UpdateQuery {
+		return q.Where("status = ?", model.StatusPastDue).
+			Where("COALESCE(past_due_at, updated_at) < ?", threshold)
+	})
+}
+
+func (s *Store) expireLicenseWhere(ctx context.Context, id string, cond func(*bun.UpdateQuery) *bun.UpdateQuery) (ok bool, err error) {
+	err = RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		q := cond(tx.NewUpdate().Model((*model.License)(nil)).
+			Set("status = ?", model.StatusExpired).
+			Set("updated_at = now()").
+			Where("id = ?", id))
+		res, err := q.Exec(ctx)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return nil
+		}
+		ok = true
+		return syncSubscriptionStatus(ctx, tx, id, model.StatusExpired)
+	})
+	return ok, err
+}
+
+// syncSubscriptionStatus mirrors a licence's new status onto its
+// subscription row, if it has one.
+func syncSubscriptionStatus(ctx context.Context, tx bun.Tx, licenseID, status string) error {
+	_, err := tx.NewRaw(`UPDATE subscriptions SET status = ?, updated_at = now() WHERE license_id = ? AND status != ?`,
+		status, licenseID, status).Exec(ctx)
+	return err
 }
 
 // ExportLicenses returns all licenses matching filters (no pagination).
@@ -584,6 +733,13 @@ func (s *Store) ListUsers(ctx context.Context, search string, offset, limit int)
 func (s *Store) DeleteActivationByID(ctx context.Context, id string) error {
 	_, err := s.DB.NewDelete().Model((*model.Activation)(nil)).Where("id = ?", id).Exec(ctx)
 	return err
+}
+
+// FindActivationByID loads one activation.
+func (s *Store) FindActivationByID(ctx context.Context, id string) (*model.Activation, error) {
+	a := new(model.Activation)
+	err := s.DB.NewSelect().Model(a).Where("id = ?", id).Scan(ctx)
+	return a, err
 }
 
 // GetActivationProductID resolves the product behind an activation

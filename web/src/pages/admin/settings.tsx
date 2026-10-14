@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { ArrowUpCircle, Check, RefreshCw, Send, Shield, Trash2, UserPlus } from "lucide-react"
 import { useEffect, useState } from "react"
+import { DEFAULT_REMINDER_DAYS, ReminderDaysInput } from "@/components/reminder-days-input"
 import { showToast } from "@/components/toast"
 import {
   AlertDialog,
@@ -54,6 +55,46 @@ const TIMEZONES = [
   { value: "Pacific/Auckland", label: "UTC +12:00", city: "Auckland" },
 ]
 
+// One switch per automated email an admin may turn off; mirrors
+// service.ToggleableEmails on the server. Grouped as the page shows them.
+const EMAIL_NOTIFY_GROUPS = [
+  { group: "reminders", kinds: ["license_expiring", "renewal_reminder", "updates_ending", "trial_ending"] },
+  {
+    group: "status",
+    kinds: ["license_expired", "trial_expired", "license_suspended", "subscription_canceled", "plan_changed"],
+  },
+  { group: "billing", kinds: ["payment_failed", "payment_recovered", "payment_action_required"] },
+  { group: "usage", kinds: ["quota_warning", "welcome"] },
+] as const
+
+type EmailNotifyKind = (typeof EMAIL_NOTIFY_GROUPS)[number]["kinds"][number]
+type EmailNotifyKey = `email_notify_${EmailNotifyKind}`
+const notifyKey = (kind: EmailNotifyKind): EmailNotifyKey => `email_notify_${kind}`
+// Derived from the groups, so a kind cannot be shown without being saved.
+const EMAIL_NOTIFY_KEYS: EmailNotifyKey[] = EMAIL_NOTIFY_GROUPS.flatMap((g) => g.kinds.map(notifyKey))
+
+// The webhook event fired alongside an email at the same moment, where
+// there is one: an install that turns the email off can send its own
+// from that event. (Not "subscription canceled": that mail goes out when
+// the customer cancels, license.canceled only when the period ends.)
+const EMAIL_NOTIFY_WEBHOOK: Partial<Record<EmailNotifyKind, string>> = {
+  license_expired: "license.expired",
+  trial_expired: "license.expired",
+  license_suspended: "license.suspended",
+  plan_changed: "plan.changed",
+  payment_failed: "license.payment_failed",
+  payment_recovered: "license.payment_recovered",
+  quota_warning: "quota.warning",
+}
+
+// What an unset key means, so undoing an edit leaves the form clean:
+// an email switch is on, the reminder days are the server's default.
+const SETTING_DEFAULTS: Partial<Record<string, string>> = {
+  expiry_reminder_days: DEFAULT_REMINDER_DAYS.join(","),
+  ...Object.fromEntries(EMAIL_NOTIFY_KEYS.map((k) => [k, "true"])),
+}
+const effective = (key: string, value: string | undefined) => (value ?? "") || (SETTING_DEFAULTS[key] ?? "")
+
 // The keys this form owns. Save posts only these: the settings table
 // also holds rows the server writes for itself (Stripe webhook
 // credentials) and secrets the API never returns, and PUTing the whole
@@ -84,6 +125,8 @@ const FORM_KEYS = [
   "cloudflare_from",
   "cloudflare_account_id",
   "cloudflare_api_token",
+  ...EMAIL_NOTIFY_KEYS,
+  "expiry_reminder_days",
 ] as const
 
 type FormKey = (typeof FORM_KEYS)[number]
@@ -106,7 +149,7 @@ export default function SettingsPage() {
     // would otherwise overwrite the whole form and silently discard any
     // field the admin has edited but not yet saved.
     setForm((prev) => {
-      const dirty = FORM_KEYS.some((k) => k in prev && prev[k] !== (data.settings[k] ?? ""))
+      const dirty = FORM_KEYS.some((k) => k in prev && effective(k, prev[k]) !== effective(k, data.settings[k]))
       return dirty ? prev : data.settings
     })
   }, [data])
@@ -118,7 +161,10 @@ export default function SettingsPage() {
   // incompatible build has since switched off.
   const changedSettings = () => {
     const changed = Object.fromEntries(
-      FORM_KEYS.filter((k) => k in form && form[k] !== (data?.settings?.[k] ?? "")).map((k) => [k, form[k]]),
+      FORM_KEYS.filter((k) => k in form && effective(k, form[k]) !== effective(k, data?.settings?.[k])).map((k) => [
+        k,
+        form[k],
+      ]),
     )
     // A fresh install shows "SMTP" via the fallback without writing it
     // into the form, so filling the SMTP fields and saving would send
@@ -502,6 +548,61 @@ export default function SettingsPage() {
               <p className="text-xs text-muted-foreground">
                 {emailDirty ? t("settings.testEmailDirtyHint") : t("settings.testEmailSaveHint")}
               </p>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">{t("settings.autoEmails")}</CardTitle>
+              <p className="text-sm text-muted-foreground">{t("settings.autoEmailsDesc")}</p>
+            </CardHeader>
+            <CardContent className="grid gap-6 sm:grid-cols-2">
+              {EMAIL_NOTIFY_GROUPS.map(({ group, kinds }) => (
+                <fieldset key={group} className="space-y-2">
+                  <legend className="mb-1 text-sm font-medium">{t(`settings.autoEmailsGroup.${group}`)}</legend>
+                  {kinds.map((kind) => {
+                    const key = notifyKey(kind)
+                    const enabled = form[key] !== "false"
+                    return (
+                      <div key={kind} className="space-y-2">
+                        <div className="flex items-center gap-3">
+                          <input
+                            type="checkbox"
+                            id={key}
+                            // Unset means on: only "false" turns an email off.
+                            checked={form[key] !== "false"}
+                            onChange={(e) => set(key, e.target.checked ? "true" : "false")}
+                            className="h-4 w-4 rounded border-input accent-primary"
+                          />
+                          <Label htmlFor={key} className="font-normal">
+                            {t(`settings.notify.${kind}`)}
+                          </Label>
+                          {EMAIL_NOTIFY_WEBHOOK[kind] && (
+                            <span
+                              className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
+                              title={EMAIL_NOTIFY_WEBHOOK[kind]}
+                            >
+                              webhook
+                            </span>
+                          )}
+                        </div>
+                        {/* When the expiry reminders go out belongs with
+                        their switch: editing it is pointless while off. */}
+                        {kind === "license_expiring" && (
+                          <div className="ml-7">
+                            <ReminderDaysInput
+                              value={form.expiry_reminder_days}
+                              onChange={(v) => set("expiry_reminder_days", v)}
+                              disabled={!enabled}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </fieldset>
+              ))}
+              <p className="text-xs text-muted-foreground sm:col-span-2">{t("settings.autoEmailsAlways")}</p>
             </CardContent>
           </Card>
         </TabsContent>

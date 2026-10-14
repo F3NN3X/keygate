@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/tabloy/keygate/internal/model"
+	"github.com/tabloy/keygate/internal/service"
 	"github.com/tabloy/keygate/internal/store"
 	"github.com/tabloy/keygate/pkg/response"
 )
@@ -27,11 +28,12 @@ import (
 // activation slots are taken, I can't activate the new machine".
 // Without self-service, that's a customer-support ticket every time.
 type PortalActivationsHandler struct {
-	store *store.Store
+	store   *store.Store
+	webhook *service.WebhookService
 }
 
-func NewPortalActivationsHandler(s *store.Store) *PortalActivationsHandler {
-	return &PortalActivationsHandler{store: s}
+func NewPortalActivationsHandler(s *store.Store, webhook *service.WebhookService) *PortalActivationsHandler {
+	return &PortalActivationsHandler{store: s, webhook: webhook}
 }
 
 // portalActivationView is the slimmed-down activation row exposed to
@@ -136,14 +138,14 @@ func (h *PortalActivationsHandler) Delete(c *gin.Context) {
 		response.Internal(c, err)
 		return
 	}
-	belongs := false
+	var removed *model.Activation
 	for _, a := range rows {
 		if a.ID == activationID {
-			belongs = true
+			removed = a
 			break
 		}
 	}
-	if !belongs {
+	if removed == nil {
 		response.NotFound(c, "activation not found")
 		return
 	}
@@ -163,6 +165,11 @@ func (h *PortalActivationsHandler) Delete(c *gin.Context) {
 		ActorType: "portal", ActorID: emailFromContext(c), IPAddress: c.ClientIP(),
 		Changes: map[string]any{"license_id": lic.ID, "via": "self_service"},
 	})
+	if h.webhook != nil {
+		h.webhook.Dispatch(c.Request.Context(), lic.ProductID, "license.deactivated", map[string]any{
+			"license_id": lic.ID, "identifier": removed.Identifier,
+		})
+	}
 	response.OK(c, gin.H{"status": "deleted"})
 }
 

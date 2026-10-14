@@ -15,6 +15,8 @@ func TestValidateEmail(t *testing.T) {
 		{"not-email", false},
 		{"@no-local.com", false},
 		{"no-at-sign", false},
+		{"Alice <alice@example.com>", false},          // display-name form
+		{" alice@example.com ", false},                // padded
 		{string(make([]byte, 255)) + "@x.com", false}, // too long
 	}
 	for _, tt := range tests {

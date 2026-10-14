@@ -620,7 +620,7 @@ func (s *Store) GetTopUsers(ctx context.Context, productID string, limit int) ([
 	var out []TopUser
 	q := s.DB.NewSelect().
 		TableExpr("licenses AS l").
-		ColumnExpr("l.email").
+		ColumnExpr("min(l.email) AS email").
 		ColumnExpr("COALESCE(l.user_id, '') AS user_id").
 		ColumnExpr("COUNT(DISTINCT l.id)::int AS license_count").
 		ColumnExpr("COUNT(DISTINCT l.id) FILTER (WHERE l.status = 'active')::int AS active_count").
@@ -629,8 +629,8 @@ func (s *Store) GetTopUsers(ctx context.Context, productID string, limit int) ([
 		Join("LEFT JOIN (SELECT license_id, SUM(quantity) AS total_usage FROM usage_events GROUP BY license_id) uc ON uc.license_id = l.id").
 		Join("LEFT JOIN activations a ON a.license_id = l.id").
 		// Exclude admin users from customer rankings
-		Where("l.email NOT IN (SELECT email FROM users WHERE role IN ('owner', 'admin'))").
-		GroupExpr("l.email, l.user_id").
+		Where("lower(l.email) NOT IN (SELECT email FROM users WHERE role IN ('owner', 'admin'))").
+		GroupExpr("lower(l.email), l.user_id").
 		OrderExpr("license_count DESC, total_usage DESC").
 		Limit(limit)
 	if productID != "" {
@@ -694,7 +694,7 @@ func (s *Store) GetUserDetail(ctx context.Context, userID string) (*UserDetail, 
 	err = s.DB.NewSelect().Model(&licenses).
 		Relation("Plan").Relation("Plan.Entitlements").
 		Relation("Product").Relation("Activations").Relation("Seats").
-		Where("license.user_id = ? OR license.email = ?", userID, user.Email).
+		Where("license.user_id = ? OR lower(license.email) = ?", userID, normalizeEmail(user.Email)).
 		OrderExpr("license.created_at DESC").
 		Scan(ctx)
 	if err != nil {
@@ -729,7 +729,7 @@ func (s *Store) GetUserDetail(ctx context.Context, userID string) (*UserDetail, 
 	}
 
 	sq := s.DB.NewSelect().TableExpr("seats").
-		Where("(user_id = ? OR email = ?)", userID, user.Email).
+		Where("(user_id = ? OR lower(email) = ?)", userID, normalizeEmail(user.Email)).
 		Where("removed_at IS NULL")
 	activeSeats, _ := sq.Count(ctx)
 	detail.ActiveSeats = activeSeats

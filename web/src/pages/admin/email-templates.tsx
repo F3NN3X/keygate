@@ -19,15 +19,32 @@ import { useI18n } from "@/i18n"
 import { admin } from "@/lib/api"
 
 const TEMPLATE_META: Record<string, { label: string; variables: string[] }> = {
-  license_created: { label: "License Created", variables: ["Product", "Plan", "LicenseKey"] },
-  license_expiring: { label: "License Expiring", variables: ["Product", "LicenseKey", "ExpiresAt"] },
-  updates_ending: { label: "Updates Ending", variables: ["Product", "LicenseKey", "UpdatesUntil"] },
-  license_expired: { label: "License Expired", variables: ["Product"] },
-  trial_expired: { label: "Trial Expired", variables: ["Product"] },
-  license_suspended: { label: "License Suspended", variables: ["Product", "Reason"] },
-  quota_warning: { label: "Quota Warning", variables: ["Product", "Feature", "Used", "Limit", "Pct"] },
-  seat_invite: { label: "Seat Invite", variables: ["Product", "Inviter"] },
-  payment_failed: { label: "Payment Failed", variables: ["Product"] },
+  // SiteName and PortalURL are available in every template (see
+  // EmailService.templateData); they are listed last on each.
+  license_created: {
+    label: "License Created",
+    variables: ["Product", "Plan", "LicenseKey", "DownloadURL", "SiteName", "PortalURL"],
+  },
+  license_expiring: {
+    label: "License Expiring",
+    variables: ["Product", "LicenseKey", "ExpiresAt", "DaysLeft", "IsTrial", "SiteName", "PortalURL"],
+  },
+  updates_ending: {
+    label: "Updates Ending",
+    variables: ["Product", "LicenseKey", "UpdatesUntil", "SiteName", "PortalURL"],
+  },
+  license_expired: { label: "License Expired", variables: ["Product", "SiteName", "PortalURL"] },
+  trial_expired: { label: "Trial Expired", variables: ["Product", "SiteName", "PortalURL"] },
+  license_suspended: { label: "License Suspended", variables: ["Product", "Reason", "SiteName", "PortalURL"] },
+  quota_warning: {
+    label: "Quota Warning",
+    variables: ["Product", "Feature", "Used", "Limit", "Pct", "SiteName", "PortalURL"],
+  },
+  seat_invite: {
+    label: "Seat Invite",
+    variables: ["Product", "Inviter", "InviteURL", "DownloadURL", "SiteName", "PortalURL"],
+  },
+  payment_failed: { label: "Payment Failed", variables: ["Product", "SiteName", "PortalURL"] },
 }
 
 const PREVIEW_DATA: Record<string, string> = {
@@ -42,6 +59,12 @@ const PREVIEW_DATA: Record<string, string> = {
   Pct: "80",
   Inviter: "admin@company.com",
   Reason: "Policy violation",
+  DaysLeft: "3",
+  IsTrial: "true",
+  DownloadURL: "https://example.com/download",
+  InviteURL: "https://licenses.example.com/accept-invite?token=…",
+  SiteName: "Acme Licensing",
+  PortalURL: "https://licenses.example.com/portal",
 }
 
 function fillTemplate(html: string): string {
@@ -49,8 +72,12 @@ function fillTemplate(html: string): string {
   for (const [k, v] of Object.entries(PREVIEW_DATA)) {
     result = result.replaceAll(`{{.${k}}}`, v)
   }
-  // Remove Go template conditionals for preview
-  result = result.replace(/\{\{if [^}]+\}\}/g, "").replace(/\{\{end\}\}/g, "")
+  // Preview the "true" side of each conditional: drop {{else}} branches,
+  // then the {{if}}/{{end}} markers (the defaults never nest them).
+  result = result
+    .replace(/\{\{else\}\}[\s\S]*?\{\{end\}\}/g, "")
+    .replace(/\{\{if [^}]+\}\}/g, "")
+    .replace(/\{\{end\}\}/g, "")
   return result
 }
 
@@ -217,7 +244,7 @@ export default function EmailTemplatesManager() {
 
       {/* Preview Dialog — uses sandboxed iframe for safe HTML rendering */}
       <Dialog open={!!previewing} onOpenChange={(open) => !open && setPreviewing(null)}>
-        <DialogContent className="max-w-2xl">
+        <DialogContent className="max-w-2xl h-[min(760px,85vh)]">
           <DialogHeader>
             <DialogTitle>
               {t("settings.templatePreview")}: {previewing && TEMPLATE_META[previewing]?.label}

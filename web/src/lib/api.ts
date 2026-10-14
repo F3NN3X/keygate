@@ -1,6 +1,35 @@
 const BASE = `${import.meta.env.VITE_API_URL || ""}/api/v1`
 
-async function request<T>(path: string, opts?: RequestInit): Promise<T> {
+// ServiceUnavailableError means the server could not be reached or could
+// not answer right now: a network failure, a 429 or a 5xx — including a
+// session renewal that failed for one of those reasons. The user may
+// well still be signed in, so it must never be read as a sign-out; the
+// auth layer retries instead (see AuthProvider).
+export class ServiceUnavailableError extends Error {}
+
+type RefreshOutcome = "ok" | "denied" | "unavailable"
+
+// The session cookie lives 24 hours; the refresh cookie 30 days. When a
+// call comes back 401, renew the session once and retry it. Only one
+// refresh runs per page at a time: the server rotates the refresh token
+// on every use, so parallel calls would present the same token twice.
+// (The server also tolerates a just-rotated token for a few seconds,
+// which covers several tabs renewing at the same moment.)
+let refreshing: Promise<RefreshOutcome> | null = null
+
+function refreshSession(): Promise<RefreshOutcome> {
+  refreshing ??= fetch(`${BASE}/auth/refresh`, { method: "POST", credentials: "include" })
+    // Only 401/403 mean the refresh cookie is no good. A 429 (shared
+    // rate limit) or a 5xx is a hiccup: the user is still signed in.
+    .then((r): RefreshOutcome => (r.ok ? "ok" : r.status === 401 || r.status === 403 ? "denied" : "unavailable"))
+    .catch((): RefreshOutcome => "unavailable")
+    .finally(() => {
+      refreshing = null
+    })
+  return refreshing
+}
+
+async function request<T>(path: string, opts?: RequestInit, retried = false): Promise<T> {
   let res: Response
   try {
     res = await fetch(BASE + path, {
@@ -13,10 +42,26 @@ async function request<T>(path: string, opts?: RequestInit): Promise<T> {
     // a TypeError here; we surface a friendly message instead of
     // "Failed to fetch" which is meaningless to end users.
     const reason = e instanceof Error ? e.message : String(e)
-    throw new Error(`Network error: ${reason}. Is the server reachable?`)
+    throw new ServiceUnavailableError(`Network error: ${reason}. Is the server reachable?`)
   }
 
-  // Handle session expiry: redirect to login on 401
+  // Session expired: renew it and retry the call once. Auth endpoints
+  // answer 401 for their own reasons (a wrong code, no refresh cookie),
+  // so they are not retried — that would mask the error or loop. Logout
+  // is the exception: it needs a live session to revoke the refresh
+  // token, and if it fails the login page would silently renew the
+  // session and sign the user straight back in.
+  const renewable = !path.startsWith("/auth/") || path === "/auth/logout"
+  if (res.status === 401 && !retried && renewable) {
+    const outcome = await refreshSession()
+    if (outcome === "ok") return request<T>(path, opts, true)
+    if (outcome === "unavailable") {
+      // Not a sign-out: the session may well still be renewable.
+      throw new ServiceUnavailableError("Could not renew your session right now. Check your connection and try again.")
+    }
+  }
+
+  // Could not renew: redirect to login
   if (res.status === 401) {
     // Don't redirect if already on login page or fetching auth state
     if (!window.location.pathname.startsWith("/login") && path !== "/portal/me") {
@@ -47,7 +92,9 @@ async function request<T>(path: string, opts?: RequestInit): Promise<T> {
       (typeof json?.error === "string" ? json.error : null) ||
       (raw && raw.length < 200 ? raw : null) ||
       `Request failed (${res.status}${res.statusText ? ` ${res.statusText}` : ""})`
-    throw new Error(msg)
+    // A 429 or 5xx says nothing about the session: the server is busy or
+    // failing. Callers that decide "signed in or not" must tell it apart.
+    throw res.status === 429 || res.status >= 500 ? new ServiceUnavailableError(msg) : new Error(msg)
   }
   return (json?.data !== undefined ? json.data : json) as T
 }
@@ -75,6 +122,19 @@ export const site = {
 }
 
 // ─── Auth ───
+// First run setup. Public: the server refuses initialize once an owner exists.
+export const setup = {
+  status: () => get<{ needed: boolean; step: string }>("/setup/status"),
+  initialize: (body: {
+    admin_name: string
+    admin_email: string
+    site_name: string
+    product_name: string
+    product_slug: string
+    product_type: "desktop" | "saas" | "hybrid"
+  }) => post<{ user: unknown; product: unknown; plan: unknown }>("/setup/initialize", body),
+}
+
 export const auth = {
   me: () =>
     get<{ id: string; email: string; name: string; avatar_url: string; is_admin: boolean; role: string }>("/portal/me"),
@@ -172,8 +232,13 @@ export const admin = {
   listProducts: (params?: { search?: string; type?: string; limit?: number; offset?: number }) =>
     get<Paged<{ products: Product[] }>>(`/admin/products?${listQuery(params)}`),
   getProduct: (id: string) => get<Product>(`/admin/products/${id}`),
-  createProduct: (data: { name: string; slug: string; type: string; feed_license_required?: boolean }) =>
-    post<Product>("/admin/products", data),
+  createProduct: (data: {
+    name: string
+    slug: string
+    type: string
+    feed_license_required?: boolean
+    download_url?: string
+  }) => post<Product>("/admin/products", data),
   updateProduct: (id: string, data: Partial<Product>) => put<Product>(`/admin/products/${id}`, data),
   deleteProduct: (id: string) => del(`/admin/products/${id}`),
 
@@ -224,7 +289,10 @@ export const admin = {
   },
   // The licence keeps its own shape; only the key is gone, replaced by
   // a last-four hint.
-  getLicense: (id: string) => get<License & { license_key_hint: string }>(`/admin/licenses/${id}`),
+  getLicense: (id: string) =>
+    get<License & { license_key_hint: string; key_usable: boolean; key_unusable_reason?: string }>(
+      `/admin/licenses/${id}`,
+    ),
   // The key is never in a list or detail payload — one explicit
   // request per key, audited server-side.
   revealLicenseKey: (id: string) => get<{ license_key: string }>(`/admin/licenses/${id}/key`),
@@ -509,6 +577,8 @@ export const admin = {
       body: JSON.stringify({ note }),
     }),
   publicKeyURL: (productId: string) => `${BASE}/admin/products/${productId}/signing-key/public.pem`,
+  tauriPublicKey: (productId: string) =>
+    get<{ pubkey: string }>(`/admin/products/${productId}/signing-key/tauri-pubkey`),
 }
 
 // ─── Types ───
@@ -534,6 +604,8 @@ export interface Product {
   // Update feeds answer only with a license key (maintenance-period products).
   feed_license_required?: boolean
   feed_gated_at?: string
+  /** Vendor's download page, used as {{.DownloadURL}} in emails. */
+  download_url?: string
   created_at: string
 }
 
@@ -949,6 +1021,8 @@ export interface ReleaseArtifact {
   id: string
   release_id: string
   platform: string
+  /** Name the file had when uploaded; empty for older artifacts. */
+  filename?: string
   file_key: string
   file_size: number
   sha256: string

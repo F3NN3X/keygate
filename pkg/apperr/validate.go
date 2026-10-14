@@ -2,6 +2,7 @@ package apperr
 
 import (
 	"net/mail"
+	"net/url"
 	"regexp"
 	"strings"
 
@@ -46,6 +47,11 @@ func ValidateEmail(email string) *AppError {
 	if !strings.Contains(addr.Address, "@") {
 		return BadRequest("invalid email format")
 	}
+	// ParseAddress also accepts "Name <a@b.c>" and padding; the stored
+	// value must be the bare address, or no lookup would ever match it.
+	if addr.Address != email {
+		return BadRequest("invalid email format: use a bare address such as name@example.com")
+	}
 	return nil
 }
 
@@ -89,6 +95,19 @@ func ValidateURL(value string) *AppError {
 	}
 	if !strings.HasPrefix(value, "https://") && !strings.HasPrefix(value, "http://") {
 		return &AppError{Status: 400, Code: "INVALID_INPUT", Message: "url must start with https:// or http://"}
+	}
+	return nil
+}
+
+// ValidateHTTPURL checks an absolute http(s) URL, such as a page linked
+// from an email. Callers decide whether empty is allowed.
+func ValidateHTTPURL(field, raw string) *AppError {
+	if len(raw) > 2048 {
+		return BadRequest(field + " is too long (max 2048 characters)")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return BadRequest(field + " must be a full http(s) URL, such as https://example.com/download")
 	}
 	return nil
 }

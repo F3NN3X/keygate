@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html/template"
 	"log/slog"
 	"net/http"
 	"slices"
@@ -441,10 +440,19 @@ func (h *AdminHandler) CreateProduct(c *gin.Context) {
 		// the gate takes effect at once and no drain has to be waited
 		// out. Doing it later works too, and then it does.
 		FeedLicenseRequired bool `json:"feed_license_required"`
+		// DownloadURL: optional page for {{.DownloadURL}} in emails.
+		DownloadURL string `json:"download_url"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "name, slug, and type are required")
 		return
+	}
+	req.DownloadURL = strings.TrimSpace(req.DownloadURL)
+	if req.DownloadURL != "" {
+		if err := apperr.ValidateHTTPURL("download_url", req.DownloadURL); err != nil {
+			response.BadRequest(c, err.Message)
+			return
+		}
 	}
 	if req.Type != "desktop" && req.Type != "saas" && req.Type != "hybrid" {
 		response.BadRequest(c, "type must be desktop, saas, or hybrid")
@@ -466,7 +474,8 @@ func (h *AdminHandler) CreateProduct(c *gin.Context) {
 		return
 	}
 
-	p := &model.Product{Name: req.Name, Slug: req.Slug, Type: req.Type, FeedLicenseRequired: req.FeedLicenseRequired}
+	p := &model.Product{Name: req.Name, Slug: req.Slug, Type: req.Type, FeedLicenseRequired: req.FeedLicenseRequired,
+		DownloadURL: req.DownloadURL}
 	if err := h.Store.CreateProduct(c, p); err != nil {
 		response.Err(c, http.StatusConflict, "DUPLICATE", "product slug already exists")
 		return
@@ -497,6 +506,7 @@ func (h *AdminHandler) UpdateProduct(c *gin.Context) {
 		MinimumSupportedMessage *string `json:"minimum_supported_message"`
 		RequireSigning          *bool   `json:"require_signing"`
 		FeedLicenseRequired     *bool   `json:"feed_license_required"`
+		DownloadURL             *string `json:"download_url"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "invalid request body")
@@ -589,9 +599,35 @@ func (h *AdminHandler) UpdateProduct(c *gin.Context) {
 		p.MinimumSupportedMessage = msg
 		cols = append(cols, "minimum_supported_message")
 	}
+	// The message explains the floor and means nothing without one. A
+	// message sent where no floor will be set is refused rather than
+	// dropped, so the caller learns it did not take.
+	if req.MinimumSupportedMessage != nil && strings.TrimSpace(*req.MinimumSupportedMessage) != "" && p.MinimumSupportedVersion == "" {
+		response.BadRequest(c, "minimum_supported_message needs a minimum_supported_version: set the version in the same request, or keep the one already set")
+		return
+	}
+	// Turning the floor off clears its message, so a later floor never
+	// shows a message written for an earlier one.
+	if p.MinimumSupportedVersion == "" && p.MinimumSupportedMessage != "" {
+		p.MinimumSupportedMessage = ""
+		if !slices.Contains(cols, "minimum_supported_message") {
+			cols = append(cols, "minimum_supported_message")
+		}
+	}
 	if req.RequireSigning != nil {
 		p.RequireSigning = *req.RequireSigning
 		cols = append(cols, "require_signing")
+	}
+	if req.DownloadURL != nil {
+		v := strings.TrimSpace(*req.DownloadURL)
+		if v != "" {
+			if err := apperr.ValidateHTTPURL("download_url", v); err != nil {
+				response.BadRequest(c, err.Message)
+				return
+			}
+		}
+		p.DownloadURL = v
+		cols = append(cols, "download_url")
 	}
 	wasGated, wasReleases := p.FeedLicenseRequired, model.ProductSupports(prevType, model.CapReleases)
 	// gatingNow marks a request that switches the gate on. The instant
@@ -724,6 +760,10 @@ func (h *AdminHandler) UpdateProduct(c *gin.Context) {
 		response.Conflict(c, waiting.code, waiting.message, waiting.details)
 		return
 	}
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "product", EntityID: p.ID, Action: "updated",
+		ActorType: "admin", ActorID: adminID(c),
+	})
 	response.OK(c, p)
 }
 
@@ -1341,6 +1381,10 @@ func (h *AdminHandler) UpdatePlan(c *gin.Context) {
 		response.Internal(c, err)
 		return
 	}
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "plan", EntityID: p.ID, Action: "updated",
+		ActorType: "admin", ActorID: adminID(c),
+	})
 	response.OK(c, p)
 }
 
@@ -1436,6 +1480,10 @@ func (h *AdminHandler) DeletePlan(c *gin.Context) {
 		response.Internal(c, err)
 		return
 	}
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "plan", EntityID: id, Action: "deleted",
+		ActorType: "admin", ActorID: adminID(c),
+	})
 	response.NoContent(c)
 }
 
@@ -1493,6 +1541,11 @@ func (h *AdminHandler) CreateEntitlement(c *gin.Context) {
 		response.Err(c, http.StatusConflict, "DUPLICATE", "entitlement already exists for this plan and feature")
 		return
 	}
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "entitlement", EntityID: e.ID, Action: "created",
+		ActorType: "admin", ActorID: adminID(c),
+		Changes: map[string]any{"plan_id": e.PlanID, "feature": e.Feature, "value": e.Value},
+	})
 	response.Created(c, e)
 }
 
@@ -1616,6 +1669,11 @@ func (h *AdminHandler) UpdateEntitlement(c *gin.Context) {
 		response.Internal(c, err)
 		return
 	}
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "entitlement", EntityID: e.ID, Action: "updated",
+		ActorType: "admin", ActorID: adminID(c),
+		Changes: map[string]any{"feature": e.Feature, "value": e.Value},
+	})
 	response.OK(c, e)
 }
 
@@ -1624,6 +1682,10 @@ func (h *AdminHandler) DeleteEntitlement(c *gin.Context) {
 		response.Internal(c, err)
 		return
 	}
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "entitlement", EntityID: c.Param("id"), Action: "deleted",
+		ActorType: "admin", ActorID: adminID(c),
+	})
 	response.NoContent(c)
 }
 
@@ -1828,7 +1890,7 @@ var licenseSortColumns = map[string]sortCol{
 	// column sends asc for the same reason; leaving the two disagreeing
 	// would mean a direct API caller got the opposite answer.
 	"valid_until": {Expr: "license.valid_until"},
-	"email":       {Expr: "license.email"},
+	"email":       {Expr: "lower(license.email)"}, // case-insensitive, like every email lookup
 	"status":      {Expr: "license.status"},
 	"product":     {Expr: "product.name"},
 	"plan":        {Expr: "plan.name"},
@@ -1896,7 +1958,11 @@ func (h *AdminHandler) GetLicense(c *gin.Context) {
 	// deliberate break here is that license_key is gone. The hint
 	// rides alongside them; the key itself is one explicit request
 	// away via RevealLicenseKey.
-	response.OK(c, licenseWithHint{License: l, LicenseKeyHint: h.licenseKeyHint(l)})
+	out := licenseWithHint{License: l, LicenseKeyHint: h.licenseKeyHint(l), KeyUsable: true}
+	if err := service.LicenseUsable(l); err != nil {
+		out.KeyUsable, out.KeyUnusableReason = false, apperrCode(err)
+	}
+	response.OK(c, out)
 }
 
 func (h *AdminHandler) CreateLicense(c *gin.Context) {
@@ -1917,6 +1983,8 @@ func (h *AdminHandler) CreateLicense(c *gin.Context) {
 		return
 	}
 
+	// Kept as typed otherwise (lookups ignore case), but never padded.
+	req.Email = strings.TrimSpace(req.Email)
 	if appErr := apperr.ValidateEmail(req.Email); appErr != nil {
 		response.BadRequest(c, appErr.Message)
 		return
@@ -2053,11 +2121,11 @@ func (h *AdminHandler) CreateLicense(c *gin.Context) {
 	// is logged inside SendLicenseCreated but doesn't fail the API call —
 	// the license is already persisted, and admin can resend manually.
 	if h.Email != nil {
-		productName := ""
+		productName, downloadURL := "", ""
 		if prod, err := h.Store.FindProductByID(c, l.ProductID); err == nil {
-			productName = prod.Name
+			productName, downloadURL = prod.Name, prod.DownloadURL
 		}
-		h.Email.SendLicenseCreated(req.Email, productName, plan.Name, l.LicenseKey)
+		h.Email.SendLicenseCreated(req.Email, productName, plan.Name, l.LicenseKey, downloadURL)
 	}
 
 	// The key is returned exactly here: the admin explicitly created
@@ -2080,6 +2148,21 @@ type licenseWithKey struct {
 type licenseWithHint struct {
 	*model.License
 	LicenseKeyHint string `json:"license_key_hint"`
+	// KeyUsable says whether the key works right now (the activation
+	// rule); KeyUnusableReason is its error code when not. The admin UI
+	// offers to resend the key only when it works.
+	KeyUsable         bool   `json:"key_usable"`
+	KeyUnusableReason string `json:"key_unusable_reason,omitempty"`
+}
+
+// apperrCode is the machine-readable code of an apperr error, or
+// "LICENSE_INVALID" for any other.
+func apperrCode(err error) string {
+	var ae *apperr.AppError
+	if errors.As(err, &ae) {
+		return ae.Code
+	}
+	return "LICENSE_INVALID"
 }
 
 // licenseKeyHint is the last four characters of a key — a row label,
@@ -2161,6 +2244,14 @@ func (h *AdminHandler) ResendLicenseEmail(c *gin.Context) {
 			"this license has no email address on file")
 		return
 	}
+	// Only a key that works goes out — the rule activation applies. The
+	// mail tells the customer their licence is ready, and a revoked or
+	// suspended licence's key must not be posted at all.
+	if err := service.LicenseUsable(l); err != nil {
+		response.Err(c, http.StatusConflict, "LICENSE_NOT_USABLE",
+			"this license's key does not work right now ("+apperrCode(err)+"), so it is not sent")
+		return
+	}
 	if h.Email == nil || !h.Email.IsConfigured() {
 		response.Err(c, http.StatusConflict, "SMTP_NOT_CONFIGURED",
 			"SMTP is not configured on this server, so no mail can be sent")
@@ -2176,14 +2267,14 @@ func (h *AdminHandler) ResendLicenseEmail(c *gin.Context) {
 		return
 	}
 
-	productName, planName := "", ""
+	productName, planName, downloadURL := "", "", ""
 	if l.Product != nil {
-		productName = l.Product.Name
+		productName, downloadURL = l.Product.Name, l.Product.DownloadURL
 	}
 	if l.Plan != nil {
 		planName = l.Plan.Name
 	}
-	subject, body := h.Email.RenderLicenseCreated(productName, planName, key)
+	subject, body := h.Email.RenderLicenseCreated(productName, planName, key, downloadURL)
 	if err := h.Store.EnqueueEmail(c, l.Email, subject, body); err != nil {
 		response.Err(c, http.StatusInternalServerError, "EMAIL_QUEUE_FAILED",
 			"could not queue the email")
@@ -2277,6 +2368,10 @@ func (h *AdminHandler) SuspendLicense(c *gin.Context) {
 		return
 	}
 	if err := h.Store.SuspendLicense(c, id); err != nil {
+		if errors.Is(err, store.ErrLicenseNotSuspendable) {
+			response.Conflict(c, "LICENSE_NOT_SUSPENDABLE", err.Error(), nil)
+			return
+		}
 		response.NotFound(c, err.Error())
 		return
 	}
@@ -2306,29 +2401,36 @@ func (h *AdminHandler) ReinstateLicense(c *gin.Context) {
 	if !h.checkLicenseScope(c, id) {
 		return
 	}
-	if err := h.Store.ReinstateLicense(c, id); err != nil {
+	status, err := h.Store.ReinstateLicense(c, id)
+	if errors.Is(err, store.ErrReinstateNeedsNewExpiry) {
+		response.Conflict(c, "EXPIRY_PASSED", err.Error(), nil)
+		return
+	}
+	if err != nil {
 		response.BadRequest(c, err.Error())
 		return
 	}
 	h.Store.Audit(c, &model.AuditLog{
 		Entity: "license", EntityID: id, Action: "reinstated",
 		ActorType: "admin", ActorID: adminID(c),
+		Changes: map[string]any{"status": status},
 	})
 	if h.Webhook != nil {
 		if lic, err := h.Store.FindLicenseByID(c, id); err == nil {
 			h.Webhook.Dispatch(c, lic.ProductID, "license.reinstated", map[string]any{
-				"license_id": id, "email": lic.Email,
+				"license_id": id, "email": lic.Email, "status": status,
 			})
 		}
 	}
-	response.OK(c, gin.H{"status": "active"})
+	response.OK(c, gin.H{"status": status})
 }
 
 // SetLicenseValidUntil sets or clears a license's expiry date. An
-// empty valid_until makes the license perpetual. Extending an
-// already-expired license does not change its status — use
-// /reinstate for that (the two concerns stay separate so an
-// accidental date edit can't silently re-arm a revoked customer).
+// empty valid_until makes the license perpetual. An expired license
+// given a future (or no) expiry is usable again and takes back its
+// plan's status: "trialing" on a trial plan, "active" otherwise.
+// Suspended, revoked and canceled licenses keep their status — those
+// are deliberate decisions, and only /reinstate undoes them.
 func (h *AdminHandler) SetLicenseValidUntil(c *gin.Context) {
 	id := c.Param("id")
 	if !h.checkLicenseScope(c, id) {
@@ -2383,16 +2485,22 @@ func (h *AdminHandler) SetLicenseValidUntil(c *gin.Context) {
 		validUntil = &ts
 	}
 
-	lic.ValidUntil = validUntil
-	if err := h.Store.UpdateLicense(c, lic, "valid_until"); err != nil {
+	prevStatus, status, err := h.Store.SetLicenseValidUntil(c, id, validUntil)
+	if err != nil {
 		response.Internal(c, err)
 		return
 	}
+	lic.ValidUntil, lic.Status = validUntil, status
+	reactivated := status != prevStatus
 
+	changes := map[string]any{"valid_until": req.ValidUntil}
+	if reactivated {
+		changes["status"] = map[string]any{"from": prevStatus, "to": status}
+	}
 	h.Store.Audit(c, &model.AuditLog{
 		Entity: "license", EntityID: id, Action: "valid_until_changed",
 		ActorType: "admin", ActorID: adminID(c),
-		Changes: map[string]any{"valid_until": req.ValidUntil},
+		Changes: changes,
 	})
 	if h.Webhook != nil {
 		// null valid_until means perpetual — send it explicitly so an
@@ -2402,6 +2510,12 @@ func (h *AdminHandler) SetLicenseValidUntil(c *gin.Context) {
 			payload["valid_until"] = validUntil.Format(time.RFC3339)
 		}
 		h.Webhook.Dispatch(c, lic.ProductID, "license.expiry_changed", payload)
+		// It received license.expired; tell it the licence is back.
+		if reactivated {
+			h.Webhook.Dispatch(c, lic.ProductID, "license.reinstated", map[string]any{
+				"license_id": id, "email": lic.Email, "status": status,
+			})
+		}
 	}
 	response.OK(c, lic)
 }
@@ -2637,9 +2751,24 @@ func (h *AdminHandler) DeleteActivation(c *gin.Context) {
 	if !requireKeyProductScope(c, pid) {
 		return
 	}
+	act, err := h.Store.FindActivationByID(c, id)
+	if err != nil {
+		response.NotFound(c, "activation not found")
+		return
+	}
 	if err := h.Store.DeleteActivationByID(c, id); err != nil {
 		response.Internal(c, err)
 		return
+	}
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "activation", EntityID: id, Action: "deleted",
+		ActorType: "admin", ActorID: adminID(c),
+		Changes: map[string]any{"license_id": act.LicenseID, "identifier": act.Identifier},
+	})
+	if h.Webhook != nil {
+		h.Webhook.Dispatch(c, pid, "license.deactivated", map[string]any{
+			"license_id": act.LicenseID, "identifier": act.Identifier,
+		})
 	}
 	response.NoContent(c)
 }
@@ -3043,6 +3172,10 @@ func (h *AdminHandler) CreateAddon(c *gin.Context) {
 		response.Err(c, 409, "DUPLICATE", "addon slug already exists for this product")
 		return
 	}
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "addon", EntityID: a.ID, Action: "created",
+		ActorType: "admin", ActorID: adminID(c),
+	})
 	response.Created(c, a)
 }
 
@@ -3142,6 +3275,10 @@ func (h *AdminHandler) UpdateAddon(c *gin.Context) {
 		response.Internal(c, err)
 		return
 	}
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "addon", EntityID: a.ID, Action: "updated",
+		ActorType: "admin", ActorID: adminID(c),
+	})
 	response.OK(c, a)
 }
 
@@ -3150,6 +3287,10 @@ func (h *AdminHandler) DeleteAddon(c *gin.Context) {
 		response.Internal(c, err)
 		return
 	}
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "addon", EntityID: c.Param("id"), Action: "deleted",
+		ActorType: "admin", ActorID: adminID(c),
+	})
 	response.NoContent(c)
 }
 
@@ -3170,6 +3311,11 @@ func (h *AdminHandler) AddLicenseAddon(c *gin.Context) {
 		response.Internal(c, err)
 		return
 	}
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "license", EntityID: id, Action: "addon_added",
+		ActorType: "admin", ActorID: adminID(c),
+		Changes: map[string]any{"addon_id": req.AddonID},
+	})
 	response.Created(c, la)
 }
 
@@ -3182,6 +3328,11 @@ func (h *AdminHandler) RemoveLicenseAddon(c *gin.Context) {
 		response.Internal(c, err)
 		return
 	}
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "license", EntityID: id, Action: "addon_removed",
+		ActorType: "admin", ActorID: adminID(c),
+		Changes: map[string]any{"addon_id": c.Param("addon_id")},
+	})
 	response.NoContent(c)
 }
 
@@ -3502,6 +3653,7 @@ var settingsWritable = map[string]bool{
 	"rate_limit_api": true, "rate_limit_admin": true,
 	"webhook_max_attempts": true, "webhook_timeout": true,
 	"quota_warning_threshold":          true,
+	service.ReminderDaysSetting:        true,
 	"setup_complete":                   true,
 	"maintenance_features_enabled":     true,
 	"feed_url_ttl_bound":               true,
@@ -3527,6 +3679,17 @@ var settingsWritable = map[string]bool{
 	"cloudflare_from":       true,
 	"cloudflare_account_id": true,
 	"cloudflare_api_token":  true, // secret (see settingsSecret)
+}
+
+// The on/off switch of every automated email an admin may turn off
+// (service.ToggleableEmails) is writable, and only as "true" or "false"
+// so a typo cannot silently leave a switch in an unknown state.
+func init() {
+	for _, kind := range service.ToggleableEmails {
+		key := service.NotifySettingKey(kind)
+		settingsWritable[key] = true
+		settingsEnum[key] = []string{"true", "false"}
+	}
 }
 
 // settingsSecret lists keys that can be written but never read back.
@@ -3736,6 +3899,18 @@ func (h *AdminHandler) UpdateSettings(c *gin.Context) {
 		writes[store.SettingFeedURLTTLBound] = d.String()
 	}
 
+	// Reminder days are stored normalised ("7,3,1"): whole days 1–90,
+	// deduplicated, largest first. A bad list is refused here rather
+	// than read back as the default at send time, where nobody sees it.
+	if v, ok := writes[service.ReminderDaysSetting]; ok {
+		days, err := service.ParseReminderDays(v)
+		if err != nil {
+			response.BadRequest(c, err.Error())
+			return
+		}
+		writes[service.ReminderDaysSetting] = service.FormatReminderDays(days)
+	}
+
 	// A custom email template that does not parse is not rejected by
 	// anything downstream: the renderer gives up and mails the
 	// template source, so the customer receives "{{.LicenseKey}}"
@@ -3744,7 +3919,9 @@ func (h *AdminHandler) UpdateSettings(c *gin.Context) {
 		if !strings.HasPrefix(key, "email_template_") || value == "" {
 			continue
 		}
-		if _, err := template.New(key).Parse(value); err != nil {
+		// Rendered once with sample values, not only parsed: html/template
+		// rejects some templates only when executed.
+		if err := service.ValidateTemplate(value); err != nil {
 			response.BadRequest(c, key+" is not a valid template: "+err.Error())
 			return
 		}

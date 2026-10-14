@@ -11,7 +11,7 @@ import (
 const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 // GenerateKey creates a high-entropy license key: PREFIX-XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX
-// 32 random chars from 31-char alphabet = ~155 bits of entropy.
+// 32 random chars from a 32-char alphabet = 160 bits of entropy.
 func GenerateKey(prefix string) string {
 	if prefix == "" {
 		prefix = "KG"
@@ -35,16 +35,18 @@ func normalizeKey(key string) string {
 }
 
 func randomSegment(n int) string {
-	// Use rejection sampling to avoid modulo bias.
-	// 248 is the largest multiple of 31 that fits in a byte (31*8=248).
-	const maxUnbiased = 248
+	// Rejection sampling avoids modulo bias: only byte values below the
+	// largest multiple of the alphabet length are used. With the current
+	// 32 characters that is every byte, but the bound follows the
+	// alphabet so a change to it cannot bring the bias back.
+	const maxUnbiased = 256 - 256%len(alphabet)
 	out := make([]byte, n)
 	buf := make([]byte, 1)
 	for i := 0; i < n; {
 		if _, err := rand.Read(buf); err != nil {
 			panic(fmt.Sprintf("crypto/rand: %v", err))
 		}
-		if buf[0] >= maxUnbiased {
+		if int(buf[0]) >= maxUnbiased {
 			continue // reject biased values
 		}
 		out[i] = alphabet[buf[0]%byte(len(alphabet))]

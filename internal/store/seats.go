@@ -273,7 +273,9 @@ func (s *Store) AcceptSeatInvite(ctx context.Context, plainToken string) (*model
 	// identity. AddSeat now lowercases incoming emails, so the
 	// inserted seat.Email is already canonical.
 	user := new(model.User)
-	err = tx.NewSelect().Model(user).Where("LOWER(email) = ?", seat.Email).Scan(ctx)
+	// User rows are stored lower-cased (see normalizeEmail), so a plain
+	// comparison is exact and uses users_email_key.
+	err = tx.NewSelect().Model(user).Where("email = ?", normalizeEmail(seat.Email)).Scan(ctx)
 	if errors.Is(err, sql.ErrNoRows) {
 		user.ID = newID()
 		user.Email = seat.Email

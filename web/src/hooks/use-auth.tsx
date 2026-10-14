@@ -1,5 +1,5 @@
-import { createContext, type ReactNode, useContext, useEffect, useState } from "react"
-import { auth } from "@/lib/api"
+import { createContext, type ReactNode, useContext, useEffect, useRef, useState } from "react"
+import { auth, ServiceUnavailableError } from "@/lib/api"
 
 interface AuthUser {
   id: string
@@ -13,6 +13,9 @@ interface AuthUser {
 interface AuthContextType {
   user: AuthUser | null
   loading: boolean
+  // The server could not be reached to confirm the session. Not a
+  // sign-out: show a retry screen, never the login redirect.
+  unavailable: boolean
   logout: () => Promise<void>
   refetch: () => Promise<void>
 }
@@ -20,6 +23,7 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType>({
   user: null,
   loading: true,
+  unavailable: false,
   logout: async () => {},
   refetch: async () => {},
 })
@@ -27,13 +31,30 @@ const AuthContext = createContext<AuthContextType>({
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null)
   const [loading, setLoading] = useState(true)
+  const [unavailable, setUnavailable] = useState(false)
+  const retryTimer = useRef<number | undefined>(undefined)
+  const attempt = useRef(0)
 
   const fetchUser = async () => {
+    window.clearTimeout(retryTimer.current)
     try {
       const u = await auth.me()
       setUser({ ...u, role: u.role || "user" })
-    } catch {
-      setUser(null)
+      setUnavailable(false)
+      attempt.current = 0
+    } catch (e) {
+      if (e instanceof ServiceUnavailableError) {
+        // Keep whoever was signed in; try again with backoff
+        // (2s, 4s, 8s, 16s, then every 30s) until the server answers.
+        setUnavailable(true)
+        const delay = Math.min(30_000, 2_000 * 2 ** attempt.current)
+        attempt.current += 1
+        retryTimer.current = window.setTimeout(fetchUser, delay)
+      } else {
+        setUser(null)
+        setUnavailable(false)
+        attempt.current = 0
+      }
     } finally {
       setLoading(false)
     }
@@ -42,6 +63,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // biome-ignore lint/correctness/useExhaustiveDependencies: intentionally run only on mount
   useEffect(() => {
     fetchUser()
+    // Coming back online is the moment a retry is most likely to work.
+    const onOnline = () => {
+      if (attempt.current > 0) fetchUser()
+    }
+    window.addEventListener("online", onOnline)
+    return () => {
+      window.removeEventListener("online", onOnline)
+      window.clearTimeout(retryTimer.current)
+    }
   }, [])
 
   const logout = async () => {
@@ -49,7 +79,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(null)
   }
 
-  return <AuthContext.Provider value={{ user, loading, logout, refetch: fetchUser }}>{children}</AuthContext.Provider>
+  return (
+    <AuthContext.Provider value={{ user, loading, unavailable, logout, refetch: fetchUser }}>
+      {children}
+    </AuthContext.Provider>
+  )
 }
 
 export function useAuth() {

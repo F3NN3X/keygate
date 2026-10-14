@@ -33,7 +33,7 @@ Commercial license platforms charge per-seat, per-month, and your customer data 
 
 **Keygate is the middle ground.** A production-ready license server you deploy on your own infrastructure, connect to your own Stripe, and manage through a clean dashboard. It handles everything from activation to dunning — so you can focus on building your product.
 
-One binary. One database. Full control. Free, forever.
+One server. One database. Full control. Free, forever.
 
 <br />
 
@@ -86,7 +86,7 @@ Email OTP login with constant-time hash verification, role-based access checked 
 
 ### 🌍 Self-Hosted
 
-Single Go binary + PostgreSQL + (optional) S3-compatible storage for release artifacts. No Redis, no microservices. Auto-migration on startup. Setup wizard for first run. Custom branding, email templates, and i18n (English/Chinese built-in).
+A Go server + PostgreSQL + (optional) S3-compatible storage for release artifacts. No Redis, no microservices. Auto-migration on startup. Setup wizard for first run. Custom branding, email templates, and i18n (English/Chinese built-in).
 
 <br />
 

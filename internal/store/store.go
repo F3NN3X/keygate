@@ -203,10 +203,22 @@ func NewID() string { return newID() }
 
 // ─── User ───
 
+// normalizeEmail is the form an address is compared and keyed in.
+// Mail providers treat addresses case-insensitively in practice, so
+// "Foo@x.com" and "foo@x.com" are one person. Licences and seats keep
+// the address as typed (that is what mail is sent to) and are matched
+// case-insensitively; a user row is a login identity and is stored in
+// this form, the same one OTP and OAuth sign-in already use.
+func normalizeEmail(e string) string { return strings.ToLower(strings.TrimSpace(e)) }
+
 func (s *Store) UpsertUser(ctx context.Context, u *model.User) error {
 	if u.ID == "" {
 		u.ID = newID()
 	}
+	// Checkout hands over the address as the buyer typed it; keyed as
+	// typed it would miss the account they sign in to and create a
+	// second one beside it.
+	u.Email = normalizeEmail(u.Email)
 	// A blank incoming value means "the caller doesn't know", not "clear
 	// it". Login upserts the user with only an email — OTP has no name
 	// to offer, and neither does the Stripe checkout path — so writing
@@ -223,7 +235,7 @@ func (s *Store) UpsertUser(ctx context.Context, u *model.User) error {
 
 func (s *Store) FindUserByEmail(ctx context.Context, email string) (*model.User, error) {
 	u := new(model.User)
-	return u, s.DB.NewSelect().Model(u).Where("email = ?", email).Scan(ctx)
+	return u, s.DB.NewSelect().Model(u).Where("email = ?", normalizeEmail(email)).Scan(ctx)
 }
 
 func (s *Store) FindUserByID(ctx context.Context, id string) (*model.User, error) {
@@ -718,7 +730,7 @@ var ErrSubscriptionUnlinked = errors.New("license no longer linked to this subsc
 // UpdateLicenseAndSubscription writes the licence and mirrors its
 // status onto the subscription row, both in one transaction.
 func (s *Store) UpdateLicenseAndSubscription(ctx context.Context, lic *model.License, cols ...string) error {
-	return s.updateLicenseAndSubscription(ctx, lic, false, cols...)
+	return s.updateLicenseAndSubscription(ctx, lic, false, nil, cols...)
 }
 
 // UpdateLicenseFromSubscription is the same write for a caller that
@@ -732,33 +744,116 @@ func (s *Store) UpdateLicenseAndSubscription(ctx context.Context, lic *model.Lic
 // and a period nothing in Stripe backs any more. Then it answers
 // ErrSubscriptionUnlinked and writes nothing.
 func (s *Store) UpdateLicenseFromSubscription(ctx context.Context, lic *model.License, cols ...string) error {
-	return s.updateLicenseAndSubscription(ctx, lic, true, cols...)
+	return s.updateLicenseAndSubscription(ctx, lic, true, nil, cols...)
 }
 
-func (s *Store) updateLicenseAndSubscription(ctx context.Context, lic *model.License, stillLinked bool, cols ...string) error {
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
+// ErrLicenseRestricted reports that a Stripe-driven write was refused
+// because the licence's own state forbids it: revoked, suspended by an
+// operator, or canceled with nothing but an event payload (no current
+// read of Stripe) saying otherwise. Nothing was written — no status, no
+// dates — and the caller must not announce the change.
+var ErrLicenseRestricted = errors.New("license state does not allow this subscription change")
 
+// ErrStaleSubscriptionRead reports that a newer read of the licence's
+// Stripe subscription has already been applied, so this older one was
+// not. Like ErrSubscriptionUnlinked it is an expected answer.
+var ErrStaleSubscriptionRead = errors.New("a newer read of this subscription is already applied")
+
+// UpdateLicenseFromSubscriptionRead is UpdateLicenseFromSubscription for
+// a write made from Stripe's answer to a read taken after asOf (a
+// StripeReadStamp). Two webhooks for one subscription can overlap and
+// the one that asked Stripe first may write last; the newest read wins,
+// in the same UPDATE that makes the write, and an older one gets
+// ErrStaleSubscriptionRead. The last change in Stripe is followed by a
+// webhook whose read starts after it, so the licence ends on the final
+// state.
+func (s *Store) UpdateLicenseFromSubscriptionRead(ctx context.Context, lic *model.License, asOf time.Time, cols ...string) error {
+	return s.updateLicenseAndSubscription(ctx, lic, true, &asOf, cols...)
+}
+
+// UpdateLicenseFromSubscriptionEnded is the write for a subscription that
+// is over (customer.subscription.deleted). It always applies — nothing in
+// Stripe can bring the subscription back, so a newer read can only agree
+// — and it moves the licence's read stamp up to asOf, so a read taken
+// before the deletion (one that may still have seen "active") is refused
+// afterwards. The stamp never moves back.
+func (s *Store) UpdateLicenseFromSubscriptionEnded(ctx context.Context, lic *model.License, asOf time.Time, cols ...string) error {
+	return RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		var recorded []*time.Time
+		if err := tx.NewRaw("SELECT stripe_synced_at FROM licenses WHERE id = ? FOR UPDATE", lic.ID).Scan(ctx, &recorded); err != nil {
+			return err
+		}
+		stamp := asOf
+		if len(recorded) > 0 && recorded[0] != nil && recorded[0].After(stamp) {
+			stamp = *recorded[0]
+		}
+		lic.StripeSyncedAt = &stamp
+		return updateLicenseAndSubscriptionIn(ctx, tx, lic, true, nil, append(cols, "stripe_synced_at")...)
+	})
+}
+
+func (s *Store) updateLicenseAndSubscription(ctx context.Context, lic *model.License, stillLinked bool, asOf *time.Time, cols ...string) error {
+	return RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		return updateLicenseAndSubscriptionIn(ctx, tx, lic, stillLinked, asOf, cols...)
+	})
+}
+
+func updateLicenseAndSubscriptionIn(ctx context.Context, tx bun.Tx, lic *model.License, stillLinked bool, asOf *time.Time, cols ...string) error {
 	lic.UpdatedAt = time.Now()
-	allCols := make([]string, len(cols)+1)
-	copy(allCols, cols)
-	allCols[len(cols)] = "updated_at"
+	allCols := append(append([]string{}, cols...), "updated_at")
+	if asOf != nil {
+		lic.StripeSyncedAt = asOf
+		allCols = append(allCols, "stripe_synced_at")
+	}
 	q := tx.NewUpdate().Model(lic).Column(allCols...).WherePK()
 	guarded := stillLinked && lic.StripeSubscriptionID != ""
 	if guarded {
 		q = q.Where("stripe_subscription_id = ?", lic.StripeSubscriptionID)
 	}
+	if asOf != nil {
+		q = q.Where("stripe_synced_at IS NULL OR stripe_synced_at <= ?", *asOf)
+	}
+	// A write driven by the subscription (stillLinked) answers to the
+	// licence's own state, checked here, in the write, so a suspension or
+	// revocation made a moment earlier is never overwritten: payment can
+	// give back what non-payment or expiry took, never what an operator
+	// took, nor revive a subscription that ended.
+	if stillLinked {
+		q = q.Where("status <> ?", model.StatusRevoked)
+		switch lic.Status {
+		case model.StatusActive, model.StatusTrialing, model.StatusPastDue:
+			q = q.Where("NOT (status = ? AND COALESCE(suspended_by, ?) <> ?)",
+				model.StatusSuspended, model.SuspendedByAdmin, model.SuspendedByStripe)
+			// Stripe never brings a canceled subscription back, so only a
+			// current read saying it is live (a canceled licence that was
+			// "unpaid", now paid) may revive one — an event payload is
+			// history and may predate the end.
+			if asOf == nil {
+				q = q.Where("status <> ?", model.StatusCanceled)
+			}
+		case model.StatusSuspended:
+			// A pause must not replace a suspension already in place: it
+			// would turn an operator's into one a resume lifts.
+			q = q.Where("status <> ?", model.StatusSuspended)
+		}
+	}
 	res, err := q.Exec(ctx)
 	if err != nil {
 		return err
 	}
-	if guarded {
-		if n, err := res.RowsAffected(); err == nil && n == 0 {
+	if n, err := res.RowsAffected(); err == nil && n == 0 && (guarded || asOf != nil || stillLinked) {
+		var now struct {
+			Linked bool       `bun:"linked"`
+			Synced *time.Time `bun:"synced"`
+		}
+		if err := tx.NewRaw("SELECT COALESCE(stripe_subscription_id, '') = ? AS linked, stripe_synced_at AS synced FROM licenses WHERE id = ?",
+			lic.StripeSubscriptionID, lic.ID).Scan(ctx, &now); err != nil || !now.Linked {
 			return ErrSubscriptionUnlinked
 		}
+		if asOf != nil && now.Synced != nil && now.Synced.After(*asOf) {
+			return ErrStaleSubscriptionRead
+		}
+		return ErrLicenseRestricted
 	}
 
 	// Sync subscription status if one exists
@@ -769,17 +864,25 @@ func (s *Store) updateLicenseAndSubscription(ctx context.Context, lic *model.Lic
 		// Non-fatal: subscription may not exist
 		slog.Warn("sync subscription status failed", "license_id", lic.ID, "error", err)
 	}
-
-	return tx.Commit()
+	return nil
 }
 
 func (s *Store) ListLicensesByEmail(ctx context.Context, email string) ([]*model.License, error) {
 	var out []*model.License
-	// Include licenses owned by email OR where user has a seat
+	// Include licenses owned by email OR where user has a seat. Matched
+	// case-insensitively: a licence keeps the address as it was typed,
+	// and the portal session carries the lower-cased sign-in address.
+	e := normalizeEmail(email)
 	err := s.DB.NewSelect().Model(&out).
 		Relation("Plan").Relation("Plan.Entitlements").
 		Relation("Product").Relation("Activations").Relation("Seats").
-		Where("license.email = ? OR license.id IN (SELECT license_id FROM seats WHERE email = ? AND removed_at IS NULL)", email, email).
+		// One IN over a UNION ALL rather than "a = ? OR id IN (...)":
+		// the OR form makes Postgres scan every licence instead of
+		// using idx_licenses_email_lower.
+		Where(`license.id IN (
+			SELECT id FROM licenses WHERE lower(email) = ?
+			UNION ALL
+			SELECT license_id FROM seats WHERE lower(email) = ? AND removed_at IS NULL)`, e, e).
 		OrderExpr("license.created_at DESC, license.id DESC").Scan(ctx)
 	if err != nil {
 		return nil, err
@@ -816,7 +919,7 @@ func (s *Store) HasAccountOrLicense(ctx context.Context, email string) (bool, er
 	}
 	var exists bool
 	err := s.DB.NewRaw(`SELECT EXISTS (
-		SELECT 1 FROM users WHERE lower(email) = ?
+		SELECT 1 FROM users WHERE email = ?
 		UNION ALL
 		SELECT 1 FROM licenses WHERE lower(email) = ?
 		UNION ALL
@@ -1129,6 +1232,211 @@ func (s *Store) SyncSubscriptionStatuses(ctx context.Context) error {
 	return err
 }
 
+// cancelStateSQL is what Stripe last told us about a licence's newest
+// subscription: true when it ends at the period end, false when it
+// renews, NULL when nothing has been recorded yet (rows from before the
+// state was kept, until SyncCancelStates or a webhook fills it in).
+const cancelStateSQL = `(SELECT sub.cancel_at_period_end FROM subscriptions sub
+	WHERE sub.license_id = license.id AND sub.cancel_state_synced_at IS NOT NULL
+	ORDER BY sub.created_at DESC LIMIT 1)`
+
+// FindLicensesForExpiryReminder returns active and trialing licenses that
+// run out between from and to and will not renew on their own: no Stripe
+// subscription, or one Stripe confirmed ends at the period end. One that
+// renews gets the renewal reminder instead (FindLicensesForRenewalReminder);
+// one whose state is not known yet gets neither until it is — a late
+// reminder beats a wrong one.
+func (s *Store) FindLicensesForExpiryReminder(ctx context.Context, from, to time.Time) ([]*model.License, error) {
+	var out []*model.License
+	err := s.DB.NewSelect().Model(&out).
+		Relation("Product").
+		Relation("Plan").
+		Where("license.status IN ('active', 'trialing')").
+		Where("(COALESCE(license.stripe_subscription_id, '') = '' OR "+cancelStateSQL+" IS TRUE)").
+		Where("license.valid_until IS NOT NULL").
+		Where("license.valid_until >= ?", from).
+		Where("license.valid_until <= ?", to).
+		OrderExpr("license.valid_until ASC").
+		Scan(ctx)
+	return out, err
+}
+
+// FindLicensesForRenewalReminder returns active licenses whose Stripe
+// subscription renews between from and to: billed by Stripe, and Stripe
+// confirmed it is not set to end at the period end.
+func (s *Store) FindLicensesForRenewalReminder(ctx context.Context, from, to time.Time) ([]*model.License, error) {
+	var out []*model.License
+	err := s.DB.NewSelect().Model(&out).
+		Relation("Product").
+		Where("license.status = 'active'").
+		Where("COALESCE(license.stripe_subscription_id, '') <> ''").
+		Where(cancelStateSQL+" IS FALSE").
+		Where("license.valid_until IS NOT NULL").
+		Where("license.valid_until >= ?", from).
+		Where("license.valid_until <= ?", to).
+		Scan(ctx)
+	return out, err
+}
+
+// StripeReadStamp reads the database clock for a caller about to ask
+// Stripe for a subscription. Whatever Stripe answers is at least as new
+// as this moment, so the stamp orders the answers: see
+// SetSubscriptionCancelScheduled and UpdateLicenseFromSubscriptionRead.
+// The database clock, not this process's, so instances whose clocks
+// drift still agree on the order.
+func (s *Store) StripeReadStamp(ctx context.Context) (time.Time, error) {
+	return ledgerStamp(ctx, s.DB)
+}
+
+// SetSubscriptionCancelScheduled records what Stripe says about a
+// licence's subscription — set to end at the period end, or renewing —
+// as read from Stripe after asOf (a StripeReadStamp taken before the
+// read). The reminders read it to tell "renews" from "runs out".
+//
+// The newest read wins, not the last write: two webhooks for one
+// subscription can overlap, and the one that asked Stripe first may
+// write last. Its answer is then older than the one already recorded
+// and is dropped. The last change in Stripe is always followed by a
+// webhook whose read starts after it, so that read — the newest — sees
+// the final state.
+func (s *Store) SetSubscriptionCancelScheduled(ctx context.Context, licenseID string, scheduled bool, asOf time.Time) error {
+	return s.setCancelState(ctx, licenseID, scheduled, asOf, false)
+}
+
+// RecordSubscriptionCancelStateIfUnknown records the state only while
+// none is recorded yet: the background sync and fulfilment only fill
+// the gap, and leave anything a webhook recorded alone.
+func (s *Store) RecordSubscriptionCancelStateIfUnknown(ctx context.Context, licenseID string, scheduled bool, asOf time.Time) error {
+	return s.setCancelState(ctx, licenseID, scheduled, asOf, true)
+}
+
+// setCancelState writes the cancel state under a lock on the licence
+// row, so writers for one licence go one at a time and the check on
+// what is recorded holds until the write. A Stripe-billed licence with
+// no subscription row (one created before such rows were kept) gets
+// one, so the state has somewhere to live.
+func (s *Store) setCancelState(ctx context.Context, licenseID string, scheduled bool, asOf time.Time, onlyIfUnknown bool) error {
+	return RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		var locked []string
+		if err := tx.NewRaw(`SELECT id FROM licenses WHERE id = ? FOR UPDATE`, licenseID).Scan(ctx, &locked); err != nil {
+			return err
+		}
+		if len(locked) == 0 {
+			return nil // licence gone: nothing to record against
+		}
+		var recorded []time.Time
+		if err := tx.NewRaw(`SELECT max(cancel_state_synced_at) FROM subscriptions
+			WHERE license_id = ? HAVING max(cancel_state_synced_at) IS NOT NULL`, licenseID).Scan(ctx, &recorded); err != nil {
+			return err
+		}
+		if len(recorded) > 0 && (onlyIfUnknown || !asOf.After(recorded[0])) {
+			return nil // known already, or by a read at least as new
+		}
+		res, err := tx.NewRaw(`UPDATE subscriptions
+			SET cancel_at_period_end = ?, cancel_state_synced_at = ?, updated_at = now()
+			WHERE license_id = ?`, scheduled, asOf, licenseID).Exec(ctx)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			return nil
+		}
+		_, err = tx.NewRaw(`INSERT INTO subscriptions
+			(id, license_id, plan_id, status, payment_provider, external_id, cancel_at_period_end, cancel_state_synced_at)
+			SELECT ?, l.id, l.plan_id, l.status, 'stripe', COALESCE(l.stripe_subscription_id, ''), ?, ?
+			FROM licenses l WHERE l.id = ?`, newID(), scheduled, asOf, licenseID).Exec(ctx)
+		return err
+	})
+}
+
+// StripeCancelStateTarget is a Stripe subscription whose cancel state has
+// not been recorded yet (see FindStripeCancelStatesToSync).
+type StripeCancelStateTarget struct {
+	LicenseID      string `bun:"license_id"`
+	SubscriptionID string `bun:"subscription_id"`
+	// SortKey is its place in the walk (valid_until, 'infinity' when
+	// unset, as text), so a walk resumes after it even if the licence's
+	// own date has moved since.
+	SortKey string `bun:"sort_key"`
+}
+
+// FindStripeCancelStatesToSync lists live Stripe-billed licences whose
+// subscription cancel state has never been recorded, soonest to expire
+// first, so the reminders that are due next are unblocked first. A
+// non-nil after continues the walk past that target, so subscriptions
+// Stripe keeps failing to answer for (a 404 stays unknown) cannot hold
+// the head of the list and starve the rest.
+func (s *Store) FindStripeCancelStatesToSync(ctx context.Context, after *StripeCancelStateTarget, limit int) ([]StripeCancelStateTarget, error) {
+	afterKey, afterID := "", ""
+	if after != nil {
+		afterKey, afterID = after.SortKey, after.LicenseID
+	}
+	var out []StripeCancelStateTarget
+	err := s.DB.NewRaw(`SELECT l.id AS license_id, l.stripe_subscription_id AS subscription_id,
+			COALESCE(l.valid_until, 'infinity')::text AS sort_key
+		FROM licenses l
+		WHERE COALESCE(l.stripe_subscription_id, '') <> ''
+		  AND l.status IN ('active', 'trialing', 'past_due')
+		  AND NOT EXISTS (SELECT 1 FROM subscriptions s
+			WHERE s.license_id = l.id AND s.cancel_state_synced_at IS NOT NULL)
+		  AND (?::text = '' OR (COALESCE(l.valid_until, 'infinity'), l.id) > (NULLIF(?::text, '')::timestamptz, ?::text))
+		ORDER BY COALESCE(l.valid_until, 'infinity'), l.id
+		LIMIT ?`, afterKey, afterKey, afterID, limit).Scan(ctx, &out)
+	return out, err
+}
+
+// legacyExpiryTags are the tags expiry reminders were recorded under
+// before they carried the expiry date: one per license, ever.
+var legacyExpiryTags = map[string]int{"expiry_7d": 7, "expiry_3d": 3, "expiry_1d": 1}
+
+// ExpiryRemindersSent lists the reminder windows (in days) already sent
+// for this license and expiry date. A reminder recorded in the old,
+// dateless form counts when it was sent inside its window before this
+// date, so licenses mid-way through their reminders at the upgrade are
+// not reminded twice.
+func (s *Store) ExpiryRemindersSent(ctx context.Context, licenseID string, validUntil time.Time) ([]int, error) {
+	var rows []struct {
+		Tag    string    `bun:"tag"`
+		SentAt time.Time `bun:"sent_at"`
+	}
+	prefix := "expiry:" + validUntil.UTC().Format(time.RFC3339) + ":"
+	// Only reminders actually queued count. A claim whose sender died
+	// before queuing has no sent_at; the next run takes it over.
+	err := s.DB.NewRaw(`SELECT tag, sent_at FROM notifications
+		WHERE license_id = ? AND sent_at IS NOT NULL
+		  AND (starts_with(tag, ?) OR tag IN ('expiry_7d', 'expiry_3d', 'expiry_1d'))`,
+		licenseID, prefix).Scan(ctx, &rows)
+	if err != nil {
+		return nil, err
+	}
+	var days []int
+	for _, r := range rows {
+		if d, ok := legacyExpiryTags[r.Tag]; ok {
+			// Sent for this date only if it fell inside that window
+			// (plus a day of slack for the hourly sweep).
+			if r.SentAt.After(validUntil.Add(-time.Duration(d+1) * 24 * time.Hour)) {
+				days = append(days, d)
+			}
+			continue
+		}
+		var d int
+		if _, err := fmt.Sscanf(strings.TrimPrefix(r.Tag, prefix), "%dd", &d); err == nil {
+			days = append(days, d)
+		}
+	}
+	return days, nil
+}
+
+// RenewalReminderSentLegacy reports a renewal reminder recorded in the
+// old, dateless form ("renewal_24h") for this renewal date, so the
+// upgrade does not repeat one already sent.
+func (s *Store) RenewalReminderSentLegacy(ctx context.Context, licenseID string, validUntil time.Time) bool {
+	exists, _ := s.DB.NewSelect().TableExpr("notifications").
+		Where("license_id = ? AND tag = 'renewal_24h' AND sent_at > ?", licenseID, validUntil.Add(-48*time.Hour)).
+		Exists(ctx)
+	return exists
+}
+
 // HasNotification checks if a notification with the given tag was already sent for a license.
 func (s *Store) HasNotification(ctx context.Context, licenseID, tag string) bool {
 	exists, _ := s.DB.NewSelect().
@@ -1144,6 +1452,27 @@ func (s *Store) RecordNotification(ctx context.Context, licenseID, tag string) {
 		"INSERT INTO notifications (id, license_id, tag) VALUES (?, ?, ?) ON CONFLICT (license_id, tag) DO NOTHING",
 		newID(), licenseID, tag,
 	).Exec(ctx)
+}
+
+// TryRecordPastDueNotification records tag for a licence only while it
+// is still past_due on subscriptionID, in the episode that began at
+// pastDueAt (to the second), and reports whether this call recorded it:
+// of several concurrent callers exactly one goes on to send, and none
+// does once the licence has recovered, been unlinked or begun another
+// episode. A database error reports false — better a missed notice
+// than a duplicate or a stale one.
+func (s *Store) TryRecordPastDueNotification(ctx context.Context, licenseID, subscriptionID string, pastDueAt time.Time, tag string) bool {
+	res, err := s.DB.NewRaw(`INSERT INTO notifications (id, license_id, tag)
+		SELECT ?, l.id, ? FROM licenses l
+		WHERE l.id = ? AND l.stripe_subscription_id = ? AND l.status = 'past_due'
+		  AND floor(extract(epoch FROM l.past_due_at)) = ?
+		ON CONFLICT (license_id, tag) DO NOTHING`,
+		newID(), tag, licenseID, subscriptionID, pastDueAt.Unix()).Exec(ctx)
+	if err != nil {
+		return false
+	}
+	n, _ := res.RowsAffected()
+	return n == 1
 }
 
 // notificationLease is how long a reminder claim may stay unsent
@@ -1238,6 +1567,19 @@ type RefreshToken struct {
 // or an attacker holding the captured old token will be cut off.
 var ErrRefreshTokenReused = errors.New("refresh token reuse detected")
 
+// RefreshReuseGrace is how long a just-rotated refresh token is still
+// honoured. Several tabs whose sessions lapse together all renew with
+// the same cookie, and a refresh whose response was lost is retried with
+// it; without a grace period every one of those would look like token
+// theft and sign the user out everywhere. Kept short so a captured token
+// is useless almost at once. Revocation by logout or by reuse detection
+// deletes the row instead, so it is never covered by this window.
+const RefreshReuseGrace = 30 * time.Second
+
+// ErrRefreshUserNotFound is returned when a refresh token's user no
+// longer exists.
+var ErrRefreshUserNotFound = errors.New("refresh token user not found")
+
 func (s *Store) CreateRefreshToken(ctx context.Context, userID, tokenHash string, expiresAt time.Time) error {
 	_, err := s.DB.NewRaw(
 		"INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)",
@@ -1260,52 +1602,104 @@ func (s *Store) FindRefreshToken(ctx context.Context, tokenHash string) (*Refres
 	return rt, err
 }
 
-// RotateRefreshToken atomically marks the token as revoked and
-// returns the row. Distinguishes three outcomes:
+// RefreshRenewal is a successful RenewRefreshToken: the presented token,
+// its user, and when the new token expires.
+type RefreshRenewal struct {
+	Token     *RefreshToken
+	User      *model.User
+	ExpiresAt time.Time
+	// Grace is set when the presented token had been rotated within
+	// RefreshReuseGrace: another tab, or a retry whose first response
+	// was lost.
+	Grace bool
+}
+
+// RenewRefreshToken exchanges a refresh token for a new one (newHash,
+// expiring at expiresAt) and reads its user, all in one transaction: it
+// either succeeds whole or leaves the presented token as it was. That is
+// what keeps a failure retryable — a token consumed by a renewal whose
+// answer never reached the browser would be presented again later and
+// read as theft. Outcomes:
 //
-//   - (rt, nil)                    → caller may issue a new token
-//   - (rt, ErrRefreshTokenReused)  → REUSE detected; caller MUST
-//     wipe every refresh_token for rt.UserID. The returned rt
-//     carries the UserID so the caller can do the wipe in one step.
-//   - (nil, sql.ErrNoRows)         → token not found / expired;
-//     plain 401, no family wipe.
+//   - (renewal, nil): issue the session and the new token. On a grace
+//     renewal the presented token stays as it was and the new token
+//     keeps its expiry instead of expiresAt, so a stolen token replayed
+//     inside the window is worth no more than it already was.
+//   - (renewal with Token, ErrRefreshTokenReused): a rotated token
+//     presented after the window. The caller MUST wipe every refresh
+//     token of Token.UserID.
+//   - (nil, sql.ErrNoRows): unknown or expired token; a plain 401.
+//   - (nil, ErrRefreshUserNotFound): the user is gone; a plain 401.
+//   - (nil, other error): nothing changed; answer 5xx so the client
+//     retries.
 //
-// Implemented as a single UPDATE … RETURNING wrapped in a tx that
-// takes a SELECT FOR UPDATE on the row first. This serialises
-// concurrent rotation attempts of the same token (e.g. two browser
-// tabs both refreshing at once) so exactly one wins.
-func (s *Store) RotateRefreshToken(ctx context.Context, tokenHash string) (*RefreshToken, error) {
-	tx, err := s.DB.BeginTx(ctx, nil)
+// The row is taken FOR UPDATE first, so concurrent renewals with one
+// token (several tabs) serialise: one rotates, the rest are grace.
+func (s *Store) RenewRefreshToken(ctx context.Context, tokenHash, newHash string, expiresAt time.Time) (*RefreshRenewal, error) {
+	var out *RefreshRenewal
+	err := RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		rt := new(RefreshToken)
+		if err := tx.NewRaw(
+			"SELECT id, user_id, token_hash, expires_at, revoked_at FROM refresh_tokens "+
+				"WHERE token_hash = ? AND expires_at > now() FOR UPDATE",
+			tokenHash,
+		).Scan(ctx, rt); err != nil {
+			return err
+		}
+		ren := &RefreshRenewal{Token: rt, ExpiresAt: expiresAt}
+
+		// Already-rotated token presented again. Within the grace period it
+		// is a concurrent renewal (another tab, a retried request); after it,
+		// a replay — treat as a security incident. Both the rotation time and
+		// this check use the database clock, so replicas whose clocks drift
+		// apart still agree on the window.
+		if rt.RevokedAt != nil {
+			if err := tx.NewRaw("SELECT ?::timestamptz > now() - make_interval(secs => ?)",
+				*rt.RevokedAt, RefreshReuseGrace.Seconds()).Scan(ctx, &ren.Grace); err != nil {
+				return err
+			}
+			if !ren.Grace {
+				out = ren
+				return ErrRefreshTokenReused
+			}
+			if rt.ExpiresAt.Before(ren.ExpiresAt) {
+				ren.ExpiresAt = rt.ExpiresAt
+			}
+		} else {
+			var revokedAt time.Time
+			if err := tx.NewRaw(
+				"UPDATE refresh_tokens SET revoked_at = now() WHERE id = ? RETURNING revoked_at",
+				rt.ID,
+			).Scan(ctx, &revokedAt); err != nil {
+				return err
+			}
+			rt.RevokedAt = &revokedAt
+		}
+
+		user := new(model.User)
+		if err := tx.NewSelect().Model(user).Where("id = ?", rt.UserID).Scan(ctx); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrRefreshUserNotFound
+			}
+			return err
+		}
+		ren.User = user
+		if _, err := tx.NewRaw(
+			"INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)",
+			newID(), rt.UserID, newHash, ren.ExpiresAt,
+		).Exec(ctx); err != nil {
+			return err
+		}
+		out = ren
+		return nil
+	})
+	if errors.Is(err, ErrRefreshTokenReused) {
+		return out, err
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback() //nolint:errcheck
-
-	rt := new(RefreshToken)
-	scanErr := tx.NewRaw(
-		"SELECT id, user_id, token_hash, expires_at, revoked_at FROM refresh_tokens "+
-			"WHERE token_hash = ? AND expires_at > now() FOR UPDATE",
-		tokenHash,
-	).Scan(ctx, rt)
-	if scanErr != nil {
-		return nil, scanErr
-	}
-
-	// Already-rotated token replayed → security incident.
-	if rt.RevokedAt != nil {
-		_ = tx.Commit() // commit the FOR UPDATE release — no row change
-		return rt, ErrRefreshTokenReused
-	}
-
-	now := time.Now()
-	if _, err := tx.NewRaw(
-		"UPDATE refresh_tokens SET revoked_at = ? WHERE id = ?",
-		now, rt.ID,
-	).Exec(ctx); err != nil {
-		return nil, err
-	}
-	rt.RevokedAt = &now
-	return rt, tx.Commit()
+	return out, nil
 }
 
 // DeleteRefreshToken removes a token outright. Used on logout, where

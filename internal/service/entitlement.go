@@ -6,7 +6,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/tabloy/keygate/internal/model"
 	"github.com/tabloy/keygate/internal/store"
 )
 
@@ -73,17 +72,14 @@ func (s *EntitlementService) Check(ctx context.Context, in CheckInput) (*CheckRe
 		Features: make(map[string]FeatureStatus),
 	}
 
-	// Plan entitlements (may be absent if Plan has none or was unloaded).
-	// We do NOT early-return when the plan is bare: addons attached to
-	// the license can still extend it with their own features. Skipping
-	// this block lost the addon-merge step for plans with no built-in
-	// entitlements — a real bug that surfaced after plan changes.
-	var planEntitlements []*model.Entitlement
-	if lic.Plan != nil {
-		planEntitlements = lic.Plan.Entitlements
+	// Plan entitlements with the license's addons merged in. A bare plan
+	// still gets its addons' features.
+	ents, err := licenseFeatures(ctx, s.store, lic)
+	if err != nil {
+		return nil, err
 	}
 
-	for _, e := range planEntitlements {
+	for _, e := range ents {
 		if in.Feature != "" && e.Feature != in.Feature {
 			continue
 		}
@@ -121,49 +117,6 @@ func (s *EntitlementService) Check(ctx context.Context, in CheckInput) (*CheckRe
 		}
 
 		result.Features[e.Feature] = fs
-	}
-
-	// Merge addon features (addons override or add to plan features)
-	addons, _, _ := s.store.ListLicenseAddons(ctx, lic.ID, store.All)
-	for _, la := range addons {
-		if la.Addon == nil {
-			continue
-		}
-		a := la.Addon
-		if in.Feature != "" && a.Feature != in.Feature {
-			continue
-		}
-		fs := FeatureStatus{
-			ValueType: a.ValueType,
-			Value:     a.Value,
-			Enabled:   true,
-		}
-		switch a.ValueType {
-		case "bool":
-			fs.Enabled = a.Value == "true"
-		case "quota":
-			limit, _ := strconv.ParseInt(a.Value, 10, 64)
-			period := a.QuotaPeriod
-			if period == "" {
-				period = "monthly"
-			}
-			periodKey := store.CurrentPeriodKey(period)
-			counter, _ := s.store.GetUsageCounter(ctx, lic.ID, a.Feature, period, periodKey)
-			used := int64(0)
-			if counter != nil {
-				used = counter.Used
-			}
-			remaining := limit - used
-			if limit == 0 {
-				remaining = -1
-			}
-			fs.Used = &used
-			fs.Limit = &limit
-			fs.Remaining = &remaining
-			fs.Period = period
-			fs.ResetsAt = nextPeriodReset(period)
-		}
-		result.Features[a.Feature] = fs
 	}
 
 	return result, nil

@@ -842,7 +842,7 @@ function InvoicesDialog({ licenseId, onClose }: { licenseId: string; onClose: ()
 
   return (
     <Dialog open onOpenChange={onClose}>
-      <DialogContent className="max-w-2xl">
+      <DialogContent className="max-w-2xl h-[min(640px,85vh)]">
         <DialogHeader>
           <DialogTitle>{t("portal.invoices")}</DialogTitle>
         </DialogHeader>
@@ -907,18 +907,25 @@ function ChangePlanDialog({ license, onClose }: { license: PortalLicense; onClos
     (p: Plan) => p.id !== license.plan_id && p.license_type === "subscription" && p.stripe_price_id,
   )
 
+  // Switching bills the customer at once (prorated), so it is
+  // confirmed first and acknowledged after.
+  const [confirming, setConfirming] = useState<Plan | null>(null)
   const changeMut = useMutation({
-    mutationFn: (newPriceId: string) => portal.changePlan({ license_id: license.id, new_price_id: newPriceId }),
-    onSuccess: () => {
+    mutationFn: (plan: Plan) => portal.changePlan({ license_id: license.id, new_price_id: plan.stripe_price_id || "" }),
+    onSuccess: (_, plan) => {
       qc.invalidateQueries({ queryKey: ["portal", "licenses"] })
+      showToast(t("portal.planChanged", { plan: plan.name }), "success")
       onClose()
     },
-    onError: (e: Error) => showToast(e.message, "error"),
+    onError: (e: Error) => {
+      setConfirming(null)
+      showToast(e.message, "error")
+    },
   })
 
   return (
     <Dialog open onOpenChange={onClose}>
-      <DialogContent>
+      <DialogContent className="h-[min(560px,85vh)]">
         <DialogHeader>
           <DialogTitle>{t("portal.changePlan")}</DialogTitle>
           <DialogDescription>{t("portal.changePlanDesc")}</DialogDescription>
@@ -937,18 +944,31 @@ function ChangePlanDialog({ license, onClose }: { license: PortalLicense; onClos
                       {plan.billing_interval ? ` · ${plan.billing_interval}` : ""}
                     </p>
                   </div>
-                  <Button
-                    size="sm"
-                    onClick={() => changeMut.mutate(plan.stripe_price_id || "")}
-                    disabled={changeMut.isPending}
-                  >
-                    {changeMut.isPending ? t("common.loading") : t("portal.switchTo")}
+                  <Button size="sm" onClick={() => setConfirming(plan)} disabled={changeMut.isPending}>
+                    {t("portal.switchTo")}
                   </Button>
                 </div>
               ))}
             </div>
           )}
         </DialogBody>
+        <AlertDialog
+          open={confirming !== null}
+          onOpenChange={(open) => !open && !changeMut.isPending && setConfirming(null)}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>{t("portal.confirmSwitchTitle", { plan: confirming?.name ?? "" })}</AlertDialogTitle>
+              <AlertDialogDescription>{t("portal.confirmSwitchDesc")}</AlertDialogDescription>
+            </AlertDialogHeader>
+            <div className="flex justify-end gap-2">
+              <AlertDialogCancel disabled={changeMut.isPending}>{t("common.cancel")}</AlertDialogCancel>
+              <Button onClick={() => confirming && changeMut.mutate(confirming)} disabled={changeMut.isPending}>
+                {changeMut.isPending ? t("common.loading") : t("portal.confirmSwitch")}
+              </Button>
+            </div>
+          </AlertDialogContent>
+        </AlertDialog>
       </DialogContent>
     </Dialog>
   )

@@ -1,6 +1,7 @@
 import { Mail, Terminal } from "lucide-react"
 import { useEffect, useState } from "react"
-import { Navigate } from "react-router-dom"
+import { Navigate, useSearchParams } from "react-router-dom"
+import { ServiceUnavailableScreen } from "@/components/service-unavailable"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
@@ -9,12 +10,15 @@ import { Separator } from "@/components/ui/separator"
 import { useAuth } from "@/hooks/use-auth"
 import { useSiteConfig } from "@/hooks/use-site-config"
 import { useI18n } from "@/i18n"
-import { auth } from "@/lib/api"
+import { auth, setup } from "@/lib/api"
 
 export default function LoginPage() {
   const { t } = useI18n()
   const { site_name, logo_url, attribution_text, attribution_url } = useSiteConfig()
-  const { user, loading, refetch } = useAuth()
+  const { user, loading, unavailable, refetch } = useAuth()
+  const [params] = useSearchParams()
+  const justSetUp = params.get("setup") === "done"
+  const [needsSetup, setNeedsSetup] = useState(false)
   const [devLogin, setDevLogin] = useState(false)
   const [devEmail, setDevEmail] = useState("admin@keygate.dev")
   const [devName, setDevName] = useState("Admin")
@@ -23,11 +27,19 @@ export default function LoginPage() {
 
   // OTP state
   const [otpStep, setOtpStep] = useState<"email" | "code">("email")
-  const [otpEmail, setOtpEmail] = useState("")
+  const [otpEmail, setOtpEmail] = useState(params.get("email") ?? "")
   const [otpCode, setOtpCode] = useState("")
   const [otpLoading, setOtpLoading] = useState(false)
   const [otpError, setOtpError] = useState("")
   const [otpCooldown, setOtpCooldown] = useState(0)
+
+  // A fresh install has no owner yet: send the first visitor to setup.
+  useEffect(() => {
+    setup
+      .status()
+      .then((r) => setNeedsSetup(r.needed))
+      .catch(() => {})
+  }, [])
 
   useEffect(() => {
     auth
@@ -103,7 +115,11 @@ export default function LoginPage() {
   }
 
   if (loading) return null
+  if (needsSetup) return <Navigate to="/setup" replace />
   if (user) return <Navigate to={user.is_admin ? "/admin" : "/portal"} replace />
+  // A signed-in user whose session cannot be confirmed right now would
+  // otherwise be shown a login form they do not need.
+  if (unavailable) return <ServiceUnavailableScreen onRetry={refetch} />
 
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-muted/30">
@@ -116,6 +132,9 @@ export default function LoginPage() {
           <CardDescription>{t("login.subtitle")}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
+          {justSetUp && otpStep === "email" && (
+            <p className="rounded-md bg-emerald-50 px-3 py-2 text-sm text-emerald-800">{t("login.setupDone")}</p>
+          )}
           {/* OTP Email Step */}
           {otpStep === "email" && (
             <form onSubmit={handleOtpSend} className="space-y-3">

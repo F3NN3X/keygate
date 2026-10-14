@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Copy, Package, Pencil, Plus, Trash2 } from "lucide-react"
 import { useEffect, useState } from "react"
 import { Link } from "react-router-dom"
+import { CopyableId } from "@/components/copyable-id"
 import { ProductSelect } from "@/components/product-select"
 import { showToast } from "@/components/toast"
 import {
@@ -163,7 +164,7 @@ export default function PlansPage() {
                     <DataTableHead>{t("plans.maxSeats")}</DataTableHead>
                     <DataTableHead>{t("common.status")}</DataTableHead>
                     <DataTableHead>{t("common.created")}</DataTableHead>
-                    <DataTableHead className="w-24" />
+                    <DataTableHead className="w-24 text-right">{t("common.actions")}</DataTableHead>
                   </DataTableRow>
                 </DataTableHeader>
                 <DataTableBody>
@@ -208,7 +209,7 @@ export default function PlansPage() {
                           {formatDate(p.created_at)}
                         </DataTableCell>
                         <DataTableCell>
-                          <div className="flex gap-1">
+                          <div className="flex justify-end gap-1">
                             {p.checkout_id && (
                               <Button
                                 variant="ghost"
@@ -394,10 +395,11 @@ function PlanDialog({
 
   return (
     <Dialog open={open} onOpenChange={onClose}>
-      <DialogContent className="max-w-lg">
+      <DialogContent className="max-w-lg h-[85vh]">
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>{t("plans.formDesc")}</DialogDescription>
+          {plan && <CopyableId id={plan.id} />}
         </DialogHeader>
         <form
           onSubmit={(e) => {
@@ -591,6 +593,17 @@ function PlanDialog({
                       onChange={(e) => set("updates_days", Number(e.target.value))}
                     />
                     <p className="text-xs text-muted-foreground">{t("plans.updatesDaysHint")}</p>
+                    {/* The server refuses an update period while the
+                      product's feeds are public; say so before saving,
+                      with the way to change it. */}
+                    {selectedProduct && supports.activations && !selectedProduct.feed_license_required && (
+                      <p className="text-xs text-amber-700 dark:text-amber-400">
+                        {t("plans.feedNotGated")}{" "}
+                        <Link to={`/admin/releases?settings=${selectedProduct.id}&tab=access`} className="underline">
+                          {t("plans.feedNotGatedLink")}
+                        </Link>
+                      </p>
+                    )}
                   </div>
                   <div className="space-y-2">
                     <Label>{t("plans.renewalDays")}</Label>

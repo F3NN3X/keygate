@@ -5,12 +5,20 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
+// dateLocale is the locale dates are written in: the browser's language
+// and region preference (en-US → 09/30/2026, en-GB → 30/09/2026,
+// zh-CN → 2026/09/30), not the dashboard's UI language — an English
+// dashboard does not mean the reader writes dates the American way.
+export function dateLocale(): string | undefined {
+  return navigator.languages?.[0] || navigator.language || undefined
+}
+
 export function formatDate(
   date: string | Date | null | undefined,
   options?: { locale?: string; timezone?: string },
 ): string {
   if (!date) return "-"
-  const locale = options?.locale || document.documentElement.lang || navigator.language || undefined
+  const locale = options?.locale || dateLocale()
   const tz = options?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone
   return new Date(date).toLocaleDateString(locale, {
     year: "numeric",

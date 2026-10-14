@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"github.com/tabloy/keygate/internal/crypto"
 	"github.com/tabloy/keygate/internal/model"
@@ -87,8 +88,6 @@ func NewReleaseSigningService(c ReleaseSigningServiceConfig) *ReleaseSigningServ
 // ─── Sentinel errors ───
 
 var (
-	// Names both conditions, because the service is nil when EITHER is absent and the old text
-	// blamed only the key — sending an operator with a correctly set key to check it again.
 	ErrSigningDisabled        = errors.New("release signing is not configured: it needs RELEASE_KEY_ENCRYPTION_KEY and object storage (STORAGE_BUCKET, STORAGE_ACCESS_KEY, STORAGE_SECRET_KEY)")
 	ErrArtifactTooLargeToSign = errors.New("artifact exceeds the configured signing size limit")
 	ErrSigningKeyMissing      = errors.New("product has no active signing key — generate one before signing")
@@ -274,9 +273,9 @@ func (s *ReleaseSigningService) ExportPublicKeyPEM(ctx context.Context, productI
 // AND the ID of the signing key that produced it. Callers MUST persist both
 // atomically — a sig without a key_id is unverifiable after rotation.
 type SignResult struct {
-	Signature       string // base64-encoded raw 64-byte signature (over the file bytes)
-	GlobalSignature string // base64 ed25519(raw_sig || tauriTrustedComment) — the minisign "global" sig
-	SigningKeyID    string // FK to release_signing_keys.id
+	Signature      string // base64-encoded raw 64-byte signature
+	SigningKeyID   string // FK to release_signing_keys.id
+	TauriSignature string // base64 minisign signature file, see TauriSignature
 }
 
 // SignArtifact signs the bytes of a single release artifact and returns
@@ -381,20 +380,89 @@ func (s *ReleaseSigningService) SignArtifactWith(ctx context.Context, rel *model
 	}
 
 	sig := ed25519.Sign(priv, buf)
-
-	// The minisign "global" signature the Tauri verifier also checks: ed25519 over the raw signature
-	// concatenated with the trusted-comment text (the part after "trusted comment: "). It can only be
-	// made here, with the private key in hand; the feed assembles the 4-line envelope from both sigs.
-	globalMsg := make([]byte, 0, len(sig)+len(tauriTrustedComment))
-	globalMsg = append(globalMsg, sig...)
-	globalMsg = append(globalMsg, []byte(tauriTrustedComment)...)
-	globalSig := ed25519.Sign(priv, globalMsg)
-
 	return &SignResult{
-		Signature:       base64.StdEncoding.EncodeToString(sig),
-		GlobalSignature: base64.StdEncoding.EncodeToString(globalSig),
-		SigningKeyID:    keyRow.ID,
+		Signature:    base64.StdEncoding.EncodeToString(sig),
+		SigningKeyID: keyRow.ID,
+		TauriSignature: TauriSignature(priv, sig,
+			TauriTrustedComment(time.Now(), DownloadFilename(rel, a), rel.Version)),
 	}, nil
+}
+
+// BackfillTauriSignatures adds the Tauri signature to artifacts that
+// were signed before it was stored. The file is not read again: the
+// Tauri signature wraps the existing Ed25519 signature and adds a global
+// signature over it, made with the key that signed the artifact, so the
+// signature the release already ships is left exactly as it is. Safe to
+// run on every start; returns how many artifacts it filled in.
+func (s *ReleaseSigningService) BackfillTauriSignatures(ctx context.Context) (int, error) {
+	if s == nil || s.aead == nil {
+		return 0, nil
+	}
+	const batch = 100
+	filled, skipped := 0, 0
+	keys := map[string]*model.ReleaseSigningKey{}
+	for {
+		arts, err := s.store.ListArtifactsMissingTauriSignature(ctx, batch, skipped)
+		if err != nil {
+			return filled, err
+		}
+		if len(arts) == 0 {
+			return filled, nil
+		}
+		for _, a := range arts {
+			tauriSig, err := s.tauriSignatureFor(ctx, a, keys)
+			if err != nil {
+				// Left for a later start; skipping keeps the loop moving.
+				s.logger.Warn("tauri signature backfill: skipped artifact",
+					"artifact_id", a.ID, "error", err)
+				skipped++
+				continue
+			}
+			if err := s.store.SetArtifactTauriSignature(ctx, a.ID, a.SigningKeyID, tauriSig); err != nil {
+				return filled, err
+			}
+			filled++
+		}
+	}
+}
+
+func (s *ReleaseSigningService) tauriSignatureFor(ctx context.Context, a *model.ReleaseArtifact, keys map[string]*model.ReleaseSigningKey) (string, error) {
+	if a.Release == nil {
+		return "", errors.New("artifact has no release")
+	}
+	sig, err := base64.StdEncoding.DecodeString(a.Ed25519Sig)
+	if err != nil || len(sig) != ed25519.SignatureSize {
+		return "", errors.New("stored signature is not a 64-byte Ed25519 signature")
+	}
+	key, ok := keys[a.SigningKeyID]
+	if !ok {
+		if key, err = s.store.FindSigningKeyByID(ctx, a.SigningKeyID); err != nil {
+			return "", fmt.Errorf("find signing key: %w", err)
+		}
+		keys[a.SigningKeyID] = key
+	}
+	seed, err := s.aead.Decrypt(key.PrivateKeyEncrypted, []byte(a.Release.ProductID))
+	if err != nil {
+		return "", fmt.Errorf("decrypt private key: %w", err)
+	}
+	defer zeroBytes(seed)
+	if len(seed) != ed25519.SeedSize {
+		return "", fmt.Errorf("decrypted seed has wrong length: %d", len(seed))
+	}
+	priv := ed25519.NewKeyFromSeed(seed)
+	defer zeroBytes(priv)
+	if base64.StdEncoding.EncodeToString(priv.Public().(ed25519.PublicKey)) != key.PublicKey {
+		return "", errors.New("private key does not match the stored public key")
+	}
+	signedAt := a.UpdatedAt
+	if a.Release.PublishedAt != nil {
+		signedAt = *a.Release.PublishedAt
+	}
+	out := TauriSignature(priv, sig, TauriTrustedComment(signedAt, DownloadFilename(a.Release, a), a.Release.Version))
+	if out == "" {
+		return "", errors.New("could not build the signature")
+	}
+	return out, nil
 }
 
 // bytesBufferWriter wraps a *[]byte as an io.Writer with a hard cap.

@@ -55,16 +55,10 @@ func (s *UsageService) RecordUsage(ctx context.Context, in RecordUsageInput) (*R
 		return nil, err
 	}
 
-	var quota *model.Entitlement
-	if lic.Plan != nil {
-		for _, e := range lic.Plan.Entitlements {
-			if e.Feature == in.Feature && e.ValueType == "quota" {
-				quota = e
-				break
-			}
-		}
+	quota, err := s.quotaFor(ctx, lic, in.Feature)
+	if err != nil {
+		return nil, apperr.Internal(err)
 	}
-
 	if quota == nil {
 		return nil, apperr.New(400, "NO_QUOTA", "no quota entitlement found for feature: "+in.Feature)
 	}
@@ -165,6 +159,23 @@ func (s *UsageService) RecordUsage(ctx context.Context, in RecordUsageInput) (*R
 	}, nil
 }
 
+// quotaFor is the quota enforced for a feature: the plan's, or an
+// enabled addon's, which replaces the plan's for the same feature.
+// RecordUsage and GetQuotaStatus both read it, so the status always
+// describes the limit and period that usage is counted against.
+func (s *UsageService) quotaFor(ctx context.Context, lic *model.License, feature string) (*model.Entitlement, error) {
+	ents, err := licenseFeatures(ctx, s.store, lic)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range ents {
+		if e.Feature == feature && e.ValueType == "quota" {
+			return e, nil
+		}
+	}
+	return nil, nil
+}
+
 type QuotaStatus struct {
 	Feature   string `json:"feature"`
 	Used      int64  `json:"used"`
@@ -180,14 +191,9 @@ func (s *UsageService) GetQuotaStatus(ctx context.Context, licenseKey, feature, 
 		return nil, err
 	}
 
-	var quota *model.Entitlement
-	if lic.Plan != nil {
-		for _, e := range lic.Plan.Entitlements {
-			if e.Feature == feature && e.ValueType == "quota" {
-				quota = e
-				break
-			}
-		}
+	quota, err := s.quotaFor(ctx, lic, feature)
+	if err != nil {
+		return nil, apperr.Internal(err)
 	}
 	if quota == nil {
 		return nil, apperr.NotFound("QUOTA", feature)

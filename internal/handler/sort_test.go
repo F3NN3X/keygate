@@ -141,9 +141,10 @@ func TestLicenseSortColumnsAreQualified(t *testing.T) {
 		}
 		// Whatever the map says, it must not be something a caller
 		// could have injected: no spaces, no punctuation beyond the
-		// table qualifier.
+		// table qualifier and the parentheses of a function call such
+		// as lower(license.email).
 		for _, r := range col.Expr {
-			if r != '.' && r != '_' && !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') {
+			if r != '.' && r != '_' && r != '(' && r != ')' && !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') {
 				t.Errorf("sort column %q expression %q contains unexpected character %q", name, col.Expr, r)
 			}
 		}

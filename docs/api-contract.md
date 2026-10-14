@@ -36,7 +36,8 @@ whatever that consumer requires. They are the only exceptions above.
 | Route | Body |
 |---|---|
 | `GET /releases/:slug/feed.xml` | RSS/Sparkle XML |
-| `GET /releases/:slug/feed.json` | a bare JSON array |
+| `GET /releases/:slug/feed.json` | a Velopack asset feed, `{"Assets": [...]}` |
+| `GET /releases/:slug/velopack/[:platform/]:file` | the same feed at the URL Velopack builds, or a `302` to a package |
 | `GET /releases/:slug/upgrade.json` | a bare Tauri manifest, or `204` when there is no update |
 | `GET /admin/products/:id/signing-key/public.pem` | the PEM itself |
 | `POST /webhook/stripe` | `{"received": …}`, for Stripe; **errors are not the envelope either** |

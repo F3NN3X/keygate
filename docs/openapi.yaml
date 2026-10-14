@@ -84,8 +84,44 @@ tags:
     description: Concurrent session checkout for floating licenses
   - name: Releases
     description: License-gated download + auto-update feeds (Sparkle / Velopack / Tauri)
+  - name: Site
+    description: Public site configuration
 
 paths:
+  /config:
+    get:
+      tags: [Site]
+      summary: Public site configuration
+      description: |
+        Settings the login page, customer portal and dashboard read before
+        anyone signs in, plus the attribution notice the AGPL v3 terms
+        (Section 7(b), see NOTICE) require on every UI surface.
+      responses:
+        "200":
+          description: Public settings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      site_name: { type: string }
+                      timezone: { type: string }
+                      brand_color: { type: string }
+                      language: { type: string }
+                      logo_url: { type: string }
+                      base_url:
+                        type: string
+                        description: The server's BASE_URL, the address clients reach it at. The dashboard builds the feed URLs it shows from it.
+                      attribution_text:
+                        type: string
+                        description: Attribution notice, "Powered by Keygate". Required by the license.
+                      attribution_url:
+                        type: string
+                        description: Link for the attribution notice. Required by the license.
   /license/pubkey:
     get:
       tags: [License]
@@ -699,6 +735,12 @@ paths:
         (no auth); non-stable channels are also public — internal
         / customer-specific builds belong on internal CI/CD
         distribution, not these feeds.
+
+        When the product has a minimum_supported_version, every item at
+        or above it carries <sparkle:criticalUpdate sparkle:version="…"/>
+        with that version: Sparkle treats the update as critical for apps
+        whose CFBundleVersion is lower. Feeds limited by an update period
+        lower the version to the newest release the license may install.
       parameters:
         - $ref: "#/components/parameters/ProductSlug"
         - $ref: "#/components/parameters/Platform"
@@ -722,6 +764,10 @@ paths:
     get:
       tags: [Releases]
       summary: Velopack feed (per-platform)
+      description: |
+        The same feed as /releases/{product_slug}/velopack/releases.{channel}.json,
+        addressed by platform and channel parameters. Velopack's client
+        cannot build this URL; give it the velopack base URL instead.
       parameters:
         - $ref: "#/components/parameters/ProductSlug"
         - $ref: "#/components/parameters/Platform"
@@ -731,9 +777,11 @@ paths:
         - $ref: "#/components/parameters/LicenseToken"
       responses:
         "200":
-          description: Velopack JSON array
+          description: Velopack asset feed
           content:
-            application/json: {}
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VelopackFeed"
         "401":
           description: "`LICENSE_KEY_REQUIRED` — the product requires the license token (or key) on its feeds"
         "400":
@@ -741,13 +789,76 @@ paths:
         "404":
           description: Unknown product_slug
 
+  /releases/{product_slug}/velopack/{platform}/{file}:
+    get:
+      tags: [Releases]
+      summary: Velopack feed and package downloads, at the URLs Velopack builds
+      description: |
+        Give Velopack's UpdateManager the base URL
+        /api/v1/releases/{product_slug}/velopack/{platform}. It requests
+        releases.{channel}.json under it, then downloads each package as
+        {base}/{FileName}, which this route answers with a 302 to storage.
+
+        The platform segment may be left out
+        (/releases/{product_slug}/velopack/{file}). The platform then comes
+        from a channel named after a runtime (win-x64, win-x64-beta), or
+        from the rid the C# client sends, which is the machine's runtime
+        rather than the app's. Velopack's Rust core, used by its Rust,
+        Node.js, Python and C++ SDKs, sends no rid.
+
+        Channels: Velopack's default channels win, osx and linux read
+        stable; stable, beta, alpha and dev read that channel; a runtime
+        name with a trailing channel (osx-arm64-beta) reads that channel.
+
+        Gated feeds: the C# client keeps the base URL's query on both
+        requests, so license_token can go there. The Rust core replaces
+        the query; send X-License-Token or X-License-Key instead.
+      parameters:
+        - $ref: "#/components/parameters/ProductSlug"
+        - name: platform
+          in: path
+          required: true
+          description: Keygate platform, such as windows-x64 or darwin-arm64
+          schema:
+            type: string
+        - name: file
+          in: path
+          required: true
+          description: releases.{channel}.json, or a package FileName from the feed
+          schema:
+            type: string
+        - name: rid
+          in: query
+          description: .NET runtime identifier sent by the C# client, used only without a platform
+          schema:
+            type: string
+        - $ref: "#/components/parameters/LicenseToken"
+      responses:
+        "200":
+          description: Velopack asset feed (for releases.{channel}.json)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VelopackFeed"
+        "302":
+          description: Redirect to the package in storage (for a package FileName)
+        "401":
+          description: "`LICENSE_KEY_REQUIRED` — the product requires the license token (or key) on its feeds"
+        "400":
+          description: Unknown platform, or no platform from the path, the channel name or rid
+        "404":
+          description: Unknown product_slug, or no such release
+
   /releases/{product_slug}/upgrade.json:
     get:
       tags: [Releases]
       summary: Tauri updater manifest (latest only)
       description: |
-        Returns the single latest release. Signature is in minisign
-        envelope format that Tauri's verifier consumes directly.
+        Returns the single latest release. The signature is what a Tauri
+        `.sig` file holds: a base64 encoded minisign signature with a
+        trusted comment (timestamp, file and version) and a global
+        signature, verifiable with the product's Tauri public key from
+        GET /admin/products/{id}/signing-key/tauri-pubkey.
         Embeds `minimum_supported_version` + `minimum_supported_message`
         when the product has them configured.
       parameters:
@@ -774,7 +885,7 @@ paths:
                     format: uri
                   signature:
                     type: string
-                    description: minisign envelope ("untrusted comment:\n<base64>")
+                    description: base64 encoded minisign signature file, as in a Tauri .sig file. Empty when the release is unsigned.
                   notes:
                     type: string
                   minimum_supported_version:
@@ -890,6 +1001,22 @@ components:
         browsers attach it automatically.
 
   schemas:
+    VelopackFeed:
+      type: object
+      description: Velopack's VelopackAssetFeed. SHA256 is upper case hex, as Velopack compares it.
+      properties:
+        Assets:
+          type: array
+          items:
+            type: object
+            properties:
+              PackageId: { type: string }
+              Version: { type: string }
+              Type: { type: string, enum: [Full] }
+              FileName: { type: string, description: "{version}_{channel}_{platform}.nupkg, downloaded from the velopack base URL" }
+              SHA256: { type: string }
+              Size: { type: integer, format: int64 }
+              NotesMarkdown: { type: string }
     ActivateResponse:
       type: object
       properties:

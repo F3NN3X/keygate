@@ -2,6 +2,7 @@ import { ArrowDown, ArrowUp, ArrowUpDown, ChevronLeft, ChevronRight, ChevronsLef
 import * as React from "react"
 import { Button } from "@/components/ui/button"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { useI18n } from "@/i18n"
 import { cn } from "@/lib/utils"
 
 // ─── Enhanced Table Components ───
@@ -45,7 +46,7 @@ const DataTableHead = React.forwardRef<HTMLTableCellElement, React.ThHTMLAttribu
     <th
       ref={ref}
       className={cn(
-        "h-10 px-3 text-left align-middle text-xs font-semibold uppercase tracking-wider text-muted-foreground [&:has([role=checkbox])]:pr-0",
+        "h-10 whitespace-nowrap px-3 text-left align-middle text-xs font-semibold uppercase tracking-wider text-muted-foreground [&:has([role=checkbox])]:pr-0",
         className,
       )}
       {...props}
@@ -87,7 +88,7 @@ function DataTableSortHead({
         type="button"
         onClick={() => sort.toggle(column, firstOrder)}
         className={cn(
-          "group flex h-10 w-full items-center gap-1 px-3 text-left text-xs font-semibold uppercase tracking-wider transition-colors",
+          "group flex h-10 w-full items-center gap-1 whitespace-nowrap px-3 text-left text-xs font-semibold uppercase tracking-wider transition-colors",
           active ? "text-foreground" : "text-muted-foreground hover:text-foreground",
         )}
       >
@@ -138,6 +139,7 @@ function DataTablePagination({
   onPageSizeChange,
   pageSizeOptions = [10, 20, 30, 50],
 }: PaginationProps) {
+  const { t, locale } = useI18n()
   const from = total === 0 ? 0 : page * pageSize + 1
   const to = Math.min((page + 1) * pageSize, total)
 
@@ -162,13 +164,13 @@ function DataTablePagination({
     <div className="flex flex-col gap-3 px-1 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
       <div className="flex items-center gap-2 text-xs text-muted-foreground">
         <span className="whitespace-nowrap">
-          {from}-{to} of {total.toLocaleString()}
+          {t("common.pageRange", { from, to, total: total.toLocaleString(locale) })}
         </span>
         {onPageSizeChange && (
           <>
             <span className="text-border">|</span>
             <div className="flex items-center gap-1.5">
-              <span>Rows</span>
+              <span className="whitespace-nowrap">{t("common.rowsPerPage")}</span>
               <Select value={String(pageSize)} onValueChange={(v) => onPageSizeChange(Number(v))}>
                 <SelectTrigger className="h-7 w-16 text-xs">
                   <SelectValue />

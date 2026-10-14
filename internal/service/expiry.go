@@ -65,13 +65,21 @@ func (c *ExpiryChecker) ExpireGracePeriodLicenses(ctx context.Context) {
 		if lic.Plan != nil {
 			graceDays = lic.Plan.GraceDays
 		}
-		graceEnd := lic.ValidUntil.Add(time.Duration(graceDays) * 24 * time.Hour)
-		if time.Now().After(graceEnd) {
-			lic.Status = model.StatusExpired
-			if err := c.store.UpdateLicenseAndSubscription(ctx, lic, "status"); err != nil {
+		grace := time.Duration(graceDays) * 24 * time.Hour
+		if time.Now().After(lic.ValidUntil.Add(grace)) {
+			// Re-checked in the write itself: an admin may have
+			// extended or reinstated the licence since it was read.
+			cutoff := time.Now().Add(-grace)
+			ok, err := c.store.ExpireLicenseIf(ctx, lic.ID,
+				[]string{model.StatusActive, model.StatusPastDue}, &cutoff)
+			if err != nil {
 				c.logger.Error("expire license failed", "id", lic.ID, "error", err)
 				continue
 			}
+			if !ok {
+				continue
+			}
+			lic.Status = model.StatusExpired
 			c.store.Audit(ctx, &model.AuditLog{
 				Entity: "license", EntityID: lic.ID, Action: "expired",
 				ActorType: "system",
@@ -98,11 +106,16 @@ func (c *ExpiryChecker) ExpireTrials(ctx context.Context) {
 		return
 	}
 	for _, lic := range licenses {
-		lic.Status = model.StatusExpired
-		if err := c.store.UpdateLicenseAndSubscription(ctx, lic, "status"); err != nil {
+		now := time.Now()
+		ok, err := c.store.ExpireLicenseIf(ctx, lic.ID, []string{model.StatusTrialing}, &now)
+		if err != nil {
 			c.logger.Error("expire trial failed", "id", lic.ID, "error", err)
 			continue
 		}
+		if !ok {
+			continue // extended or changed since it was read
+		}
+		lic.Status = model.StatusExpired
 		c.store.Audit(ctx, &model.AuditLog{
 			Entity: "license", EntityID: lic.ID, Action: "expired",
 			ActorType: "system",
@@ -130,10 +143,15 @@ func (c *ExpiryChecker) MarkPastDueAsExpired(ctx context.Context) {
 		return
 	}
 	for _, lic := range licenses {
-		lic.Status = model.StatusExpired
-		if err := c.store.UpdateLicenseAndSubscription(ctx, lic, "status"); err != nil {
+		ok, err := c.store.ExpireStalePastDueLicenseIf(ctx, lic.ID, threshold)
+		if err != nil {
+			c.logger.Error("expire past_due failed", "id", lic.ID, "error", err)
 			continue
 		}
+		if !ok {
+			continue // paid, reinstated or changed since it was read
+		}
+		lic.Status = model.StatusExpired
 		c.store.Audit(ctx, &model.AuditLog{
 			Entity: "license", EntityID: lic.ID, Action: "expired",
 			ActorType: "system",
@@ -143,52 +161,17 @@ func (c *ExpiryChecker) MarkPastDueAsExpired(ctx context.Context) {
 	}
 }
 
-// SendExpiryReminders sends notifications for upcoming expirations.
-// Uses a notified_at tracking to prevent duplicate emails.
-func (c *ExpiryChecker) SendExpiryReminders(ctx context.Context) {
-	reminders := []struct {
-		days int
-		tag  string
-	}{
-		{7, "expiry_7d"},
-		{3, "expiry_3d"},
-		{1, "expiry_1d"},
-	}
-
-	for _, r := range reminders {
-		from := time.Now()
-		to := from.Add(time.Duration(r.days) * 24 * time.Hour)
-		licenses, err := c.store.FindExpiringLicenses(ctx, from, to)
-		if err != nil {
-			c.logger.Error("expiry reminder check failed", "error", err)
-			continue
-		}
-		for _, lic := range licenses {
-			// Check if we already sent this reminder
-			if c.store.HasNotification(ctx, lic.ID, r.tag) {
-				continue
-			}
-			productName := ""
-			if lic.Product != nil {
-				productName = lic.Product.Name
-			}
-			expiresAt := ""
-			if lic.ValidUntil != nil {
-				expiresAt = lic.ValidUntil.Format("2006-01-02")
-			}
-			c.email.SendLicenseExpiring(lic.Email, productName, c.store.DecryptLicenseKey(lic), expiresAt)
-			c.store.RecordNotification(ctx, lic.ID, r.tag)
-			c.logger.Info("expiry reminder sent", "license_id", lic.ID, "days", r.days)
-		}
-	}
-}
-
 // SendUpdatesEndingReminders tells holders of perpetual licenses that
 // their maintenance period ends within 14 days, once per period end.
 // Only plans that sell renewals get the mail: without one there is
 // nothing the customer can do about it, and the license keeps
 // working either way.
 func (c *ExpiryChecker) SendUpdatesEndingReminders(ctx context.Context) {
+	// Turned off: skip without recording anything, so switching it back
+	// on reminds licenses still inside the window.
+	if !c.email.NotifyEnabled("updates_ending") {
+		return
+	}
 	from := time.Now()
 	to := from.Add(14 * 24 * time.Hour)
 	licenses, err := c.store.FindLicensesWithUpdatesEnding(ctx, from, to)
@@ -264,6 +247,12 @@ func (c *ExpiryChecker) CleanupExpiredActivations(ctx context.Context) {
 //     full fresh ladder for the second episode (the tag includes
 //     past_due_at's epoch).
 func (c *ExpiryChecker) SendPaymentFailureReminders(ctx context.Context) {
+	// Switched off: send nothing and record nothing. Each step records
+	// its tag as sent, so recording one that was skipped would leave the
+	// reminder lost for good once the email is switched back on.
+	if c.email == nil || !c.email.NotifyEnabled("payment_failed") {
+		return
+	}
 	var licenses []*model.License
 	err := c.store.DB.NewSelect().Model(&licenses).
 		Relation("Product").
@@ -328,39 +317,43 @@ func strconvI64(n int64) string {
 	return strconv.FormatInt(n, 10)
 }
 
-// SendRenewalReminders notifies users in the 24 hours leading up to
-// renewal. We scan a wide [now, now+25h] window and dedup with the
-// "renewal_24h" tag so a server outage during the narrow original
-// 23-25h window doesn't silently skip the email.
+// SendRenewalReminders tells customers, the day before, that their Stripe
+// subscription renews. It covers exactly the licenses the expiry reminder
+// leaves out — an active Stripe subscription not set to cancel — so no
+// license gets both "renews tomorrow" and "expiring" (see
+// FindLicensesForRenewalReminder). The wide [now, now+25h] scan with a
+// per-date tag means an outage during the narrow window does not skip
+// the email, and every renewal is reminded, not only the first. Queued
+// through the durable mail queue like the other reminders.
 func (c *ExpiryChecker) SendRenewalReminders(ctx context.Context) {
-	from := time.Now()
-	to := time.Now().Add(25 * time.Hour)
-	licenses, err := c.store.FindExpiringLicenses(ctx, from, to)
+	if !c.email.NotifyEnabled("renewal_reminder") {
+		return
+	}
+	now := time.Now()
+	licenses, err := c.store.FindLicensesForRenewalReminder(ctx, now, now.Add(25*time.Hour))
 	if err != nil {
+		c.logger.Error("renewal reminder check failed", "error", err)
 		return
 	}
 	for _, lic := range licenses {
-		if lic.Status != model.StatusActive {
+		if lic.ValidUntil == nil || c.store.RenewalReminderSentLegacy(ctx, lic.ID, *lic.ValidUntil) {
 			continue
 		}
-		// Only for subscription type
-		if lic.Plan == nil || lic.Plan.LicenseType != "subscription" {
-			continue
-		}
-		tag := "renewal_24h"
-		if c.store.HasNotification(ctx, lic.ID, tag) {
+		token, err := c.store.ClaimNotification(ctx, lic.ID, "renewal_24h:"+lic.ValidUntil.UTC().Format(time.RFC3339))
+		if err != nil || token == "" {
 			continue
 		}
 		productName := ""
 		if lic.Product != nil {
 			productName = lic.Product.Name
 		}
-		renewalDate := ""
-		if lic.ValidUntil != nil {
-			renewalDate = lic.ValidUntil.Format("2006-01-02")
+		subject, body := c.email.RenderRenewalReminder(productName, lic.ValidUntil.Format("2006-01-02"))
+		switch err := c.store.EnqueueEmailAndCloseNotification(ctx, lic.Email, subject, body, token); {
+		case err == nil, errors.Is(err, store.ErrNotificationClaimLost):
+		default:
+			_ = c.store.ReleaseNotification(ctx, token)
+			c.logger.Error("renewal reminder enqueue failed", "license_id", lic.ID, "error", err)
 		}
-		c.email.SendRenewalReminder(lic.Email, productName, renewalDate)
-		c.store.RecordNotification(ctx, lic.ID, tag)
 	}
 }
 

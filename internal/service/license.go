@@ -115,7 +115,7 @@ func (s *LicenseService) Activate(ctx context.Context, in ActivateInput) (*Activ
 	if existing, err := s.store.FindActivation(ctx, lic.ID, in.Identifier); err == nil {
 		_ = s.store.TouchActivation(ctx, existing.ID)
 		middleware.LicenseActivations.WithLabelValues(lic.ProductID, "already_activated").Inc()
-		token, err := s.signToken(lic, in.Identifier)
+		token, _, err := s.signToken(ctx, lic, in.Identifier)
 		if err != nil {
 			return nil, apperr.Internal(err)
 		}
@@ -140,7 +140,7 @@ func (s *LicenseService) Activate(ctx context.Context, in ActivateInput) (*Activ
 		if errors.Is(err, store.ErrAlreadyActivated) {
 			_ = s.store.TouchActivation(ctx, act.ID)
 			middleware.LicenseActivations.WithLabelValues(lic.ProductID, "already_activated").Inc()
-			token, terr := s.signToken(lic, in.Identifier)
+			token, _, terr := s.signToken(ctx, lic, in.Identifier)
 			if terr != nil {
 				return nil, apperr.Internal(terr)
 			}
@@ -182,7 +182,7 @@ func (s *LicenseService) Activate(ctx context.Context, in ActivateInput) (*Activ
 		})
 	}
 
-	token, err := s.signToken(lic, in.Identifier)
+	token, _, err := s.signToken(ctx, lic, in.Identifier)
 	if err != nil {
 		return nil, apperr.Internal(err)
 	}
@@ -340,7 +340,7 @@ func (s *LicenseService) Verify(ctx context.Context, in VerifyInput) (*VerifyRes
 
 	middleware.LicenseVerifications.WithLabelValues(lic.ProductID, "valid").Inc()
 
-	token, err := s.signToken(lic, in.Identifier)
+	token, features, err := s.signToken(ctx, lic, in.Identifier)
 	if err != nil {
 		return nil, apperr.Internal(err)
 	}
@@ -351,7 +351,7 @@ func (s *LicenseService) Verify(ctx context.Context, in VerifyInput) (*VerifyRes
 		PlanName:            planName,
 		ValidUntil:          lic.ValidUntil,
 		UpdatesUntil:        lic.EffectiveUpdatesUntil(),
-		Features:            s.entitlements(lic),
+		Features:            features,
 		Token:               token,
 		GraceDays:           s.effectiveGraceDays(lic),
 		Meta:                s.responseMeta(),
@@ -511,6 +511,16 @@ func requireProductCapability(prod *model.Product, capability, hint string) erro
 // caller decides whether to surface it (Activate path: yes, paid users
 // renewing) or collapse to licenseNotFound() (Verify / Deactivate: no,
 // avoid existence oracle).
+// LicenseUsable reports whether a licence's key works right now — the
+// rule activation and verification apply — for callers outside this
+// service: the admin resend of a key mails only one that works. It reads
+// nothing but the licence and its plan, and assertUsable must stay that
+// way for this to hold.
+func LicenseUsable(lic *model.License) error {
+	var s LicenseService
+	return s.assertUsable(lic)
+}
+
 func (s *LicenseService) assertUsable(lic *model.License) error {
 	now := time.Now()
 	switch lic.Status {
@@ -569,22 +579,6 @@ func (s *LicenseService) effectiveGraceDays(lic *model.License) int {
 	}
 }
 
-func (s *LicenseService) entitlements(lic *model.License) map[string]any {
-	m := make(map[string]any)
-	if lic.Plan == nil {
-		return m
-	}
-	for _, e := range lic.Plan.Entitlements {
-		switch e.ValueType {
-		case "bool":
-			m[e.Feature] = e.Value == "true"
-		default:
-			m[e.Feature] = e.Value
-		}
-	}
-	return m
-}
-
 // responseMeta carries the AGPL §7(b) attribution (server / url — the "Powered by Keygate" identity,
 // see internal/branding) plus, when configured, this deployment's own public origin as instance. The
 // attribution stays; instance is additive so a client (or a human reading /verify) can see which
@@ -610,8 +604,16 @@ func (s *LicenseService) tokenTTLFor(lic *model.License) time.Duration {
 	return tokenTTL
 }
 
-func (s *LicenseService) signToken(lic *model.License, identifier string) (string, error) {
+// signToken also returns the feature map it signed, so a verify answer
+// reports exactly the features its token carries.
+func (s *LicenseService) signToken(ctx context.Context, lic *model.License, identifier string) (string, map[string]any, error) {
 	now := time.Now()
+
+	ents, err := licenseFeatures(ctx, s.store, lic)
+	if err != nil {
+		return "", nil, err
+	}
+	features := featureValues(ents)
 
 	// A token must never outlive the licence it was issued for. With a
 	// flat 7-day TTL, a plan whose grace period is shorter than that
@@ -645,7 +647,7 @@ func (s *LicenseService) signToken(lic *model.License, identifier string) (strin
 		PlanID:       lic.PlanID,
 		Status:       lic.Status,
 		Identifier:   identifier,
-		Features:     s.entitlements(lic),
+		Features:     features,
 		IssuedAt:     now.Unix(),
 		ExpiresAt:    expiresAt.Unix(),
 		ValidUntil:   validUntil,
@@ -653,5 +655,6 @@ func (s *LicenseService) signToken(lic *model.License, identifier string) (strin
 		GraceDays:    grace,
 		Fingerprint:  license.Fingerprint(identifier, lic.ProductID),
 	}
-	return license.Sign(t, s.signingKey)
+	token, err := license.Sign(t, s.signingKey)
+	return token, features, err
 }

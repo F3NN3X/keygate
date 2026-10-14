@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/json"
 	"strings"
@@ -191,8 +192,6 @@ func TestGraceDays(t *testing.T) {
 }
 
 func TestEntitlements(t *testing.T) {
-	svc := &LicenseService{}
-
 	lic := &model.License{
 		Plan: &model.Plan{
 			Entitlements: []*model.Entitlement{
@@ -204,7 +203,11 @@ func TestEntitlements(t *testing.T) {
 		},
 	}
 
-	features := svc.entitlements(lic)
+	ents, err := licenseFeatures(context.Background(), nil, lic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	features := featureValues(ents)
 
 	if features["export"] != true {
 		t.Error("export should be true")
@@ -219,8 +222,8 @@ func TestEntitlements(t *testing.T) {
 		t.Errorf("sla should be '99.9%%', got %v", features["sla"])
 	}
 
-	nilLic := &model.License{}
-	emptyFeatures := svc.entitlements(nilLic)
+	nilEnts, _ := licenseFeatures(context.Background(), nil, &model.License{})
+	emptyFeatures := featureValues(nilEnts)
 	if len(emptyFeatures) != 0 {
 		t.Error("nil plan should return empty features")
 	}
@@ -299,7 +302,7 @@ func TestSignTokenClampsToLicenceDeadline(t *testing.T) {
 				ValidUntil: tt.validUntil,
 				Plan:       &model.Plan{GraceDays: tt.graceDays, TokenTTLDays: tt.ttlDays},
 			}
-			raw, err := svc.signToken(lic, "device-1")
+			raw, _, err := svc.signToken(context.Background(), lic, "device-1")
 			if err != nil {
 				t.Fatalf("signToken: %v", err)
 			}
@@ -355,5 +358,32 @@ func TestEffectiveGraceDays(t *testing.T) {
 	lic := &model.License{Status: model.StatusCanceled, Plan: plan}
 	if got := svc.effectiveGraceDays(lic); got != 0 {
 		t.Errorf("canceled: grace = %d, want 0", got)
+	}
+}
+
+// LicenseUsable is the activation rule for callers outside the service,
+// and gives the same answers.
+func TestLicenseUsableMatchesActivation(t *testing.T) {
+	past := time.Now().Add(-48 * time.Hour)
+	future := time.Now().Add(48 * time.Hour)
+	plan := &model.Plan{GraceDays: 7}
+	for _, lic := range []*model.License{
+		{Status: model.StatusActive, ValidUntil: &future, Plan: plan},
+		{Status: model.StatusActive, ValidUntil: &past, Plan: plan}, // within grace
+		{Status: model.StatusPastDue, ValidUntil: &future, Plan: plan},
+		{Status: model.StatusCanceled, ValidUntil: &future, Plan: plan},
+		{Status: model.StatusCanceled, ValidUntil: &past, Plan: plan},
+		{Status: model.StatusSuspended, ValidUntil: &future, Plan: plan},
+		{Status: model.StatusRevoked, ValidUntil: &future, Plan: plan},
+		{Status: model.StatusExpired, ValidUntil: &past, Plan: plan},
+	} {
+		svc := &LicenseService{}
+		want, got := svc.assertUsable(lic), LicenseUsable(lic)
+		if (want == nil) != (got == nil) || (want != nil && want.Error() != got.Error()) {
+			t.Errorf("%s until %v: LicenseUsable=%v, activation=%v", lic.Status, lic.ValidUntil, got, want)
+		}
+	}
+	if LicenseUsable(&model.License{Status: model.StatusRevoked}) == nil {
+		t.Fatal("revoked licence reported usable")
 	}
 }

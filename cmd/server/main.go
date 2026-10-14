@@ -262,6 +262,7 @@ func main() {
 	)
 	webhookSvc := service.NewWebhookService(db, logger, webhookHTTPTimeout, cfg.WebhookMaxAttempts, cfg.WebhookAllowPrivate)
 	emailSvc := service.NewEmailService(cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUsername, cfg.SMTPPassword, cfg.SMTPFrom, logger, db)
+	emailSvc.SetBaseURL(cfg.BaseURL)
 	// LICENSE_SIGNING_KEY is a 32-byte ed25519 seed in hex. Parsed
 	// once here so an invalid value fails fast at startup rather
 	// than the first /license/activate call.
@@ -369,6 +370,21 @@ func main() {
 					MaxSignSize: cfg.MaxReleaseSignSize,
 				})
 				logger.Info("release signing: enabled", "max_sign_mb", cfg.MaxReleaseSignSize/(1024*1024))
+
+				// Artifacts signed before Tauri signatures were stored get
+				// one from the key that signed them. Non-blocking and
+				// idempotent, like the license key backfill above.
+				go func() {
+					n, err := releaseSigner.BackfillTauriSignatures(context.Background())
+					if err != nil {
+						logger.Warn("tauri signature backfill failed (will retry next start)",
+							"filled_so_far", n, "error", err)
+						return
+					}
+					if n > 0 {
+						logger.Info("tauri signature backfill complete", "filled", n)
+					}
+				}()
 			}
 		}
 	} else {
@@ -512,6 +528,9 @@ func main() {
 	// Periodic Stripe checkout sync — catches missed webhooks
 	if cfg.StripeSecretKey != "" {
 		go func() {
+			// Unblock the reminders for subscriptions whose cancel state
+			// predates this release without waiting a tick.
+			stripeH.SyncCancelStates(ctx)
 			ticker := time.NewTicker(5 * time.Minute)
 			defer ticker.Stop()
 			for {
@@ -522,6 +541,7 @@ func main() {
 					stripeH.SyncRecentCheckouts(ctx)
 					stripeH.SyncPendingCheckouts(ctx)
 					stripeH.RetireReplacedEndpoint(ctx)
+					stripeH.SyncCancelStates(ctx)
 				}
 			}
 		}()
@@ -668,6 +688,9 @@ func main() {
 		if settings == nil {
 			settings = make(map[string]string)
 		}
+		// The public address clients reach this server at, for the
+		// dashboard to show copyable feed URLs.
+		settings["base_url"] = cfg.BaseURL
 		// Attribution: AGPL v3 Section 7(b) — see NOTICE
 		settings["attribution_text"] = branding.Tagline
 		settings["attribution_url"] = branding.URL
@@ -767,6 +790,7 @@ func main() {
 	}
 	v1.GET("/releases/:product_slug/feed.xml", append(feedMW, releasePublicH.FeedSparkle)...)
 	v1.GET("/releases/:product_slug/feed.json", append(feedMW, releasePublicH.FeedVelopack)...)
+	v1.GET("/releases/:product_slug/velopack/*path", append(feedMW, releasePublicH.FeedVelopackIndex)...)
 	v1.GET("/releases/:product_slug/upgrade.json", append(feedMW, releasePublicH.FeedTauri)...)
 
 	// Old /releases/feed.* (no product slug, license-key auth) → 410 Gone
@@ -792,8 +816,14 @@ func main() {
 		auth.POST("/otp/verify", authH.OTPVerify)
 		auth.POST("/dev-login", authH.DevLogin)
 		auth.POST("/logout", middleware.SessionAuth(cfg.JWTSecret, db.FindUserIsAdmin), authH.Logout)
-		auth.POST("/refresh", authH.Refresh)
 	}
+	// Session renewal has a bucket of its own. The dashboard renews
+	// silently, so every page load of a signed-out visitor tries it once;
+	// in the group bucket that would spend the login budget an office
+	// behind one NAT address shares.
+	v1.POST("/auth/refresh",
+		middleware.RateLimitByIPScoped("auth_refresh", cfg.RateLimitAuth, time.Minute),
+		authH.Refresh)
 
 	// Anonymous plan catalogue for a pricing page — the visitor has no
 	// account yet, so /portal/plans (session-gated) can't serve them.
@@ -1057,7 +1087,7 @@ func main() {
 
 		// Self-service activation management — solves the "I lost my
 		// laptop, my activation slot is stuck" support ticket.
-		portalActH := handler.NewPortalActivationsHandler(db)
+		portalActH := handler.NewPortalActivationsHandler(db, webhookSvc)
 		portal.GET("/licenses/:license_key/activations", portalActH.List)
 		portal.DELETE("/licenses/:license_key/activations/:activation_id", portalActH.Delete)
 

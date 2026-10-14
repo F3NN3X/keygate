@@ -3,6 +3,7 @@ package handler
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"log/slog"
@@ -108,8 +109,15 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		return
 	}
 
-	tokenHash := hashToken(raw)
-	rt, err := h.Store.RotateRefreshToken(c, tokenHash)
+	// Rotation, the new token and the user read commit together or not at
+	// all: a failure leaves the presented token usable, so the client's
+	// retry works however long the outage lasts. A grace renewal (another
+	// tab, or a retry whose first response was lost) also hands out a
+	// refresh token: the browser may never have seen the one the first
+	// renewal issued, and would otherwise present this rotated token a
+	// day on and be taken for theft.
+	rawRefresh := randomHex(32)
+	ren, err := h.Store.RenewRefreshToken(c, hashToken(raw), hashToken(rawRefresh), time.Now().Add(refreshTokenTTL))
 	if errors.Is(err, store.ErrRefreshTokenReused) {
 		// REUSE DETECTED: a token that was already rotated has been
 		// presented again. Either the legit user replayed a stale
@@ -118,35 +126,54 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		// refresh_token for the user. Both parties (legit + attacker)
 		// lose their refresh capability; legit user has to re-auth
 		// from scratch.
-		h.Store.DeleteUserRefreshTokens(c, rt.UserID)
+		h.Store.DeleteUserRefreshTokens(c, ren.Token.UserID)
 		slog.Warn("refresh token reuse detected — revoking all user tokens",
-			"user_id", rt.UserID, "token_id", rt.ID)
+			"user_id", ren.Token.UserID, "token_id", ren.Token.ID)
 		// Clear the cookie on the client so the next page load
 		// doesn't try the dead token again.
 		setSecureCookie(c, "refresh_token", "", -1, "/api/v1/auth/refresh", h.requestIsHTTPS(c), true)
 		response.Unauthorized(c, "refresh token reuse detected")
 		return
 	}
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		response.Unauthorized(c, "invalid refresh token")
 		return
 	}
-
-	user, err := h.Store.FindUserByID(c, rt.UserID)
-	if err != nil {
+	if errors.Is(err, store.ErrRefreshUserNotFound) {
 		response.Unauthorized(c, "user not found")
 		return
 	}
+	if err != nil {
+		// A database failure is not a sign-out: answer 5xx so the client
+		// keeps the user signed in and retries later.
+		response.Internal(c, err)
+		return
+	}
 
-	// Token already marked revoked atomically by RotateRefreshToken.
-	// Just issue the new session — the new token is a fresh row,
-	// the old row stays in DB with revoked_at set so a future
-	// replay of the old hash will trip ErrRefreshTokenReused.
-	h.issueSession(c, user)
+	h.issueSessionCookie(c, ren.User)
+	h.setRefreshCookie(c, rawRefresh, ren.ExpiresAt)
 	response.OK(c, gin.H{"status": "refreshed"})
 }
 
+// refreshTokenTTL is how long a refresh token lives.
+const refreshTokenTTL = 30 * 24 * time.Hour
+
 func (h *AuthHandler) issueSession(c *gin.Context, user *model.User) {
+	h.issueSessionCookie(c, user)
+	rawRefresh := randomHex(32)
+	expiresAt := time.Now().Add(refreshTokenTTL)
+	_ = h.Store.CreateRefreshToken(c, user.ID, hashToken(rawRefresh), expiresAt)
+	h.setRefreshCookie(c, rawRefresh, expiresAt)
+}
+
+// setRefreshCookie sets the refresh cookie to a token expiring at expiresAt.
+func (h *AuthHandler) setRefreshCookie(c *gin.Context, rawRefresh string, expiresAt time.Time) {
+	maxAge := int(time.Until(expiresAt).Seconds())
+	setSecureCookie(c, "refresh_token", rawRefresh, maxAge, "/api/v1/auth/refresh", h.requestIsHTTPS(c), true)
+}
+
+// issueSessionCookie sets the 24-hour session cookie alone.
+func (h *AuthHandler) issueSessionCookie(c *gin.Context, user *model.User) {
 	// JWT includes admin claim for convenience, but the authoritative check
 	// happens at request time via DB role lookup in SessionAuth middleware.
 	token, _ := middleware.IssueJWT(
@@ -154,13 +181,6 @@ func (h *AuthHandler) issueSession(c *gin.Context, user *model.User) {
 		user.IsAdmin(), 24*time.Hour,
 	)
 	setSecureCookie(c, "session", token, 24*3600, "/", h.requestIsHTTPS(c), true)
-
-	// Long-lived refresh token (30 days)
-	rawRefresh := randomHex(32)
-	refreshHash := hashToken(rawRefresh)
-	expiresAt := time.Now().Add(30 * 24 * time.Hour)
-	_ = h.Store.CreateRefreshToken(c, user.ID, refreshHash, expiresAt)
-	setSecureCookie(c, "refresh_token", rawRefresh, 30*24*3600, "/api/v1/auth/refresh", h.requestIsHTTPS(c), true)
 }
 
 func hashToken(raw string) string {

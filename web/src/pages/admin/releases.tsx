@@ -1,21 +1,18 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   AlertTriangle,
-  Check,
   ChevronRight,
-  Copy,
-  Download,
-  KeyRound,
+  MoreVertical,
   Package,
   Plus,
   Rocket,
-  RotateCw,
+  Settings2,
   Trash2,
   Upload,
   X,
 } from "lucide-react"
 import { type ChangeEvent, useEffect, useRef, useState } from "react"
-import { Link } from "react-router-dom"
+import { Link, useSearchParams } from "react-router-dom"
 import { ProductSelect } from "@/components/product-select"
 import { showToast } from "@/components/toast"
 import {
@@ -51,29 +48,21 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { useI18n } from "@/i18n"
 import {
-  admin,
-  RELEASE_CHANNELS,
-  RELEASE_PLATFORMS,
-  type Release,
-  type ReleaseArtifact,
-  type ReleaseSigningKey,
-} from "@/lib/api"
+  RELEASE_PRODUCT_TYPES,
+  rich,
+  SETTINGS_TABS,
+  type SettingsTab,
+  UpdateSettingsDialog,
+} from "@/components/update-settings"
+import { useI18n } from "@/i18n"
+import { admin, RELEASE_CHANNELS, RELEASE_PLATFORMS, type Release, type ReleaseArtifact } from "@/lib/api"
+import { compareSemver } from "@/lib/semver"
 import { formatDate } from "@/lib/utils"
 
 const PAGE_SIZE = 20
 
-// Releases belong to products that ship installable binaries. The
-// server enforces it; the pickers here ask for the same set so an
-// admin never fills in a form the server will then refuse.
-const RELEASE_PRODUCT_TYPES = ["desktop", "hybrid"]
-
 export default function ReleasesPage() {
-  // Only the heading is translated so far: the sidebar names this
-  // section from the same key, and the two reading differently on one
-  // screen is the confusing part. The rest of the page is still
-  // English.
   const { t } = useI18n()
   const qc = useQueryClient()
   const [productFilter, setProductFilter] = useState("")
@@ -84,7 +73,20 @@ export default function ReleasesPage() {
   const [yanking, setYanking] = useState<Release | null>(null)
   const [unyanking, setUnyanking] = useState<Release | null>(null)
   const [deleting, setDeleting] = useState<Release | null>(null)
-  const [showSigningKeys, setShowSigningKeys] = useState(false)
+  // ?settings=<product id>&tab=access opens Update settings, so other
+  // pages (a plan's update period, for one) can link straight to it.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const settingsParam = searchParams.get("settings")
+  const tabParam = searchParams.get("tab") as SettingsTab | null
+  const [settings, setSettings] = useState<{ productId: string; tab: SettingsTab } | null>(
+    settingsParam !== null
+      ? { productId: settingsParam, tab: tabParam && SETTINGS_TABS.includes(tabParam) ? tabParam : "signing" }
+      : null,
+  )
+  const closeSettings = () => {
+    setSettings(null)
+    if (settingsParam !== null) setSearchParams({}, { replace: true })
+  }
   const [openRelease, setOpenRelease] = useState<Release | null>(null)
   const [confirmPublish, setConfirmPublish] = useState<{ rel: Release; latest: string } | null>(null)
 
@@ -124,7 +126,7 @@ export default function ReleasesPage() {
     mutationFn: admin.publishRelease,
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["admin", "releases"] })
-      showToast("Release published", "success")
+      showToast(t("releases.toastPublished"), "success")
     },
     onError: (e: Error) => showToast(e.message, "error"),
   })
@@ -132,7 +134,7 @@ export default function ReleasesPage() {
     mutationFn: admin.unyankRelease,
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["admin", "releases"] })
-      showToast("Release unyanked", "success")
+      showToast(t("releases.toastUnyanked"), "success")
       setUnyanking(null)
     },
     onError: (e: Error) => showToast(e.message, "error"),
@@ -142,7 +144,7 @@ export default function ReleasesPage() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["admin", "releases"] })
       setDeleting(null)
-      showToast("Draft deleted", "success")
+      showToast(t("releases.toastDraftDeleted"), "success")
     },
     onError: (e: Error) => showToast(e.message, "error"),
   })
@@ -155,30 +157,26 @@ export default function ReleasesPage() {
       <div className="space-y-6">
         <div>
           <h1 className="text-2xl font-bold tracking-tight sr-only md:not-sr-only">{t("nav.releases")}</h1>
-          <p className="text-muted-foreground">
-            Distribute software updates to your customers via Sparkle, Velopack, or Tauri.
-          </p>
+          <p className="text-muted-foreground">{t("releases.subtitle")}</p>
         </div>
         <Card>
           <CardContent className="py-12 text-center">
             <Package className="h-12 w-12 mx-auto text-muted-foreground mb-4" />
             {hasAnyProducts ? (
               <>
-                <p className="text-lg font-medium">No release-eligible products</p>
-                <p className="text-muted-foreground mt-1 mb-4">
-                  Release feeds are available for desktop and hybrid products only. Your existing products are all SaaS
-                  — change a product's type or create a new desktop/hybrid one.
-                </p>
+                <p className="text-lg font-medium">{t("releases.noEligibleTitle")}</p>
+                <p className="text-muted-foreground mt-1 mb-4">{t("releases.noEligibleDesc")}</p>
               </>
             ) : (
               <>
-                <p className="text-lg font-medium">No products yet</p>
-                <p className="text-muted-foreground mt-1 mb-4">Create a product before publishing releases.</p>
+                <p className="text-lg font-medium">{t("releases.noProductsTitle")}</p>
+                <p className="text-muted-foreground mt-1 mb-4">{t("releases.noProductsDesc")}</p>
               </>
             )}
             <Button asChild>
               <Link to="/admin/products">
-                <Plus className="h-4 w-4 mr-2" /> {hasAnyProducts ? "Manage products" : "Create product"}
+                <Plus className="h-4 w-4 mr-2" />{" "}
+                {hasAnyProducts ? t("releases.manageProducts") : t("releases.createProduct")}
               </Link>
             </Button>
           </CardContent>
@@ -192,16 +190,14 @@ export default function ReleasesPage() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="min-w-0">
           <h1 className="text-2xl font-bold tracking-tight sr-only md:not-sr-only">{t("nav.releases")}</h1>
-          <p className="text-muted-foreground">
-            Distribute software updates to your customers via Sparkle, Velopack, or Tauri.
-          </p>
+          <p className="text-muted-foreground">{t("releases.subtitle")}</p>
         </div>
         <div className="flex gap-2">
-          <Button variant="outline" onClick={() => setShowSigningKeys(true)}>
-            <KeyRound className="h-4 w-4 mr-2" /> Signing keys
+          <Button variant="outline" onClick={() => setSettings({ productId: productFilter, tab: "signing" })}>
+            <Settings2 className="h-4 w-4 mr-2" /> {t("releases.updateSettings")}
           </Button>
           <Button onClick={() => setCreating(true)}>
-            <Plus className="h-4 w-4 mr-2" /> New release
+            <Plus className="h-4 w-4 mr-2" /> {t("releases.newRelease")}
           </Button>
         </div>
       </div>
@@ -210,15 +206,15 @@ export default function ReleasesPage() {
         <ProductSelect
           value={productFilter}
           onChange={setProductFilter}
-          allLabel="All products"
+          allLabel={t("releases.allProducts")}
           types={RELEASE_PRODUCT_TYPES}
         />
         <Select value={channelFilter || "all"} onValueChange={(v) => setChannelFilter(v === "all" ? "" : v)}>
           <SelectTrigger className="w-36">
-            <SelectValue placeholder="All channels" />
+            <SelectValue placeholder={t("releases.allChannels")} />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="all">All channels</SelectItem>
+            <SelectItem value="all">{t("releases.allChannels")}</SelectItem>
             {RELEASE_CHANNELS.map((c) => (
               <SelectItem key={c} value={c}>
                 {c}
@@ -228,13 +224,13 @@ export default function ReleasesPage() {
         </Select>
         <Select value={statusFilter || "all"} onValueChange={(v) => setStatusFilter(v === "all" ? "" : v)}>
           <SelectTrigger className="w-36">
-            <SelectValue placeholder="All statuses" />
+            <SelectValue placeholder={t("releases.allStatuses")} />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="all">All statuses</SelectItem>
-            <SelectItem value="draft">Draft</SelectItem>
-            <SelectItem value="published">Published</SelectItem>
-            <SelectItem value="yanked">Yanked</SelectItem>
+            <SelectItem value="all">{t("releases.allStatuses")}</SelectItem>
+            <SelectItem value="draft">{t("releases.statusDraft")}</SelectItem>
+            <SelectItem value="published">{t("releases.statusPublished")}</SelectItem>
+            <SelectItem value="yanked">{t("releases.statusYanked")}</SelectItem>
           </SelectContent>
         </Select>
       </div>
@@ -242,20 +238,20 @@ export default function ReleasesPage() {
       <DataTable>
         <DataTableHeader>
           <DataTableRow>
-            <DataTableHead>Product</DataTableHead>
-            <DataTableHead>Version</DataTableHead>
-            <DataTableHead>Channel</DataTableHead>
-            <DataTableHead>Platforms</DataTableHead>
-            <DataTableHead>Status</DataTableHead>
-            <DataTableHead>Created</DataTableHead>
-            <DataTableHead className="text-right">Actions</DataTableHead>
+            <DataTableHead>{t("common.product")}</DataTableHead>
+            <DataTableHead>{t("releases.version")}</DataTableHead>
+            <DataTableHead>{t("releases.channel")}</DataTableHead>
+            <DataTableHead>{t("releases.platforms")}</DataTableHead>
+            <DataTableHead>{t("common.status")}</DataTableHead>
+            <DataTableHead>{t("common.created")}</DataTableHead>
+            <DataTableHead className="text-right">{t("common.actions")}</DataTableHead>
           </DataTableRow>
         </DataTableHeader>
         <DataTableBody>
           {isLoading ? (
-            <DataTableEmpty colSpan={7} message="Loading..." />
+            <DataTableEmpty colSpan={7} message={t("common.loading")} />
           ) : releases.length === 0 ? (
-            <DataTableEmpty colSpan={7} message='No releases yet. Click "New release" to start.' />
+            <DataTableEmpty colSpan={7} message={t("releases.empty")} />
           ) : (
             releases.map((rel) => {
               const bucketKey = `${rel.product_id}|${rel.channel}`
@@ -275,7 +271,7 @@ export default function ReleasesPage() {
                       type="button"
                       className="hover:underline"
                       onClick={() => setOpenRelease(rel)}
-                      title="Open release detail"
+                      title={t("releases.openDetail")}
                     >
                       {rel.version}
                     </button>
@@ -283,9 +279,9 @@ export default function ReleasesPage() {
                       <Badge
                         variant="outline"
                         className="ml-1.5 text-[10px] py-0 px-1.5 border-amber-500 text-amber-700"
-                        title={`Below current latest (${latestInBucket})`}
+                        title={t("releases.belowLatestTitle", { latest: latestInBucket ?? "" })}
                       >
-                        below latest
+                        {t("releases.belowLatest")}
                       </Badge>
                     )}
                   </DataTableCell>
@@ -299,7 +295,9 @@ export default function ReleasesPage() {
                       <span className="text-muted-foreground">—</span>
                     ) : (
                       <span className="font-mono text-xs">
-                        {artifacts.length} platform{artifacts.length === 1 ? "" : "s"}
+                        {t(artifacts.length === 1 ? "releases.platformCountOne" : "releases.platformCountMany", {
+                          count: artifacts.length,
+                        })}
                       </span>
                     )}
                   </DataTableCell>
@@ -309,14 +307,23 @@ export default function ReleasesPage() {
                   <DataTableCell className="text-sm text-muted-foreground">{formatDate(rel.created_at)}</DataTableCell>
                   <DataTableCell className="text-right">
                     <DropdownMenu>
+                      {/* A row's actions depend on its status (publish a draft,
+                        yank a published release, unyank a yanked one), so
+                        they live behind one overflow icon under the Actions
+                        column instead of a second "Actions" label. */}
                       <DropdownMenuTrigger asChild>
-                        <Button variant="ghost" size="sm">
-                          Actions
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          title={t("common.actions")}
+                          aria-label={t("common.actions")}
+                        >
+                          <MoreVertical className="h-4 w-4" />
                         </Button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
                         <DropdownMenuItem onClick={() => setOpenRelease(rel)}>
-                          <ChevronRight className="h-3.5 w-3.5 mr-2" /> View / manage artifacts
+                          <ChevronRight className="h-3.5 w-3.5 mr-2" /> {t("releases.viewArtifacts")}
                         </DropdownMenuItem>
                         <DropdownMenuSeparator />
                         {rel.status === "draft" && allReady && (
@@ -329,30 +336,33 @@ export default function ReleasesPage() {
                               }
                             }}
                           >
-                            <Rocket className="h-3.5 w-3.5 mr-2" /> Publish
+                            <Rocket className="h-3.5 w-3.5 mr-2" /> {t("releases.publish")}
                           </DropdownMenuItem>
                         )}
                         {rel.status === "draft" && !allReady && (
                           <DropdownMenuItem disabled>
-                            Awaiting artifacts ({artifacts.filter((a) => a.sha256).length}/{artifacts.length} ready)
+                            {t("releases.awaitingArtifacts", {
+                              ready: artifacts.filter((a) => a.sha256).length,
+                              total: artifacts.length,
+                            })}
                           </DropdownMenuItem>
                         )}
                         {rel.status === "published" && (
                           <DropdownMenuItem onClick={() => setYanking(rel)} className="text-destructive">
-                            <AlertTriangle className="h-3.5 w-3.5 mr-2" /> Yank
+                            <AlertTriangle className="h-3.5 w-3.5 mr-2" /> {t("releases.yank")}
                           </DropdownMenuItem>
                         )}
                         {rel.status === "yanked" && (
-                          <DropdownMenuItem onClick={() => setUnyanking(rel)}>Unyank</DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => setUnyanking(rel)}>{t("releases.unyank")}</DropdownMenuItem>
                         )}
                         <DropdownMenuSeparator />
                         {rel.status === "draft" ? (
                           <DropdownMenuItem className="text-destructive" onClick={() => setDeleting(rel)}>
-                            <Trash2 className="h-3.5 w-3.5 mr-2" /> Delete draft
+                            <Trash2 className="h-3.5 w-3.5 mr-2" /> {t("releases.deleteDraft")}
                           </DropdownMenuItem>
                         ) : (
                           <DropdownMenuItem disabled>
-                            <Trash2 className="h-3.5 w-3.5 mr-2" /> Delete (yank instead)
+                            <Trash2 className="h-3.5 w-3.5 mr-2" /> {t("releases.deleteYankInstead")}
                           </DropdownMenuItem>
                         )}
                       </DropdownMenuContent>
@@ -388,34 +398,40 @@ export default function ReleasesPage() {
         <AlertDialog open onOpenChange={() => setUnyanking(null)}>
           <AlertDialogContent>
             <AlertDialogHeader>
-              <AlertDialogTitle>Unyank v{unyanking.version}?</AlertDialogTitle>
+              <AlertDialogTitle>{t("releases.unyankTitle", { version: unyanking.version })}</AlertDialogTitle>
               <AlertDialogDescription>
-                This restores the release to the public update feed. SDK clients on the affected channel will start
-                receiving v{unyanking.version} as a valid update again.
+                {t("releases.unyankDesc", { version: unyanking.version })}
               </AlertDialogDescription>
             </AlertDialogHeader>
             <div className="flex justify-end gap-2">
-              <AlertDialogCancel>Cancel</AlertDialogCancel>
-              <AlertDialogAction onClick={() => unyanking && unyankMut.mutate(unyanking.id)}>Unyank</AlertDialogAction>
+              <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+              <AlertDialogAction onClick={() => unyanking && unyankMut.mutate(unyanking.id)}>
+                {t("releases.unyank")}
+              </AlertDialogAction>
             </div>
           </AlertDialogContent>
         </AlertDialog>
       )}
-      {showSigningKeys && <SigningKeysDialog onClose={() => setShowSigningKeys(false)} />}
+      {settings && (
+        <UpdateSettingsDialog
+          key={`${settings.productId}-${settings.tab}`}
+          initialProductId={settings.productId}
+          initialTab={settings.tab}
+          lockProduct={settings.productId !== ""}
+          onClose={closeSettings}
+        />
+      )}
       {deleting && (
         <AlertDialog open onOpenChange={() => setDeleting(null)}>
           <AlertDialogContent>
             <AlertDialogHeader>
-              <AlertDialogTitle>Delete draft release?</AlertDialogTitle>
-              <AlertDialogDescription>
-                Permanently removes the draft and its uploaded artifacts. Published or yanked releases cannot be
-                deleted.
-              </AlertDialogDescription>
+              <AlertDialogTitle>{t("releases.deleteDraftTitle")}</AlertDialogTitle>
+              <AlertDialogDescription>{t("releases.deleteDraftDesc")}</AlertDialogDescription>
             </AlertDialogHeader>
             <div className="flex justify-end gap-2 pt-2">
-              <AlertDialogCancel>Cancel</AlertDialogCancel>
+              <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
               <AlertDialogAction onClick={() => deleteMut.mutate(deleting.id)} disabled={deleteMut.isPending}>
-                Delete
+                {t("common.delete")}
               </AlertDialogAction>
             </div>
           </AlertDialogContent>
@@ -425,23 +441,23 @@ export default function ReleasesPage() {
         <AlertDialog open onOpenChange={() => setConfirmPublish(null)}>
           <AlertDialogContent>
             <AlertDialogHeader>
-              <AlertDialogTitle>Publish a version below current latest?</AlertDialogTitle>
+              <AlertDialogTitle>{t("releases.publishOlderTitle")}</AlertDialogTitle>
               <AlertDialogDescription>
-                Publishing <strong>{confirmPublish.rel.version}</strong>, older than{" "}
-                <strong>{confirmPublish.latest}</strong>. Velopack and Tauri reject downgrades by default; Sparkle's
-                standard comparator is not SemVer-aware. This release will appear in your history out of order —
-                appropriate for backports.
+                {rich(t("releases.publishOlderDesc"), {
+                  version: <strong>{confirmPublish.rel.version}</strong>,
+                  latest: <strong>{confirmPublish.latest}</strong>,
+                })}
               </AlertDialogDescription>
             </AlertDialogHeader>
             <div className="flex justify-end gap-2 pt-2">
-              <AlertDialogCancel>Cancel</AlertDialogCancel>
+              <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
               <AlertDialogAction
                 onClick={() => {
                   publishMut.mutate(confirmPublish.rel.id)
                   setConfirmPublish(null)
                 }}
               >
-                Publish anyway
+                {t("releases.publishAnyway")}
               </AlertDialogAction>
             </div>
           </AlertDialogContent>
@@ -452,6 +468,15 @@ export default function ReleasesPage() {
 }
 
 function StatusBadge({ status, yankedReason }: { status: string; yankedReason?: string }) {
+  const { t } = useI18n()
+  const label =
+    status === "published"
+      ? t("releases.badgePublished")
+      : status === "yanked"
+        ? t("releases.badgeYanked")
+        : status === "draft"
+          ? t("releases.badgeDraft")
+          : status
   const cls =
     status === "published"
       ? "bg-emerald-100 text-emerald-800"
@@ -461,7 +486,7 @@ function StatusBadge({ status, yankedReason }: { status: string; yankedReason?: 
   return (
     <Badge className={cls} title={yankedReason}>
       {status === "yanked" && <AlertTriangle className="h-3 w-3 mr-1" />}
-      {status}
+      {label}
     </Badge>
   )
 }
@@ -469,6 +494,7 @@ function StatusBadge({ status, yankedReason }: { status: string; yankedReason?: 
 // ─── Create Release Dialog (release metadata only; no artifacts yet) ──────
 
 function CreateReleaseDialog({ onClose, onCreated }: { onClose: () => void; onCreated: (rel: Release) => void }) {
+  const { t } = useI18n()
   const qc = useQueryClient()
   // Empty until picked: the candidates are searched on the server, so
   // there is no "first product" on hand to default to — and defaulting
@@ -492,7 +518,7 @@ function CreateReleaseDialog({ onClose, onCreated }: { onClose: () => void; onCr
       }),
     onSuccess: (rel) => {
       qc.invalidateQueries({ queryKey: ["admin", "releases"] })
-      showToast(`Draft ${rel.version} created. Add artifacts to publish.`, "success")
+      showToast(t("releases.toastDraftCreated", { version: rel.version }), "success")
       onCreated(rel)
     },
     onError: (e: Error) => setError(e.message),
@@ -500,17 +526,15 @@ function CreateReleaseDialog({ onClose, onCreated }: { onClose: () => void; onCr
 
   return (
     <Dialog open onOpenChange={onClose}>
-      <DialogContent className="max-w-lg">
+      <DialogContent className="max-w-lg h-[min(570px,85vh)]">
         <DialogHeader>
-          <DialogTitle>New release</DialogTitle>
-          <DialogDescription>
-            Create the release record. You'll add platform-specific binaries (artifacts) in the next step.
-          </DialogDescription>
+          <DialogTitle>{t("releases.newRelease")}</DialogTitle>
+          <DialogDescription>{t("releases.createDesc")}</DialogDescription>
         </DialogHeader>
         <DialogBody>
           <div className="space-y-4 py-2">
             <div className="space-y-2">
-              <Label>Product</Label>
+              <Label>{t("common.product")}</Label>
               <ProductSelect
                 value={productId}
                 onChange={setProductId}
@@ -520,11 +544,11 @@ function CreateReleaseDialog({ onClose, onCreated }: { onClose: () => void; onCr
             </div>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label>Version</Label>
+                <Label>{t("releases.version")}</Label>
                 <Input placeholder="1.2.3" value={version} onChange={(e) => setVersion(e.target.value)} />
               </div>
               <div className="space-y-2">
-                <Label>Channel</Label>
+                <Label>{t("releases.channel")}</Label>
                 <Select value={channel} onValueChange={(v) => setChannel(v as typeof channel)}>
                   <SelectTrigger>
                     <SelectValue />
@@ -540,14 +564,14 @@ function CreateReleaseDialog({ onClose, onCreated }: { onClose: () => void; onCr
               </div>
             </div>
             <div className="space-y-2">
-              <Label>Display name (optional)</Label>
+              <Label>{t("releases.displayName")}</Label>
               <Input placeholder="MyApp Pro" value={name} onChange={(e) => setName(e.target.value)} />
             </div>
             <div className="space-y-2">
-              <Label>Release notes (optional, markdown)</Label>
+              <Label>{t("releases.releaseNotes")}</Label>
               <textarea
                 rows={4}
-                placeholder="What's new in this version..."
+                placeholder={t("releases.releaseNotesPlaceholder")}
                 value={releaseNotes}
                 onChange={(e) => setReleaseNotes(e.target.value)}
                 className="flex min-h-[60px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -557,10 +581,10 @@ function CreateReleaseDialog({ onClose, onCreated }: { onClose: () => void; onCr
           </div>
           <div className="flex justify-end gap-2 pt-2">
             <Button variant="outline" onClick={onClose}>
-              Cancel
+              {t("common.cancel")}
             </Button>
             <Button onClick={() => mut.mutate()} disabled={!productId || !version || mut.isPending}>
-              {mut.isPending ? "Creating..." : "Create draft"}
+              {mut.isPending ? t("releases.creating") : t("releases.createDraft")}
             </Button>
           </div>
         </DialogBody>
@@ -572,6 +596,7 @@ function CreateReleaseDialog({ onClose, onCreated }: { onClose: () => void; onCr
 // ─── Release Detail Dialog (manage artifacts) ─────────────────────────────
 
 function ReleaseDetailDialog({ release, onClose }: { release: Release; onClose: () => void }) {
+  const { t } = useI18n()
   const qc = useQueryClient()
   const { data: latest } = useQuery({
     queryKey: ["admin", "release", release.id],
@@ -597,7 +622,7 @@ function ReleaseDetailDialog({ release, onClose }: { release: Release; onClose: 
 
   return (
     <Dialog open onOpenChange={onClose}>
-      <DialogContent className="max-w-2xl">
+      <DialogContent className="max-w-2xl h-[min(580px,85vh)]">
         <DialogHeader>
           <DialogTitle>
             {rel.product?.name || rel.product_id} {rel.version}
@@ -607,20 +632,20 @@ function ReleaseDetailDialog({ release, onClose }: { release: Release; onClose: 
             <StatusBadge status={rel.status} />
           </DialogTitle>
           <DialogDescription>
-            {rel.status === "draft" ? (
-              <>Add platform binaries below. Publish when ready.</>
-            ) : (
-              <>This release is {rel.status}. Artifacts cannot be modified.</>
-            )}
+            {rel.status === "draft"
+              ? t("releases.detailDraftDesc")
+              : rel.status === "yanked"
+                ? t("releases.detailYankedDesc")
+                : t("releases.detailPublishedDesc")}
           </DialogDescription>
         </DialogHeader>
         <DialogBody>
           <div className="space-y-4 py-2">
             <div>
-              <p className="text-sm font-medium mb-2">Artifacts ({artifacts.length})</p>
+              <p className="text-sm font-medium mb-2">{t("releases.artifactsCount", { count: artifacts.length })}</p>
               {artifacts.length === 0 ? (
                 <p className="text-xs text-muted-foreground py-4 text-center bg-muted/50 rounded">
-                  No artifacts yet — add at least one platform before publishing.
+                  {t("releases.noArtifacts")}
                 </p>
               ) : (
                 <div className="space-y-2">
@@ -638,7 +663,8 @@ function ReleaseDetailDialog({ release, onClose }: { release: Release; onClose: 
 
             {rel.status === "draft" && remainingPlatforms.length > 0 && (
               <Button onClick={() => setAdding(true)} variant="outline" className="w-full">
-                <Plus className="h-4 w-4 mr-2" /> Add artifact ({remainingPlatforms.length} platforms remaining)
+                <Plus className="h-4 w-4 mr-2" />{" "}
+                {t("releases.addArtifactRemaining", { count: remainingPlatforms.length })}
               </Button>
             )}
           </div>
@@ -670,27 +696,38 @@ function ArtifactRow({
   canEdit: boolean
   onDelete: () => void
 }) {
+  const { t } = useI18n()
   const ready = !!artifact.sha256
   return (
     <div className="flex items-center gap-3 bg-muted/50 rounded px-3 py-2 text-sm">
       <Badge variant="outline" className="font-mono text-[10px]">
         {artifact.platform}
       </Badge>
-      <span className="text-muted-foreground text-xs flex-1 truncate">
-        {ready ? `${formatBytes(artifact.file_size)} · sha256:${artifact.sha256.slice(0, 12)}…` : "Not uploaded yet"}
+      <span className="text-muted-foreground text-xs flex-1 truncate" title={artifact.filename || undefined}>
+        {artifact.filename && <span className="text-foreground">{artifact.filename} · </span>}
+        {ready
+          ? `${formatBytes(artifact.file_size)} · sha256:${artifact.sha256.slice(0, 12)}…`
+          : t("releases.notUploaded")}
       </span>
       {ready && artifact.ed25519_sig && (
         <Badge variant="outline" className="text-[10px]" title={artifact.signing_key_id}>
-          signed
+          {t("releases.signed")}
         </Badge>
       )}
       {ready ? (
-        <Badge className="bg-emerald-100 text-emerald-800 text-[10px]">ready</Badge>
+        <Badge className="bg-emerald-100 text-emerald-800 text-[10px]">{t("releases.ready")}</Badge>
       ) : (
-        <Badge className="bg-amber-100 text-amber-800 text-[10px]">pending</Badge>
+        <Badge className="bg-amber-100 text-amber-800 text-[10px]">{t("releases.pending")}</Badge>
       )}
       {canEdit && (
-        <Button variant="ghost" size="icon" className="h-7 w-7 text-destructive" onClick={onDelete}>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7 text-destructive"
+          onClick={onDelete}
+          title={t("releases.removeArtifact")}
+          aria-label={t("releases.removeArtifact")}
+        >
           <X className="h-3.5 w-3.5" />
         </Button>
       )}
@@ -711,6 +748,7 @@ function AddArtifactDialog({
   onClose: () => void
   onAdded: () => void
 }) {
+  const { t } = useI18n()
   const qc = useQueryClient()
   const [platform, setPlatform] = useState(availablePlatforms[0] || "")
   const [file, setFile] = useState<File | null>(null)
@@ -732,7 +770,7 @@ function AddArtifactDialog({
   const handleSubmit = async () => {
     setError("")
     if (!platform || !file) {
-      setError("Platform and file are required")
+      setError(t("releases.platformAndFileRequired"))
       return
     }
     try {
@@ -751,7 +789,7 @@ function AddArtifactDialog({
         headers: { "Content-Type": file.type || "application/octet-stream" },
       })
       if (!putResp.ok) {
-        throw new Error(`Upload failed: ${putResp.status} ${putResp.statusText}`)
+        throw new Error(t("releases.uploadFailed", { status: putResp.status, statusText: putResp.statusText }))
       }
 
       setProgress("finalizing")
@@ -761,7 +799,7 @@ function AddArtifactDialog({
       const expected_sha256 = file.size <= CLIENT_HASH_MAX_BYTES ? await sha256Hex(file) : undefined
       await admin.finalizeArtifact(release.id, init.artifact.id, { expected_sha256 })
 
-      showToast(`Artifact for ${platform} uploaded`, "success")
+      showToast(t("releases.toastArtifactUploaded", { platform }), "success")
       onAdded()
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
@@ -777,18 +815,15 @@ function AddArtifactDialog({
 
   return (
     <Dialog open onOpenChange={busy ? undefined : onClose}>
-      <DialogContent>
+      <DialogContent className="h-[min(420px,85vh)]">
         <DialogHeader>
-          <DialogTitle>Add artifact</DialogTitle>
-          <DialogDescription>
-            Upload a platform binary for {release.version}. The file goes directly to storage; we sign + finalize on
-            publish.
-          </DialogDescription>
+          <DialogTitle>{t("releases.addArtifact")}</DialogTitle>
+          <DialogDescription>{t("releases.addArtifactDesc", { version: release.version })}</DialogDescription>
         </DialogHeader>
         <DialogBody>
           <div className="space-y-4 py-2">
             <div className="space-y-2">
-              <Label>Platform</Label>
+              <Label>{t("releases.platform")}</Label>
               <Select value={platform} onValueChange={setPlatform} disabled={busy}>
                 <SelectTrigger>
                   <SelectValue />
@@ -803,7 +838,7 @@ function AddArtifactDialog({
               </Select>
             </div>
             <div className="space-y-2">
-              <Label>Artifact file</Label>
+              <Label>{t("releases.artifactFile")}</Label>
               <input
                 ref={fileInputRef}
                 type="file"
@@ -820,19 +855,19 @@ function AddArtifactDialog({
             {error && <p className="text-sm text-destructive">{error}</p>}
             {busy && (
               <div className="text-sm space-y-1 bg-muted rounded-md p-3">
-                {progress === "init" && "Reserving artifact slot..."}
-                {progress === "uploading" && "Uploading to storage..."}
-                {progress === "finalizing" && "Computing SHA-256 + finalizing..."}
+                {progress === "init" && t("releases.progressInit")}
+                {progress === "uploading" && t("releases.progressUploading")}
+                {progress === "finalizing" && t("releases.progressFinalizing")}
               </div>
             )}
           </div>
           <div className="flex justify-end gap-2 pt-2">
             <Button variant="outline" onClick={onClose} disabled={busy}>
-              Cancel
+              {t("common.cancel")}
             </Button>
             <Button onClick={handleSubmit} disabled={busy || !file || !platform}>
               <Upload className="h-4 w-4 mr-2" />
-              {busy ? "Working..." : "Upload"}
+              {busy ? t("releases.working") : t("releases.upload")}
             </Button>
           </div>
         </DialogBody>
@@ -842,13 +877,14 @@ function AddArtifactDialog({
 }
 
 function YankDialog({ release, onClose }: { release: Release; onClose: () => void }) {
+  const { t } = useI18n()
   const qc = useQueryClient()
   const [reason, setReason] = useState("")
   const yankMut = useMutation({
     mutationFn: (r: string) => admin.yankRelease(release.id, r),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["admin", "releases"] })
-      showToast("Release yanked", "success")
+      showToast(t("releases.toastYanked"), "success")
       onClose()
     },
     onError: (e: Error) => showToast(e.message, "error"),
@@ -858,18 +894,15 @@ function YankDialog({ release, onClose }: { release: Release; onClose: () => voi
     <Dialog open onOpenChange={onClose}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Yank {release.version}?</DialogTitle>
-          <DialogDescription>
-            Yanking removes this release (and ALL its artifacts) from update feeds. Existing installs continue working.
-            Provide a reason — recorded in the audit log.
-          </DialogDescription>
+          <DialogTitle>{t("releases.yankTitle", { version: release.version })}</DialogTitle>
+          <DialogDescription>{t("releases.yankDesc")}</DialogDescription>
         </DialogHeader>
         <DialogBody>
           <div className="space-y-2 py-2">
-            <Label>Reason</Label>
+            <Label>{t("releases.reason")}</Label>
             <textarea
               rows={3}
-              placeholder="Critical bug in v1.2.3 affecting Windows users; rollback recommended."
+              placeholder={t("releases.yankPlaceholder")}
               value={reason}
               onChange={(e) => setReason(e.target.value)}
               className="flex min-h-[60px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -877,14 +910,14 @@ function YankDialog({ release, onClose }: { release: Release; onClose: () => voi
           </div>
           <div className="flex justify-end gap-2 pt-2">
             <Button variant="outline" onClick={onClose}>
-              Cancel
+              {t("common.cancel")}
             </Button>
             <Button
               variant="destructive"
               onClick={() => yankMut.mutate(reason)}
               disabled={!reason.trim() || yankMut.isPending}
             >
-              Yank
+              {t("releases.yank")}
             </Button>
           </div>
         </DialogBody>
@@ -913,60 +946,6 @@ async function sha256Hex(file: File): Promise<string> {
     hex += bytes[i].toString(16).padStart(2, "0")
   }
   return hex
-}
-
-function parseSemver(v: string): [number, number, number, string] | null {
-  const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(v)
-  if (!m) return null
-  for (const part of [m[1], m[2], m[3]]) {
-    if (part.length > 1 && part[0] === "0") return null
-  }
-  const pre = m[4] ?? ""
-  if (pre) {
-    for (const id of pre.split(".")) {
-      if (id === "") return null
-      if (/^\d+$/.test(id) && id.length > 1 && id[0] === "0") return null
-    }
-  }
-  return [Number(m[1]), Number(m[2]), Number(m[3]), pre]
-}
-
-function compareSemver(a: string, b: string): number {
-  const pa = parseSemver(a)
-  const pb = parseSemver(b)
-  if (!pa && !pb) return 0
-  if (!pa) return -1
-  if (!pb) return 1
-  for (let i = 0; i < 3; i++) {
-    if (pa[i] !== pb[i]) return (pa[i] as number) - (pb[i] as number)
-  }
-  const preA = pa[3] as string
-  const preB = pb[3] as string
-  if (preA === preB) return 0
-  if (preA === "") return 1
-  if (preB === "") return -1
-  const partsA = preA.split(".")
-  const partsB = preB.split(".")
-  const len = Math.max(partsA.length, partsB.length)
-  for (let i = 0; i < len; i++) {
-    const ai = partsA[i]
-    const bi = partsB[i]
-    if (ai === undefined) return -1
-    if (bi === undefined) return 1
-    const aNum = /^\d+$/.test(ai)
-    const bNum = /^\d+$/.test(bi)
-    if (aNum && bNum) {
-      const diff = Number(ai) - Number(bi)
-      if (diff !== 0) return diff
-    } else if (aNum) {
-      return -1
-    } else if (bNum) {
-      return 1
-    } else if (ai !== bi) {
-      return ai < bi ? -1 : 1
-    }
-  }
-  return 0
 }
 
 // Channel fallback chain (mirrors server behavior).
@@ -999,273 +978,4 @@ function computeLatestVersions(releases: Release[]): Map<string, string> {
     if (max) out.set(key, max)
   }
   return out
-}
-
-// ─── SigningKeysDialog (unchanged from before) ────────────────────────────
-
-function SigningKeysDialog({ onClose }: { onClose: () => void }) {
-  const [productId, setProductId] = useState("")
-
-  return (
-    <Dialog open onOpenChange={onClose}>
-      <DialogContent className="max-w-2xl">
-        <DialogHeader>
-          <DialogTitle>Release signing keys</DialogTitle>
-          <DialogDescription>
-            Generate an Ed25519 keypair per product. The public key is embedded in your client app; the server signs
-            every release artifact with the private key on publish.
-          </DialogDescription>
-        </DialogHeader>
-        <DialogBody>
-          <div className="space-y-2 py-2">
-            <Label>Product</Label>
-            <ProductSelect
-              value={productId}
-              onChange={setProductId}
-              className="w-full"
-              types={RELEASE_PRODUCT_TYPES}
-              placeholder="Select a product"
-            />
-          </div>
-          {productId && <SigningKeysSection productId={productId} />}
-        </DialogBody>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-function SigningKeysSection({ productId }: { productId: string }) {
-  const qc = useQueryClient()
-  const [rotateOpen, setRotateOpen] = useState(false)
-  const [deactivateOpen, setDeactivateOpen] = useState(false)
-
-  const { data, isLoading } = useQuery({
-    queryKey: ["admin", "signing-keys", productId],
-    queryFn: () => admin.listSigningKeys(productId),
-  })
-  const keys = data?.keys || []
-  const active = keys.find((k) => k.active)
-  const history = keys.filter((k) => !k.active)
-
-  const generateMut = useMutation({
-    mutationFn: () => admin.generateSigningKey(productId),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["admin", "signing-keys", productId] })
-      showToast("Signing key generated", "success")
-    },
-    onError: (e: Error) => showToast(e.message, "error"),
-  })
-
-  if (isLoading) return <div className="h-32 animate-pulse bg-muted rounded-md mt-4" />
-
-  return (
-    <div className="space-y-4 mt-4">
-      {!active ? (
-        <Card>
-          <CardContent className="py-8 text-center">
-            <KeyRound className="h-10 w-10 mx-auto text-muted-foreground mb-3" />
-            <p className="font-medium">No active signing key</p>
-            <p className="text-sm text-muted-foreground mb-4">
-              Publishing is blocked until you generate a key (or turn off require_signing on the product to ship
-              unsigned releases).
-            </p>
-            <Button onClick={() => generateMut.mutate()} disabled={generateMut.isPending}>
-              <Plus className="h-4 w-4 mr-2" />
-              {generateMut.isPending ? "Generating..." : "Generate signing key"}
-            </Button>
-          </CardContent>
-        </Card>
-      ) : (
-        <ActiveSigningKeyCard
-          keyRow={active}
-          productId={productId}
-          onRotate={() => setRotateOpen(true)}
-          onDeactivate={() => setDeactivateOpen(true)}
-        />
-      )}
-
-      {history.length > 0 && (
-        <div>
-          <p className="text-sm font-medium mb-2">Past keys ({history.length})</p>
-          <div className="space-y-2">
-            {history.map((k) => (
-              <div key={k.id} className="bg-muted/50 rounded-md px-3 py-2 text-xs">
-                <div className="flex items-center justify-between">
-                  <code className="truncate flex-1 mr-2">{k.public_key}</code>
-                  <span className="text-muted-foreground shrink-0">
-                    rotated {k.rotated_at ? formatDate(k.rotated_at) : "—"}
-                  </span>
-                </div>
-                {k.note && <p className="text-muted-foreground mt-1">{k.note}</p>}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {rotateOpen && active && <RotateKeyDialog productId={productId} onClose={() => setRotateOpen(false)} />}
-      {deactivateOpen && active && (
-        <DeactivateKeyDialog productId={productId} onClose={() => setDeactivateOpen(false)} />
-      )}
-    </div>
-  )
-}
-
-function ActiveSigningKeyCard({
-  keyRow,
-  productId,
-  onRotate,
-  onDeactivate,
-}: {
-  keyRow: ReleaseSigningKey
-  productId: string
-  onRotate: () => void
-  onDeactivate: () => void
-}) {
-  const [copied, setCopied] = useState(false)
-  const copy = () => {
-    navigator.clipboard.writeText(keyRow.public_key)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 1500)
-  }
-
-  return (
-    <Card>
-      <CardContent className="py-4 space-y-3">
-        <div className="flex items-center justify-between">
-          <div>
-            <p className="font-medium text-sm">Active signing key</p>
-            <p className="text-xs text-muted-foreground">Created {formatDate(keyRow.created_at)}</p>
-          </div>
-          <Badge className="bg-emerald-100 text-emerald-800">Active</Badge>
-        </div>
-        <div>
-          <Label className="text-xs">Public key (Ed25519, base64)</Label>
-          <div className="flex items-center gap-2 mt-1 bg-muted rounded-md px-3 py-2">
-            <code className="text-xs flex-1 truncate font-mono">{keyRow.public_key}</code>
-            <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={copy}>
-              {copied ? <Check className="h-3 w-3 text-emerald-600" /> : <Copy className="h-3 w-3" />}
-            </Button>
-          </div>
-          <p className="text-xs text-muted-foreground mt-1">
-            Embed this in your client app's update verifier (Sparkle <code>SUPublicEDKey</code> in Info.plist, or Tauri{" "}
-            <code>pubkey</code>).
-          </p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <Button variant="outline" size="sm" asChild>
-            <a href={admin.publicKeyURL(productId)} download="public_key.pem">
-              <Download className="h-3.5 w-3.5 mr-1.5" />
-              Download .pem
-            </a>
-          </Button>
-          <Button variant="outline" size="sm" onClick={onRotate}>
-            <RotateCw className="h-3.5 w-3.5 mr-1.5" />
-            Rotate
-          </Button>
-          <Button variant="outline" size="sm" className="text-destructive" onClick={onDeactivate}>
-            <Trash2 className="h-3.5 w-3.5 mr-1.5" />
-            Deactivate
-          </Button>
-        </div>
-      </CardContent>
-    </Card>
-  )
-}
-
-function RotateKeyDialog({ productId, onClose }: { productId: string; onClose: () => void }) {
-  const qc = useQueryClient()
-  const [note, setNote] = useState("")
-  const mut = useMutation({
-    mutationFn: (n: string) => admin.rotateSigningKey(productId, n),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["admin", "signing-keys", productId] })
-      showToast("Signing key rotated", "success")
-      onClose()
-    },
-    onError: (e: Error) => showToast(e.message, "error"),
-  })
-
-  return (
-    <Dialog open onOpenChange={onClose}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Rotate signing key?</DialogTitle>
-          <DialogDescription>
-            New keypair generated. Old key is preserved in history but inactive. Existing installs with only the old
-            public key embedded will fail to verify new releases.
-          </DialogDescription>
-        </DialogHeader>
-        <DialogBody>
-          <div className="space-y-2 py-2">
-            <Label>Reason (audit log)</Label>
-            <textarea
-              rows={3}
-              placeholder="Routine rotation; no key compromise."
-              value={note}
-              onChange={(e) => setNote(e.target.value)}
-              className="flex min-h-[60px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-            />
-          </div>
-          <div className="flex justify-end gap-2 pt-2">
-            <Button variant="outline" onClick={onClose}>
-              Cancel
-            </Button>
-            <Button onClick={() => mut.mutate(note)} disabled={mut.isPending}>
-              {mut.isPending ? "Rotating..." : "Rotate"}
-            </Button>
-          </div>
-        </DialogBody>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-function DeactivateKeyDialog({ productId, onClose }: { productId: string; onClose: () => void }) {
-  const qc = useQueryClient()
-  const [note, setNote] = useState("")
-  const mut = useMutation({
-    mutationFn: (n: string) => admin.deactivateSigningKey(productId, n),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["admin", "signing-keys", productId] })
-      showToast("Signing key deactivated", "success")
-      onClose()
-    },
-    onError: (e: Error) => showToast(e.message, "error"),
-  })
-
-  return (
-    <Dialog open onOpenChange={onClose}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Deactivate signing key?</DialogTitle>
-          <DialogDescription>
-            Already-published releases keep their signatures. New releases cannot be published until you generate a new
-            key, unless require_signing is off for the product — then they ship unsigned and clients with strict
-            signature checking will reject them.
-          </DialogDescription>
-        </DialogHeader>
-        <DialogBody>
-          <div className="space-y-2 py-2">
-            <Label>Reason (audit log)</Label>
-            <textarea
-              rows={3}
-              placeholder="Why are you deactivating?"
-              value={note}
-              onChange={(e) => setNote(e.target.value)}
-              className="flex min-h-[60px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-            />
-          </div>
-          <div className="flex justify-end gap-2 pt-2">
-            <Button variant="outline" onClick={onClose}>
-              Cancel
-            </Button>
-            <Button variant="destructive" onClick={() => mut.mutate(note)} disabled={mut.isPending}>
-              {mut.isPending ? "Deactivating..." : "Deactivate"}
-            </Button>
-          </div>
-        </DialogBody>
-      </DialogContent>
-    </Dialog>
-  )
 }

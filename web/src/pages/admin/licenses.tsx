@@ -17,6 +17,7 @@ import {
 } from "lucide-react"
 import { useState } from "react"
 import { Link } from "react-router-dom"
+import { CopyableId } from "@/components/copyable-id"
 import { PlanSelect } from "@/components/plan-select"
 import { ProductSelect } from "@/components/product-select"
 import { showToast } from "@/components/toast"
@@ -89,7 +90,7 @@ function maskKey(hint?: string) {
 }
 
 export default function LicensesPage() {
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const qc = useQueryClient()
   const [productFilter, setProductFilter] = useState<string>("")
   const [statusFilter, setStatusFilter] = useState<string>("")
@@ -163,7 +164,7 @@ export default function LicensesPage() {
         <div className="min-w-0">
           <h1 className="text-2xl font-bold tracking-tight sr-only md:not-sr-only">{t("licenses.title")}</h1>
           <p className="text-muted-foreground">
-            {total} {t("licenses.title").toLowerCase()} total
+            {t(total === 1 ? "licenses.totalOne" : "licenses.totalMany", { count: total.toLocaleString(locale) })}
           </p>
         </div>
         <Button onClick={() => setCreating(true)}>
@@ -239,7 +240,7 @@ export default function LicensesPage() {
                     <DataTableSortHead sort={srt} column="created_at" firstOrder="desc">
                       {t("common.created")}
                     </DataTableSortHead>
-                    <DataTableHead className="w-16" />
+                    <DataTableHead className="w-16 text-right">{t("common.actions")}</DataTableHead>
                   </DataTableRow>
                 </DataTableHeader>
                 <DataTableBody>
@@ -280,8 +281,14 @@ export default function LicensesPage() {
                       <DataTableCell className="text-muted-foreground text-xs">
                         {formatDate(lic.created_at)}
                       </DataTableCell>
-                      <DataTableCell>
-                        <Button variant="ghost" size="icon" onClick={() => setViewing(lic.id)}>
+                      <DataTableCell className="text-right">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          title={t("licenses.detail")}
+                          aria-label={t("licenses.detail")}
+                          onClick={() => setViewing(lic.id)}
+                        >
                           <Eye className="h-4 w-4" />
                         </Button>
                       </DataTableCell>
@@ -375,7 +382,7 @@ function CreateLicenseDialog({
 
   return (
     <Dialog open={open} onOpenChange={onClose}>
-      <DialogContent>
+      <DialogContent className="h-[min(680px,85vh)]">
         <DialogHeader>
           <DialogTitle>{t("licenses.issue")}</DialogTitle>
           <DialogDescription>{t("licenses.issueDesc")}</DialogDescription>
@@ -600,6 +607,7 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
         <DialogHeader>
           <DialogTitle>{t("licenses.detail")}</DialogTitle>
           <DialogDescription>{lic?.email}</DialogDescription>
+          {lic && <CopyableId id={lic.id} />}
         </DialogHeader>
         {isLoading || !lic ? (
           <div className="h-48 animate-pulse bg-muted rounded-lg" />
@@ -702,10 +710,9 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
                           </Button>
                         </div>
                         <p className="text-xs text-muted-foreground">{t("licenses.validUntilClear")}</p>
-                        {/* An expired license stays dead no matter what date
-                          is set — assertUsable short-circuits on the status
-                          before it ever reads valid_until. Say so, or the
-                          admin walks away thinking the edit revived it. */}
+                        {/* Saving a future date (or none) on an expired
+                          license reactivates it — say so before the admin
+                          saves, so the status change is not a surprise. */}
                         {lic.status === "expired" && (
                           <p className="text-xs text-amber-600">{t("licenses.validUntilExpiredHint")}</p>
                         )}
@@ -834,7 +841,9 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
                   {lic.email && (
                     <AlertDialog>
                       <AlertDialogTrigger asChild>
-                        <Button variant="outline" size="sm" disabled={resendMut.isPending}>
+                        {/* Only a key that works is mailed; the server
+                          refuses the rest. */}
+                        <Button variant="outline" size="sm" disabled={resendMut.isPending || !lic.key_usable}>
                           <Mail className="h-4 w-4 mr-1" /> {t("licenses.resendEmail")}
                         </Button>
                       </AlertDialogTrigger>
@@ -854,7 +863,8 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
                       </AlertDialogContent>
                     </AlertDialog>
                   )}
-                  {(lic.status === "active" || lic.status === "trialing") && (
+                  {/* Same states the server suspends: a licence in use. */}
+                  {(lic.status === "active" || lic.status === "trialing" || lic.status === "past_due") && (
                     <AlertDialog>
                       <AlertDialogTrigger asChild>
                         <Button variant="outline" size="sm" disabled={suspendMut.isPending}>
@@ -875,7 +885,13 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
                       </AlertDialogContent>
                     </AlertDialog>
                   )}
-                  {lic.status === "suspended" && (
+                  {/* Mirrors store.ReinstateLicense. An expired or canceled
+                    license whose expiry date has passed would stay unusable
+                    after a reinstate; setting a new expiry date (which
+                    reactivates it) is the way back for those. */}
+                  {(lic.status === "suspended" ||
+                    ((lic.status === "expired" || lic.status === "canceled") &&
+                      (!lic.valid_until || new Date(lic.valid_until) > new Date()))) && (
                     <Button
                       variant="outline"
                       size="sm"
@@ -909,7 +925,9 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
                       </AlertDialogContent>
                     </AlertDialog>
                   )}
-                  {lic.payment_provider && lic.status !== "revoked" && (
+                  {/* Refund cancels the subscription and revokes: only a
+                    licence a subscription bills has one to cancel. */}
+                  {lic.stripe_subscription_id && lic.status !== "revoked" && (
                     <AlertDialog>
                       <AlertDialogTrigger asChild>
                         <Button
@@ -938,7 +956,15 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
                       </AlertDialogContent>
                     </AlertDialog>
                   )}
-                  <Button variant="outline" size="sm" onClick={() => setChangingPlan(true)}>
+                  {/* A Stripe subscription owns the plan of the licence it
+                    bills (the server refuses); a revoked one has none to
+                    change. */}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={!!lic.stripe_subscription_id || lic.status === "revoked"}
+                    onClick={() => setChangingPlan(true)}
+                  >
                     {t("licenses.changePlan")}
                   </Button>
                 </div>

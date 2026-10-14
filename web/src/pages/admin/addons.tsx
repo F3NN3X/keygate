@@ -137,7 +137,7 @@ export default function AddonsPage() {
                     <DataTableHead>{t("plans.value")}</DataTableHead>
                     <DataTableHead>{t("common.status")}</DataTableHead>
                     <DataTableHead>{t("common.created")}</DataTableHead>
-                    <DataTableHead className="w-24" />
+                    <DataTableHead className="w-24 text-right">{t("common.actions")}</DataTableHead>
                   </DataTableRow>
                 </DataTableHeader>
                 <DataTableBody>
@@ -158,7 +158,7 @@ export default function AddonsPage() {
                       </DataTableCell>
                       <DataTableCell className="text-muted-foreground">{formatDate(a.created_at)}</DataTableCell>
                       <DataTableCell>
-                        <div className="flex gap-1">
+                        <div className="flex justify-end gap-1">
                           <Button variant="ghost" size="icon" onClick={() => setEditing(a)}>
                             <Pencil className="h-4 w-4" />
                           </Button>
@@ -267,7 +267,7 @@ function AddonDialog({
 
   return (
     <Dialog open={open} onOpenChange={onClose}>
-      <DialogContent className="max-w-lg">
+      <DialogContent className="max-w-lg h-[min(640px,85vh)]">
         <DialogHeader>
           <DialogTitle>{addon ? t("addons.edit") : t("addons.new")}</DialogTitle>
           <DialogDescription>{t("addons.formDesc")}</DialogDescription>
