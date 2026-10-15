@@ -1,8 +1,8 @@
 # Fork patches — what `custom` carries on top of upstream
 
 `license.deckshot.app` builds from this fork's **`custom`** branch, which is upstream
-`tabloy/keygate`'s `main` plus the patch set below. **Currently tracking upstream v0.1.13** (merged
-2026-10-14; previously v0.1.11, 2026-09-29). The fork's own `main` is kept as a clean mirror of
+`tabloy/keygate`'s `main` plus the patch set below. **Currently tracking upstream v0.1.14** (merged
+2026-10-15; previously v0.1.13, 2026-10-14). The fork's own `main` is kept as a clean mirror of
 upstream, so `git log --oneline main..custom` is the authoritative, current list of deviations — this
 document is its annotated form: what each patch is, why it exists, and where the detail lives.
 
@@ -66,8 +66,9 @@ Grouped by area, newest first within each group. SHAs are the `custom` commits a
   (`deploy/rustfs/docker-compose.yml`) and the config to reach it over its **public** hostname
   (`s3.deckshot.app`), because presigned URLs bind the host into the SigV4 signature and a container
   reaching its host's public address hairpins — fixed with an `extra_hosts` host-gateway entry on the
-  keygate service. `.env.example` documents the `STORAGE_*` variables (on top of upstream's v0.1.13 text it adds
-  `STORAGE_PUBLIC_URL` and `MAX_RELEASE_SIGN_SIZE_MB`, which upstream reads but doesn't list). Files: `docker-compose.yml`,
+  keygate service. `.env.example` adds `MAX_RELEASE_SIGN_SIZE_MB`, which upstream reads but doesn't list. It
+  deliberately leaves out `STORAGE_PUBLIC_URL`: config reads it but nothing uses it, so setting it changes
+  nothing (the compose still forwards it, harmlessly). Files: `docker-compose.yml`,
   `deploy/rustfs/docker-compose.yml`, `.env.example`, `internal/service/release.go`. Operational detail
   (bucket creation, the hairpin) lives in the DeckShot runbook's "Object storage — RustFS" section.
 
