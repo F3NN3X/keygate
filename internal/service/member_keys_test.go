@@ -65,7 +65,7 @@ func TestMemberKeyThroughTheSDK(t *testing.T) {
 	}
 
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
-	ls := NewLicenseService(s, priv, slog.Default(), nil, nil)
+	ls := NewLicenseService(s, priv, slog.Default(), nil, nil, "")
 	seats := NewSeatService(s, NewWebhookService(s, slog.Default(), time.Second, 1, true), nil, slog.Default(), "")
 	notFound := func(err error) bool {
 		var ae *apperr.AppError

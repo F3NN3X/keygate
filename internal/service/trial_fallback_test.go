@@ -639,7 +639,7 @@ func TestTrialNotBilledByStripe_EndsAtItsEndDate(t *testing.T) {
 		t.Fatal(err)
 	}
 	priv := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
-	svc := NewLicenseService(f.s, priv, slog.Default(), nil, nil)
+	svc := NewLicenseService(f.s, priv, slog.Default(), nil, nil, "")
 
 	// A day left: the token stops at the trial's end.
 	end := time.Now().Add(24 * time.Hour).Truncate(time.Second)

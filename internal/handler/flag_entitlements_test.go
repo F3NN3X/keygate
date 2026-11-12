@@ -50,7 +50,7 @@ func TestFlagEntitlementsMatchBooleans(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ls := service.NewLicenseService(f.s, priv, slog.Default(), nil, nil)
+	ls := service.NewLicenseService(f.s, priv, slog.Default(), nil, nil, "")
 	lh := NewLicenseHandler(ls)
 	body := fmt.Sprintf(`{"license_key":%q,"identifier":"device-1"}`, f.licA.LicenseKey)
 
