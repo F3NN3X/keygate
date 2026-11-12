@@ -1,0 +1,1 @@
+-- Nothing to undo: ANALYZE only refreshes the planner's statistics.

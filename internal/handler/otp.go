@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/tabloy/keygate/internal/model"
+	"github.com/tabloy/keygate/internal/store"
 	"github.com/tabloy/keygate/pkg/response"
 )
 
@@ -29,7 +30,14 @@ func (h *AuthHandler) OTPSend(c *gin.Context) {
 		return
 	}
 	email := strings.ToLower(strings.TrimSpace(req.Email))
+	h.sendCode(c, email, true)
+}
 
+// sendCode mails email a login code and writes the response. gated
+// applies the signup_mode gate; self sign-up passes false, because
+// claiming a licence on a plan the operator opened is itself the
+// sign-up that gate is about.
+func (h *AuthHandler) sendCode(c *gin.Context, email string, gated bool) {
 	// Rate limit: max 3 OTP requests per email per 10 minutes
 	count, err := h.Store.CountRecentOTPCodes(c, email)
 	if err != nil {
@@ -37,11 +45,13 @@ func (h *AuthHandler) OTPSend(c *gin.Context) {
 		return
 	}
 	if count >= 3 {
+		// The window is ten minutes; waiting that long always clears it.
+		c.Header("Retry-After", "600")
 		response.Err(c, 429, "RATE_LIMITED", "too many code requests, try again later")
 		return
 	}
 
-	allowed := h.signupAllowed(c, email)
+	allowed := !gated || h.signupAllowed(c, email)
 
 	code := generateOTPCode()
 	codeHash := hashOTPCode(code)
@@ -115,40 +125,8 @@ func (h *AuthHandler) OTPVerify(c *gin.Context) {
 		return
 	}
 	email := strings.ToLower(strings.TrimSpace(req.Email))
-	code := strings.TrimSpace(req.Code)
-
-	otp, err := h.Store.FindLatestValidOTPCode(c, email)
-
-	// Always perform hash comparison to prevent timing-based email enumeration
-	expectedHash := hashOTPCode("") // dummy
-	otpID := ""
-	otpAttempts := 0
-	if err == nil && otp != nil {
-		expectedHash = otp.CodeHash
-		otpID = otp.ID
-		otpAttempts = otp.Attempts
-	}
-
-	codeMatch := hmac.Equal([]byte(hashOTPCode(code)), []byte(expectedHash))
-
-	if otpID != "" {
-		if err := h.Store.IncrementOTPAttempts(c, otpID); err != nil {
-			slog.Warn("failed to increment OTP attempts", "id", otpID, "error", err)
-		}
-	}
-
-	if !codeMatch || otp == nil {
-		remaining := 5 - (otpAttempts + 1)
-		if remaining <= 0 {
-			response.Unauthorized(c, "too many attempts, request a new code")
-		} else {
-			response.Unauthorized(c, "invalid or expired code")
-		}
+	if !h.checkCode(c, email, strings.TrimSpace(req.Code)) {
 		return
-	}
-
-	if err := h.Store.MarkOTPUsed(c, otpID); err != nil {
-		slog.Warn("failed to mark OTP used", "id", otpID, "error", err)
 	}
 
 	// Gate the creating half as well. A code minted before the operator
@@ -158,23 +136,10 @@ func (h *AuthHandler) OTPVerify(c *gin.Context) {
 		return
 	}
 
-	// Upsert user (create on first login)
-	user := &model.User{Email: email}
-	if err := h.Store.UpsertUser(c, user); err != nil {
-		response.Internal(c, err)
-		return
-	}
-	user, err = h.Store.FindUserByEmail(c, email)
+	user, err := h.loginUser(c, email)
 	if err != nil {
 		response.Internal(c, err)
 		return
-	}
-
-	// Auto-promote if email is in ADMIN_EMAILS
-	if h.Config.IsAdminEmail(user.Email) && user.Role == model.RoleUser {
-		if role, err := h.Store.PromoteAdminEmail(c, user.ID); err == nil {
-			user.Role = role
-		}
 	}
 
 	// Welcome email for new users
@@ -182,17 +147,94 @@ func (h *AuthHandler) OTPVerify(c *gin.Context) {
 		h.Email.SendWelcome(user.Email, user.Name)
 	}
 
+	h.startSession(c, user)
+
+	response.OK(c, gin.H{
+		"status": "ok", "email": user.Email, "name": user.Name,
+		"is_admin": user.IsAdmin(), "role": user.Role,
+	})
+}
+
+// checkCode checks code against the newest valid code mailed to email
+// and uses it up. On failure it writes the 401 and returns false.
+func (h *AuthHandler) checkCode(c *gin.Context, email, code string) bool {
+	otp, err := h.Store.FindLatestValidOTPCode(c, email)
+
+	// Always perform hash comparison to prevent timing-based email enumeration
+	expectedHash := hashOTPCode("") // dummy
+	otpID := ""
+	attempts := 0
+	if err == nil && otp != nil {
+		// The guess spends one of the code's attempts before it is
+		// compared, so the limit holds under parallel guesses.
+		n, claimed, cerr := h.Store.ClaimOTPAttempt(c, otp.ID)
+		if cerr != nil {
+			response.Internal(c, cerr)
+			return false
+		}
+		if claimed {
+			expectedHash = otp.CodeHash
+			otpID = otp.ID
+			attempts = n
+		} else {
+			attempts = store.MaxOTPAttempts
+		}
+	}
+
+	codeMatch := hmac.Equal([]byte(hashOTPCode(code)), []byte(expectedHash))
+
+	if !codeMatch || otpID == "" {
+		if store.MaxOTPAttempts-attempts <= 0 {
+			response.Unauthorized(c, "too many attempts, request a new code")
+		} else {
+			response.Unauthorized(c, "invalid or expired code")
+		}
+		return false
+	}
+
+	// Two requests carrying the same code both get past the compare
+	// above; only the one that flips the row to used goes on.
+	if h.beforeConsumeCode != nil {
+		h.beforeConsumeCode()
+	}
+	consumed, err := h.Store.ConsumeOTPCode(c, otpID)
+	if err != nil {
+		response.Internal(c, err)
+		return false
+	}
+	if !consumed {
+		response.Unauthorized(c, "invalid or expired code")
+		return false
+	}
+	return true
+}
+
+// loginUser returns the account for email, creating it on first login
+// and promoting it when the address is in ADMIN_EMAILS.
+func (h *AuthHandler) loginUser(c *gin.Context, email string) (*model.User, error) {
+	if err := h.Store.UpsertUser(c, &model.User{Email: email}); err != nil {
+		return nil, err
+	}
+	user, err := h.Store.FindUserByEmail(c, email)
+	if err != nil {
+		return nil, err
+	}
+	if h.Config.IsAdminEmail(user.Email) && user.Role == model.RoleUser {
+		if role, err := h.Store.PromoteAdminEmail(c, user.ID); err == nil {
+			user.Role = role
+		}
+	}
+	return user, nil
+}
+
+// startSession signs user in after a code login and records it.
+func (h *AuthHandler) startSession(c *gin.Context, user *model.User) {
 	h.issueSession(c, user)
 
 	h.Store.Audit(c, &model.AuditLog{
 		Entity: "session", EntityID: user.ID, Action: "login",
 		ActorType: "otp", ActorID: user.ID, IPAddress: c.ClientIP(),
 		Changes: map[string]any{"email": user.Email},
-	})
-
-	response.OK(c, gin.H{
-		"status": "ok", "email": user.Email, "name": user.Name,
-		"is_admin": user.IsAdmin(), "role": user.Role,
 	})
 }
 

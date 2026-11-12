@@ -304,9 +304,18 @@ func (s *Store) GetAnalyticsSummary(ctx context.Context, f AnalyticsFilter) (*An
 		return nil, err
 	}
 
+	// The average is over the licences whose devices were counted. With
+	// a status picked those are the licences in that status, not the
+	// total above, which leaves the status filter out.
+	licenses := result.Total
+	if f.Status != "" {
+		if licenses, err = licenseSubquery(s, f).Count(ctx); err != nil {
+			return nil, err
+		}
+	}
 	var avgActivations float64
-	if result.Total > 0 {
-		avgActivations = float64(activations) / float64(result.Total)
+	if licenses > 0 {
+		avgActivations = float64(activations) / float64(licenses)
 	}
 
 	return &AnalyticsSummary{
@@ -402,14 +411,17 @@ func (s *Store) GetTopFeatureUsage(ctx context.Context, productID string, from, 
 	return out, err
 }
 
+// GetActivationTrend counts activations per UTC day. The from/to bounds
+// are UTC days too; bucketing by the session's time zone instead would
+// shift every bar on a database not set to UTC.
 func (s *Store) GetActivationTrend(ctx context.Context, productID string, from, to time.Time) ([]TrendPoint, error) {
 	var out []TrendPoint
 	q := s.DB.NewSelect().
 		TableExpr("activations AS a").
-		ColumnExpr("DATE(a.created_at)::text AS date").
+		ColumnExpr("to_char(DATE(a.created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS date").
 		ColumnExpr("COUNT(*)::int AS count").
-		GroupExpr("DATE(a.created_at)").
-		OrderExpr("DATE(a.created_at) ASC")
+		GroupExpr("DATE(a.created_at AT TIME ZONE 'UTC')").
+		OrderExpr("DATE(a.created_at AT TIME ZONE 'UTC') ASC")
 
 	if productID != "" {
 		q = q.Join("JOIN licenses AS l ON l.id = a.license_id").
@@ -465,6 +477,33 @@ func (s *Store) TakeSnapshot(ctx context.Context, productID string, date time.Ti
 	return s.CreateAnalyticsSnapshot(ctx, snap)
 }
 
+// TakeMissingSnapshots takes the snapshot of date for every product that
+// has none for it yet, and leaves the ones taken alone. Run at start and
+// every hour, it gives each day its snapshot however often the server
+// restarts: a wait of 24 hours from start, restarted by every restart,
+// never came round on a server restarted more than once a day.
+func (s *Store) TakeMissingSnapshots(ctx context.Context, date time.Time) error {
+	products, _, err := s.ListProducts(ctx, "", nil, All)
+	if err != nil {
+		return err
+	}
+	day := date.Truncate(24 * time.Hour)
+	for _, p := range products {
+		taken, err := s.DB.NewSelect().Model((*model.AnalyticsSnapshot)(nil)).
+			Where("product_id = ? AND date = ?", p.ID, day).Exists(ctx)
+		if err != nil {
+			return err
+		}
+		if taken {
+			continue
+		}
+		if err := s.TakeSnapshot(ctx, p.ID, date); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) TakeAllSnapshots(ctx context.Context, date time.Time) error {
 	products, _, err := s.ListProducts(ctx, "", nil, All)
 	if err != nil {
@@ -517,9 +556,23 @@ func (s *Store) GetGrowthMetrics(ctx context.Context, productID string) (*Growth
 		gm.NetGrowthRate = float64(newCount-churnedCount) / float64(total) * 100
 	}
 
+	// A trial converted when an upgrade from a trial plan was paid for
+	// and applied, whatever the licence's state now (one refunded and
+	// undone did not), or when the trial plan is itself sold through
+	// Stripe and its first charge made it active. Trials are the licences on a trial plan now, plus
+	// those that left one: converted, or moved off it (to the plan a
+	// trial falls back to, or by an operator), as their plan_changed
+	// audit lines record. A trial plan deleted takes its history out
+	// of both.
+	const trialPlans = `SELECT id FROM plans WHERE license_type = 'trial'`
+	const converted = `SELECT u.license_id FROM license_upgrades AS u
+		WHERE u.state = 'applied' AND u.from_plan_id IN (` + trialPlans + `)`
+	const leftTrial = `SELECT a.entity_id FROM audit_logs AS a
+		WHERE a.entity = 'license' AND a.action = 'plan_changed'
+		AND a.changes->>'old_plan_id' IN (` + trialPlans + `)`
+
 	ttq := s.DB.NewSelect().TableExpr("licenses AS l").
-		Join("JOIN plans AS p ON p.id = l.plan_id").
-		Where("p.license_type = 'trial'")
+		Where("(l.plan_id IN (" + trialPlans + ") OR l.id IN (" + converted + ") OR l.id IN (" + leftTrial + "))")
 	if productID != "" {
 		ttq = ttq.Where("l.product_id = ?", productID)
 	}
@@ -530,9 +583,7 @@ func (s *Store) GetGrowthMetrics(ctx context.Context, productID string) (*Growth
 	gm.TotalTrials = totalTrials
 
 	ctq := s.DB.NewSelect().TableExpr("licenses AS l").
-		Join("JOIN plans AS p ON p.id = l.plan_id").
-		Where("p.license_type = 'trial'").
-		Where("l.status = 'active'")
+		Where("(l.id IN (" + converted + ") OR (l.plan_id IN (" + trialPlans + ") AND l.status = 'active'))")
 	if productID != "" {
 		ctq = ctq.Where("l.product_id = ?", productID)
 	}
@@ -607,6 +658,9 @@ func (s *Store) GetRecentActivity(ctx context.Context, productID string, limit i
 		ColumnExpr("id, entity, entity_id, action, actor_type, created_at").
 		OrderExpr("created_at DESC").
 		Limit(limit)
+	if productID != "" {
+		q = auditOfProduct(q, productID)
+	}
 	err := q.Scan(ctx, &out)
 	return out, err
 }
@@ -621,17 +675,25 @@ func (s *Store) GetTopUsers(ctx context.Context, productID string, limit int) ([
 	q := s.DB.NewSelect().
 		TableExpr("licenses AS l").
 		ColumnExpr("min(l.email) AS email").
-		ColumnExpr("COALESCE(l.user_id, '') AS user_id").
+		// The account, when one of the customer's licences is linked to
+		// it: one row per customer, by email, as GetUserDetail takes them.
+		ColumnExpr("COALESCE(max(l.user_id), '') AS user_id").
 		ColumnExpr("COUNT(DISTINCT l.id)::int AS license_count").
 		ColumnExpr("COUNT(DISTINCT l.id) FILTER (WHERE l.status = 'active')::int AS active_count").
 		ColumnExpr("COALESCE(SUM(uc.total_usage), 0) AS total_usage").
-		ColumnExpr("COUNT(DISTINCT a.id)::int AS activation_count").
+		ColumnExpr("COALESCE(SUM(ac.activations), 0)::int AS activation_count").
+		// Usage and devices are each counted per licence before the
+		// join: joined row by row, a licence's usage was added once for
+		// every device it runs on.
 		Join("LEFT JOIN (SELECT license_id, SUM(quantity) AS total_usage FROM usage_events GROUP BY license_id) uc ON uc.license_id = l.id").
-		Join("LEFT JOIN activations a ON a.license_id = l.id").
+		Join("LEFT JOIN (SELECT license_id, COUNT(*) AS activations FROM activations GROUP BY license_id) ac ON ac.license_id = l.id").
 		// Exclude admin users from customer rankings
-		Where("lower(l.email) NOT IN (SELECT email FROM users WHERE role IN ('owner', 'admin'))").
-		GroupExpr("lower(l.email), l.user_id").
-		OrderExpr("license_count DESC, total_usage DESC").
+		// Compared lower-cased on both sides (an address stored in mixed
+		// case is the same person); NOT EXISTS, as NOT IN over a set
+		// holding a NULL excludes every row.
+		Where("NOT EXISTS (SELECT 1 FROM users u WHERE u.role IN ('owner', 'admin') AND lower(u.email) = lower(l.email))").
+		GroupExpr("lower(l.email)").
+		OrderExpr("license_count DESC, total_usage DESC, lower(l.email) ASC").
 		Limit(limit)
 	if productID != "" {
 		q = q.Where("l.product_id = ?", productID)
@@ -645,8 +707,21 @@ func (s *Store) GetRetentionData(ctx context.Context, productID string, months i
 		months = 6
 	}
 	var out []RetentionData
-	q := s.DB.NewSelect().
+	// One row per day: the products added up, as the snapshot chart
+	// does. Taken over the per-product rows, the month's largest total
+	// and largest active count could come from two different products.
+	daily := s.DB.NewSelect().
 		TableExpr("analytics_snapshots").
+		ColumnExpr("date").
+		ColumnExpr("SUM(total_licenses) AS total_licenses").
+		ColumnExpr("SUM(active_licenses) AS active_licenses").
+		Where(fmt.Sprintf("date >= now() - interval '%d months'", months)).
+		GroupExpr("date")
+	if productID != "" {
+		daily = daily.Where("product_id = ?", productID)
+	}
+	q := s.DB.NewSelect().
+		TableExpr("(?) AS daily", daily).
 		// to_char, not ::text: Postgres renders a timestamptz as
 		// "2026-09-01 00:00:00+00", which is neither RFC 3339 nor the
 		// shape every other date in this API has. The bucket is a
@@ -662,19 +737,19 @@ func (s *Store) GetRetentionData(ctx context.Context, productID string, months i
 			THEN ROUND((1 - MAX(active_licenses)::numeric / MAX(total_licenses)) * 100, 1)
 			ELSE 0
 		END AS churn_pct`).
-		Where(fmt.Sprintf("date >= now() - interval '%d months'", months)).
 		GroupExpr("date_trunc('month', date)").
 		OrderExpr("period ASC")
-	if productID != "" {
-		q = q.Where("product_id = ?", productID)
-	}
 	err := q.Scan(ctx, &out)
 	return out, err
 }
 
 type UserDetail struct {
-	User          *model.User           `json:"user"`
-	Licenses      []*model.License      `json:"licenses"`
+	User     *model.User      `json:"user"`
+	Licenses []*model.License `json:"licenses"`
+	// Memberships are the seats the customer holds on other people's
+	// licences, each with its licence: where they are a member, not the
+	// owner.
+	Memberships   []*model.Seat         `json:"memberships"`
 	Subscriptions []*model.Subscription `json:"subscriptions"`
 	TotalUsage    int64                 `json:"total_usage"`
 	ActiveSeats   int                   `json:"active_seats"`
@@ -702,10 +777,19 @@ func (s *Store) GetUserDetail(ctx context.Context, userID string) (*UserDetail, 
 	}
 	detail.Licenses = licenses
 
-	subs, err := s.ListSubscriptionsByUser(ctx, userID)
-	if err == nil {
-		detail.Subscriptions = subs
+	// Joined seats only: an invitation not yet accepted gives no access.
+	// An empty list, not null, when there are none.
+	memberships := []*model.Seat{}
+	if err := s.DB.NewSelect().Model(&memberships).
+		Relation("License").Relation("License.Product").Relation("License.Plan").
+		Where("seat.accepted_at IS NOT NULL AND seat.removed_at IS NULL").
+		Where("(seat.user_id = ? OR lower(seat.email) = ?)", userID, normalizeEmail(user.Email)).
+		Where("NOT (coalesce(license.user_id, '') = ? OR lower(license.email) = ?)", userID, normalizeEmail(user.Email)).
+		OrderExpr("seat.accepted_at DESC").
+		Scan(ctx); err != nil {
+		return nil, err
 	}
+	detail.Memberships = memberships
 
 	licenseIDs := make([]string, len(licenses))
 	for i, l := range licenses {
@@ -713,6 +797,18 @@ func (s *Store) GetUserDetail(ctx context.Context, userID string) (*UserDetail, 
 	}
 
 	if len(licenseIDs) > 0 {
+		// A subscription is found through its licence: nothing fills
+		// subscriptions.user_id, and the licences above are this
+		// customer's, by owner or by email.
+		var subs []*model.Subscription
+		if err := s.DB.NewSelect().Model(&subs).
+			Relation("License").Relation("Plan").Relation("Plan.Product").
+			Where("subscription.license_id IN (?)", bun.List(licenseIDs)).
+			OrderExpr("subscription.created_at DESC").Scan(ctx); err != nil {
+			return nil, err
+		}
+		detail.Subscriptions = subs
+
 		var usageResult struct {
 			Total int64 `bun:"total"`
 		}

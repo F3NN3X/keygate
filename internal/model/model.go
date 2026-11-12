@@ -114,6 +114,18 @@ func ProductSupports(t, capability string) bool {
 	return false
 }
 
+// ProductTypesSupporting lists the product types that have capability
+// (see ProductSupports), for checks made in SQL.
+func ProductTypesSupporting(capability string) []string {
+	var out []string
+	for _, t := range []string{ProductTypeDesktop, ProductTypeSaaS, ProductTypeHybrid} {
+		if ProductSupports(t, capability) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 type Product struct {
 	bun.BaseModel `bun:"table:products"`
 
@@ -121,6 +133,12 @@ type Product struct {
 	Name string `bun:",notnull" json:"name"`
 	Slug string `bun:",notnull,unique" json:"slug"`
 	Type string `bun:",notnull" json:"type"`
+
+	// LicensePrefix is the first segment of the keys this product
+	// issues, 2 to 8 uppercase letters or digits. Changing it applies
+	// to new keys only: keys are found by their whole value, so the
+	// ones already issued keep their prefix and keep working.
+	LicensePrefix string `bun:",notnull,default:'KG'" json:"license_prefix"`
 
 	// MinimumSupportedVersion: optional semver floor. When non-empty,
 	// auto-update feeds embed this so clients can refuse to keep
@@ -258,14 +276,61 @@ type Plan struct {
 	FloatingTimeout      int    `bun:",notnull" json:"floating_timeout"`
 	// TokenTTLDays is how long a signed token may be used offline
 	// before the client must verify again. 0 = server default.
-	TokenTTLDays int       `bun:",notnull" json:"token_ttl_days"`
-	MaxSeats     int       `bun:",notnull" json:"max_seats"`
-	Active       bool      `bun:",notnull,default:true" json:"active"`
-	SortOrder    int       `bun:",default:0" json:"sort_order"`
-	CreatedAt    time.Time `bun:",nullzero,default:now()" json:"created_at"`
+	TokenTTLDays int `bun:",notnull" json:"token_ttl_days"`
+	// SelfSignup lets a visitor claim a licence on this plan from its
+	// /pay link by confirming an email address. Only for plans with no
+	// Stripe price and no update period. SignupDailyCap limits claims
+	// per UTC day (0 = no cap); SignupConsentText, when set, is the
+	// label of an optional marketing-consent checkbox on the form.
+	SelfSignup        bool   `bun:",notnull" json:"self_signup"`
+	SignupDailyCap    int    `bun:",notnull" json:"signup_daily_cap"`
+	SignupConsentText string `bun:",notnull" json:"signup_consent_text"`
+	// MaxSeats is how many people a license holds, the owner included:
+	// 5 is the owner and four members. 0 = no limit. A plan sold per
+	// seat does not use it (see Limits); it keeps 1 there, or 0 on a
+	// product without seats, so a replica that predates PerSeat holds
+	// its licences to the owner alone rather than to nobody's limit.
+	MaxSeats int `bun:",notnull" json:"max_seats"`
+	// PerSeat sells the plan by the seat: the buyer pays for a quantity
+	// between MinQuantity and MaxQuantity, and MaxActivations is per
+	// seat. Subscriptions only. A zero bound is never meant, so the
+	// column default stands in for it on insert.
+	PerSeat     bool      `bun:",notnull" json:"per_seat"`
+	MinQuantity int       `bun:",notnull,default:1" json:"min_quantity"`
+	MaxQuantity int       `bun:",notnull,default:100" json:"max_quantity"`
+	Active      bool      `bun:",notnull,default:true" json:"active"`
+	SortOrder   int       `bun:",default:0" json:"sort_order"`
+	CreatedAt   time.Time `bun:",nullzero,default:now()" json:"created_at"`
+
+	// TrialFallbackPlanID, on a trial plan, is the plan a licence
+	// moves to when its trial ends, in place of expiring: same key,
+	// same activations, now on (say) the free tier. Empty = the trial
+	// expires. Only a free plan of the same product, not a trial and
+	// not sold per seat, may be named (TrialFallbackRefusal); see
+	// ExpiryChecker.ExpireTrials.
+	TrialFallbackPlanID string `bun:",nullzero" json:"trial_fallback_plan_id,omitempty"`
 
 	Product      *Product       `bun:"rel:belongs-to,join:product_id=id" json:"product,omitempty"`
 	Entitlements []*Entitlement `bun:"rel:has-many,join:id=plan_id" json:"entitlements,omitempty"`
+}
+
+// MaxPlanQuantity is the most seats a per-seat plan may sell.
+const MaxPlanQuantity = 10000
+
+// Limits are how many people and how many devices (or floating
+// sessions) a licence on this plan holds when it is paid for quantity
+// seats. On a plan sold per seat the people are the seats and the
+// devices are MaxActivations for each; on any other plan they are the
+// plan's own, whatever the quantity. 0 seats means no limit, as on the
+// plan; 0 devices means none.
+func (p *Plan) Limits(quantity int) (seats, activations int) {
+	if !p.PerSeat {
+		return p.MaxSeats, p.MaxActivations
+	}
+	if quantity < 1 {
+		quantity = 1
+	}
+	return quantity, p.MaxActivations * quantity
 }
 
 // ─── Entitlement (feature flags per plan) ───
@@ -334,6 +399,17 @@ type License struct {
 	// license; fulfilment retries use it to see whether the session
 	// already produced one.
 	StripeCheckoutSessionID string `bun:",notnull,default:''" json:"stripe_checkout_session_id,omitempty"`
+	// Quantity is how many seats the license is paid for: for a Stripe
+	// subscription the quantity Stripe bills, read back from it (a
+	// downgrade writes it just ahead of Stripe, and puts it back if
+	// Stripe does not make it). Only a plan sold per seat turns it into
+	// limits (see Plan.Limits). Never 0, so the column default stands in
+	// for an unset one on insert.
+	Quantity int `bun:",notnull,default:1" json:"quantity"`
+	// StripePendingUpdateExpiresAt mirrors the subscription's
+	// pending_update: a change Stripe applies once its invoice is paid,
+	// and drops at this moment otherwise. Nil when nothing waits.
+	StripePendingUpdateExpiresAt *time.Time `bun:"stripe_pending_update_expires_at" json:"stripe_pending_update_expires_at,omitempty"`
 
 	Status     string     `bun:",notnull,default:'active'" json:"status"`
 	ValidFrom  time.Time  `bun:",notnull,default:now()" json:"valid_from"`
@@ -368,6 +444,17 @@ type License struct {
 	ExternalCustomerID  string `bun:",notnull,default:''" json:"external_customer_id,omitempty"`
 	ExternalWorkspaceID string `bun:",notnull,default:''" json:"external_workspace_id,omitempty"`
 
+	// SignupSource is SignupSourceSelf for a licence the customer
+	// claimed themselves on a self sign-up plan, empty otherwise.
+	// MarketingConsent is what they answered to the plan's consent
+	// checkbox at that moment, stamped with MarketingConsentAt.
+	SignupSource       string     `bun:",notnull,default:''" json:"signup_source,omitempty"`
+	MarketingConsent   bool       `bun:",notnull" json:"marketing_consent"`
+	MarketingConsentAt *time.Time `json:"marketing_consent_at,omitempty"`
+	// SignupPlanID is the plan a self sign-up licence was claimed on.
+	// PlanID moves with the licence; this stays, for the daily cap.
+	SignupPlanID string `bun:",nullzero" json:"signup_plan_id,omitempty"`
+
 	CreatedAt time.Time `bun:",nullzero,default:now()" json:"created_at"`
 	UpdatedAt time.Time `bun:",nullzero,default:now()" json:"updated_at"`
 
@@ -391,6 +478,80 @@ type License struct {
 	ActiveSessionCount int             `bun:"active_session_count,scanonly" json:"active_session_count"`
 	Seats              []*Seat         `bun:"rel:has-many,join:id=license_id" json:"seats,omitempty"`
 	Addons             []*LicenseAddon `bun:"rel:has-many,join:id=license_id" json:"addons,omitempty"`
+
+	// SeatLimit and ActivationLimit are what the licence holds, as
+	// Limits works them out; set by FillLimits wherever the plan is
+	// loaded, so clients show the limit the server enforces instead of
+	// working it out from the plan. Absent when the plan is not loaded.
+	SeatLimit       *int `bun:"-" json:"seat_limit,omitempty"`
+	ActivationLimit *int `bun:"-" json:"activation_limit,omitempty"`
+
+	// KeySeat is the member whose own key found this licence (see
+	// Store.FindLicenseByKey); nil when it was found by the licence's
+	// key or any other way.
+	KeySeat *Seat `bun:"-" json:"-"`
+	// KeySeatPaused: KeySeat is beyond the licence's seat limit (see
+	// Seat.Paused), so the member's key opens the licence but may not be
+	// used. Shown to that member in the portal.
+	KeySeatPaused bool `bun:"-" json:"key_paused,omitempty"`
+	// WasStripePaused, WasCanceled and WasExpired are the row as the last
+	// subscription-driven write found it, under the lock it held until
+	// commit (store.updateLicenseAndSubscriptionIn): a write that made it
+	// usable ended a Stripe pause or brought an ended licence back, one
+	// that canceled it ended the licence.
+	// Concurrent events cannot both find the same state, so each change
+	// is told once.
+	WasStripePaused bool `bun:"-" json:"-"`
+	// Whether the row was past due, and since when, as the write found
+	// it: a recovery is told once, for the episode it ended.
+	WasPastDue     bool       `bun:"-" json:"-"`
+	PriorPastDueAt *time.Time `bun:"-" json:"-"`
+	WasCanceled    bool       `bun:"-" json:"-"`
+	WasExpired     bool       `bun:"-" json:"-"`
+	// Whether the row was revoked already: a revocation is told once.
+	WasRevoked bool `bun:"-" json:"-"`
+}
+
+// GraceDays is how many days past ValidUntil the licence's key keeps
+// working, from its plan (7 without one). A trial that moves to its
+// plan's fallback plan when it ends keeps at least one: the hourly sweep
+// moves it, and until then it must not read as expired, as it would on
+// a plan with no grace. A trial Stripe bills is Stripe's to settle and
+// keeps the plan's number.
+// Any other trial has none: the sweep expires it at its end date.
+func (l *License) GraceDays() int {
+	if l.Plan == nil {
+		return 7
+	}
+	if l.Status == StatusTrialing && l.Plan.TrialFallbackPlanID != "" && l.StripeSubscriptionID == "" {
+		return max(l.Plan.GraceDays, 1)
+	}
+	if l.Status == StatusTrialing && l.StripeSubscriptionID == "" {
+		return 0
+	}
+	return l.Plan.GraceDays
+}
+
+// Limits are the people and devices this licence holds (see
+// Plan.Limits). Without its plan loaded it holds what a licence with no
+// plan always has: no seat limit and three devices.
+func (l *License) Limits() (seats, activations int) {
+	if l.Plan == nil {
+		return 0, 3
+	}
+	return l.Plan.Limits(l.Quantity)
+}
+
+// FillLimits sets SeatLimit and ActivationLimit on each licence whose
+// plan is loaded.
+func FillLimits(ls ...*License) {
+	for _, l := range ls {
+		if l == nil || l.Plan == nil {
+			continue
+		}
+		seats, activations := l.Plan.Limits(l.Quantity)
+		l.SeatLimit, l.ActivationLimit = &seats, &activations
+	}
 }
 
 const (
@@ -402,6 +563,10 @@ const (
 	StatusSuspended = "suspended"
 	StatusRevoked   = "revoked"
 )
+
+// SignupSourceSelf marks a licence claimed through self sign-up
+// (License.SignupSource).
+const SignupSourceSelf = "self_signup"
 
 // Who suspended a licence (License.SuspendedBy).
 const (
@@ -422,6 +587,17 @@ type Activation struct {
 	IPAddress      string    `json:"ip_address,omitempty"`
 	LastVerified   time.Time `bun:",nullzero,default:now()" json:"last_verified"`
 	CreatedAt      time.Time `bun:",nullzero,default:now()" json:"created_at"`
+	// SeatID is the member whose key activated the device; empty for
+	// the owner's key. Removing the member removes the device.
+	SeatID string `bun:",nullzero" json:"seat_id,omitempty"`
+	// PredatesMemberKeys marks a device activated with the licence's
+	// key before members had keys of their own, when members used that
+	// key: it may move, once, to the member whose key activates it (see
+	// Store.ActivateForKey).
+	PredatesMemberKeys bool `bun:",notnull" json:"-"`
+	// MemberEmail is that member's address, filled in where devices are
+	// shown (see Store.FillMemberEmails).
+	MemberEmail string `bun:"-" json:"member_email,omitempty"`
 
 	License *License `bun:"rel:belongs-to,join:license_id=id" json:"license,omitempty"`
 }
@@ -439,7 +615,10 @@ type AuditLog struct {
 	ActorType string         `json:"actor_type,omitempty"`
 	Changes   map[string]any `bun:"type:jsonb,default:'{}'" json:"changes,omitempty"`
 	IPAddress string         `json:"ip_address,omitempty"`
-	CreatedAt time.Time      `bun:",nullzero,default:now()" json:"created_at"`
+	// The product the line belongs to. Found from the entity when the
+	// line is written; a caller deleting the entity sets it first.
+	ProductID string    `bun:",nullzero" json:"product_id,omitempty"`
+	CreatedAt time.Time `bun:",nullzero,default:now()" json:"created_at"`
 }
 
 // ─── Seat ───
@@ -457,11 +636,36 @@ type Seat struct {
 	// invitee. Cleared on accept / expire / revoke so the slot
 	// frees up. The plain token never lives in the DB.
 	InviteTokenHash string `bun:",nullzero" json:"-"`
-	// InviteExpiresAt: pinned at invite-time. After this, /seats/accept
-	// returns 410 GONE and admin must re-issue.
+	// InviteExpiresAt: pinned at invite-time. After this, accepting
+	// answers 404 SEAT_INVITE_INVALID and the owner must re-invite.
 	InviteExpiresAt *time.Time `json:"invite_expires_at,omitempty"`
-	CreatedAt       time.Time  `bun:",nullzero,default:now()" json:"created_at"`
-	License         *License   `bun:"rel:belongs-to,join:license_id=id" json:"license,omitempty"`
+	// Paused: the licence holds more people than its seat limit allows,
+	// and this member is among the last to have joined beyond it, so
+	// their own key may not be used until the owner removes someone or
+	// adds seats. Worked out when read (Store.PausedSeats), never stored.
+	Paused bool `bun:"-" json:"paused,omitempty"`
+	// MemberKey is the member's own license key, made the first time
+	// they open the portal after accepting (see Store.MemberKey) and
+	// cleared when they are removed. It is kept and found the way a
+	// license key is: never in JSON, read through Store.MemberKey.
+	MemberKey          string    `bun:",nullzero" json:"-"`
+	MemberKeyHash      string    `bun:",nullzero" json:"-"`
+	MemberKeyEncrypted []byte    `bun:",nullzero" json:"-"`
+	CreatedAt          time.Time `bun:",nullzero,default:now()" json:"created_at"`
+	License            *License  `bun:"rel:belongs-to,join:license_id=id" json:"license,omitempty"`
+}
+
+// JoinedSeats is the members who have accepted and are still on the
+// team: the team as a member sees it. Pending invitations, and the
+// addresses they were sent to, are the owner's to see.
+func JoinedSeats(seats []*Seat) []*Seat {
+	out := make([]*Seat, 0, len(seats))
+	for _, s := range seats {
+		if s.AcceptedAt != nil && s.RemovedAt == nil {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // ─── Usage ───
@@ -514,6 +718,9 @@ type WebhookDelivery struct {
 	Status        string         `bun:",notnull,default:'pending'" json:"status"`
 	CreatedAt     time.Time      `bun:",nullzero,default:now()" json:"created_at"`
 	DeliveredAt   *time.Time     `json:"delivered_at,omitempty"`
+	// ClaimToken identifies the sender holding the row while it is
+	// sent (see Store.ClaimPendingDeliveries); empty when nobody does.
+	ClaimToken string `bun:",notnull,default:''" json:"-"`
 }
 
 // ─── Subscription ───
@@ -566,6 +773,9 @@ type FloatingSession struct {
 	CheckedOut    time.Time `bun:",nullzero,default:now()" json:"checked_out"`
 	ExpiresAt     time.Time `bun:",notnull" json:"expires_at"`
 	Heartbeat     time.Time `bun:",nullzero,default:now()" json:"heartbeat"`
+	// SeatID is the member whose key checked the session out; empty for
+	// the license's key. Removing the member ends it.
+	SeatID string `bun:",nullzero" json:"seat_id,omitempty"`
 }
 
 // ─── Addon ───
@@ -651,6 +861,45 @@ type LicenseRenewal struct {
 	CreatedAt time.Time `bun:",nullzero,default:now()" json:"created_at"`
 }
 
+// License upgrade states (LicenseUpgrade.State).
+const (
+	UpgradePending  = "pending"
+	UpgradeApplied  = "applied"
+	UpgradeReverted = "reverted"
+	UpgradeExpired  = "expired"
+	UpgradeRefunded = "refunded"
+	UpgradeVoid     = "void"
+)
+
+// LicenseUpgrade is one checkout that upgrades a licence Stripe does
+// not bill (a free plan's) to a paid plan. Applied, the From* fields
+// hold the licence as the upgrade found it, so a full refund or the end
+// of the subscription can put it back instead of revoking it.
+type LicenseUpgrade struct {
+	bun.BaseModel `bun:"table:license_upgrades"`
+
+	ID                      string     `bun:",pk" json:"id"`
+	LicenseID               string     `bun:",notnull" json:"license_id"`
+	ToPlanID                string     `bun:",nullzero" json:"to_plan_id,omitempty"`
+	State                   string     `bun:",notnull" json:"state"`
+	StripeCheckoutSessionID string     `bun:",notnull" json:"stripe_checkout_session_id"`
+	StripePaymentIntentID   string     `bun:",notnull,default:''" json:"stripe_payment_intent_id,omitempty"`
+	StripeSubscriptionID    string     `bun:",notnull,default:''" json:"stripe_subscription_id,omitempty"`
+	FromPlanID              string     `bun:",nullzero" json:"from_plan_id,omitempty"`
+	FromStatus              string     `bun:",notnull,default:''" json:"from_status,omitempty"`
+	FromValidUntil          *time.Time `json:"from_valid_until,omitempty"`
+	FromUpdatesUntil        *time.Time `json:"from_updates_until,omitempty"`
+	FromUpdatesTermsSet     bool       `bun:",notnull" json:"from_updates_terms_set"`
+	FromPaymentProvider     string     `bun:",notnull,default:''" json:"from_payment_provider,omitempty"`
+	FromStripeCustomerID    string     `bun:",notnull,default:''" json:"from_stripe_customer_id,omitempty"`
+	FromCanceledAt          *time.Time `json:"from_canceled_at,omitempty"`
+	FromQuantity            int        `bun:",notnull,default:1" json:"from_quantity"`
+	EndReason               string     `bun:",notnull,default:''" json:"end_reason,omitempty"`
+	CreatedAt               time.Time  `bun:",nullzero,default:now()" json:"created_at"`
+	AppliedAt               *time.Time `json:"applied_at,omitempty"`
+	EndedAt                 *time.Time `json:"ended_at,omitempty"`
+}
+
 // Counts reports whether the renewal still contributes to the
 // license's maintenance period.
 func (r *LicenseRenewal) Counts() bool { return r.RefundedAt == nil && r.UpdatesUntil != nil }
@@ -659,48 +908,63 @@ func (r *LicenseRenewal) Counts() bool { return r.RefundedAt == nil && r.Updates
 // refund lands on the dates a customer who never bought the refunded
 // renewal would have, in whatever order refunds arrive.
 //
-// Two cursors walk the rows oldest first. observed is the end the
-// license had at each point, counting renewals that were later
-// refunded, because they were in effect when the next one was bought.
-// net is the same walk without refunded renewals; it is the answer.
+// Each row records the end the license had when it was bought. The
+// replay predicts that end from the rows before it: every renewal that
+// was in effect then, so one refunded later still counts, and one
+// refunded earlier does not, as its refund had already taken it back
+// out. The answer is the walk of every row without the refunded ones.
 //
-// A row whose recorded previous end is not what observed predicts
+// A row whose recorded previous end is not what the replay predicts
 // marks a change made outside the ledger, an admin edit. It is
-// carried as an offset rather than a new baseline: resetting net to
-// the edited date would fold every earlier renewal into it, and
-// refunding one of those would then give the money back without
-// taking the days. Applying the difference keeps both properties —
-// the edit survives, and a refund removes exactly its own renewal.
-// Only a move to or from "updates for life" cannot be expressed as
-// an offset, and there both cursors restart.
+// carried as an offset rather than a new baseline: resetting to the
+// edited date would fold every earlier renewal into it, and refunding
+// one of those would then give the money back without taking the
+// days. Applying the difference keeps both properties — the edit
+// survives, and a refund removes exactly its own renewal. Only a move
+// to or from "updates for life" cannot be expressed as an offset, and
+// there the walk restarts from the recorded end.
 func ReplayRenewals(renewals []*LicenseRenewal) *time.Time {
-	var observed, net *time.Time
+	// What happened outside the ledger just before each row: a restart
+	// from its recorded end, or an admin edit carried as a shift.
+	type outside struct {
+		restart bool
+		shift   time.Duration
+	}
+	before := make([]outside, len(renewals))
+	// walk replays the first n rows, the outside changes included, each
+	// adding its days when counts says it was in effect.
+	walk := func(n int, counts func(*LicenseRenewal) bool) *time.Time {
+		var end *time.Time
+		for k, r := range renewals[:n] {
+			switch o := before[k]; {
+			case o.restart:
+				end = r.PreviousUpdatesUntil
+			case o.shift != 0 && end != nil:
+				shifted := end.Add(o.shift)
+				end = &shifted
+			}
+			if r.UpdatesUntil != nil && counts(r) { // nil: changed nothing when applied
+				renewed := RenewedUpdatesUntil(end, r.CreatedAt, r.Days)
+				end = &renewed
+			}
+		}
+		return end
+	}
 	for i, r := range renewals {
+		predicted := walk(i, func(p *LicenseRenewal) bool {
+			return p.RefundedAt == nil || !p.RefundedAt.Before(r.CreatedAt)
+		})
 		switch {
-		case i == 0 || SameEnd(r.PreviousUpdatesUntil, observed):
-			if i == 0 {
-				observed, net = r.PreviousUpdatesUntil, r.PreviousUpdatesUntil
-			}
-		case r.PreviousUpdatesUntil == nil || observed == nil:
-			observed, net = r.PreviousUpdatesUntil, r.PreviousUpdatesUntil
+		case i == 0:
+			before[i].restart = true
+		case SameEnd(r.PreviousUpdatesUntil, predicted):
+		case r.PreviousUpdatesUntil == nil || predicted == nil:
+			before[i].restart = true
 		default:
-			if net != nil {
-				shifted := net.Add(r.PreviousUpdatesUntil.Sub(*observed))
-				net = &shifted
-			}
-			observed = r.PreviousUpdatesUntil
-		}
-		if r.UpdatesUntil == nil {
-			continue // changed nothing when applied
-		}
-		end := RenewedUpdatesUntil(observed, r.CreatedAt, r.Days)
-		observed = &end
-		if r.RefundedAt == nil {
-			netEnd := RenewedUpdatesUntil(net, r.CreatedAt, r.Days)
-			net = &netEnd
+			before[i].shift = r.PreviousUpdatesUntil.Sub(*predicted)
 		}
 	}
-	return net
+	return walk(len(renewals), func(p *LicenseRenewal) bool { return p.RefundedAt == nil })
 }
 
 // SameEnd compares two optional instants that went through Postgres
@@ -732,6 +996,41 @@ func UpdatesUntilFor(licenseType string, days int, now time.Time) *time.Time {
 	}
 	until := now.Add(time.Duration(days) * 24 * time.Hour)
 	return &until
+}
+
+// IsFree reports whether Keygate charges nothing for the plan: no
+// purchase price, no update period and no renewals. It is the rule the
+// plans_self_signup_free constraint holds a self sign-up plan to, and
+// the one an upgrade checks the licence's current plan against.
+func (p *Plan) IsFree() bool {
+	return p.StripePriceID == "" && p.UpdatesDays == 0 && p.RenewalDays == 0 && p.StripeRenewalPriceID == ""
+}
+
+// TrialFallbackRefusal says why p cannot be the plan that licences of a
+// trial plan of productID move to when their trial ends, or "" when it
+// can. Only a free, non-trial plan of the same product qualifies: a
+// paid one would hand out what is sold for nothing (and a perpetual
+// plan with an update period would also need the gating a sale gets),
+// and a trial one would only start another trial. Nor one sold per
+// seat: its seats are bought, and a licence moved onto it would hold
+// one, below what the plan sells. The admin API asks
+// when the plan is saved and the expiry sweep asks again before it
+// moves a licence, since the target may have been repriced since.
+// Whether the target is active does not matter: active decides what is
+// on sale, and an operator may well keep the free tier off the public
+// plan list while trials still land on it.
+func (p *Plan) TrialFallbackRefusal(productID string) string {
+	switch {
+	case p.ProductID != productID:
+		return "must be a plan of the same product"
+	case p.LicenseType == "trial":
+		return "cannot be a trial plan"
+	case p.PerSeat:
+		return "cannot be a plan sold per seat"
+	case !p.IsFree():
+		return "must be a free plan (no stripe_price_id, update period or renewals)"
+	}
+	return ""
 }
 
 // InitialUpdatesUntil is the maintenance period a new license on this
@@ -781,9 +1080,9 @@ type MeteredBilling struct {
 	Synced        bool       `bun:",notnull,default:false" json:"synced"`
 	SyncedAt      *time.Time `json:"synced_at,omitempty"`
 	ExternalID    string     `json:"external_id,omitempty"`
-	// Attempts increments on every push to Stripe (success OR
-	// failure). LastError records the most recent failure message
-	// so operators can debug stuck rows without tailing logs.
+	// Attempts counts the pushes to Stripe that failed. LastError
+	// records the most recent failure message so operators can debug
+	// stuck rows without tailing logs.
 	Attempts  int       `bun:",notnull,default:0" json:"attempts"`
 	LastError string    `bun:",notnull,default:''" json:"last_error,omitempty"`
 	CreatedAt time.Time `bun:",nullzero,default:now()" json:"created_at"`
@@ -791,20 +1090,46 @@ type MeteredBilling struct {
 
 // Webhook event constants
 const (
-	EventLicenseCreated    = "license.created"
-	EventLicenseCanceled   = "license.canceled"
-	EventLicenseSuspended  = "license.suspended"
-	EventLicenseReinstated = "license.reinstated"
-	EventLicenseRevoked    = "license.revoked"
-	EventQuotaWarning      = "quota.warning"
-	EventQuotaExceeded     = "quota.exceeded"
-	EventSeatAdded         = "seat.added"
-	EventSeatRemoved       = "seat.removed"
-	EventPlanChanged       = "plan.changed"
-	EventReleasePublished  = "release.published"
-	EventReleaseYanked     = "release.yanked"
-	EventReleaseUnyanked   = "release.unyanked"
+	EventLicenseCreated          = "license.created"
+	EventLicenseActivated        = "license.activated"
+	EventLicenseDeactivated      = "license.deactivated"
+	EventLicenseExpiryChanged    = "license.expiry_changed"
+	EventLicenseUpdatesChanged   = "license.updates_changed"
+	EventLicenseExpired          = "license.expired"
+	EventLicenseCanceled         = "license.canceled"
+	EventLicenseSuspended        = "license.suspended"
+	EventLicenseReinstated       = "license.reinstated"
+	EventLicenseRevoked          = "license.revoked"
+	EventLicensePaymentFailed    = "license.payment_failed"
+	EventLicensePaymentRecovered = "license.payment_recovered"
+	EventLicenseQuantityChanged  = "license.quantity_changed"
+	EventQuotaWarning            = "quota.warning"
+	EventQuotaExceeded           = "quota.exceeded"
+	EventSeatAdded               = "seat.added"
+	EventSeatRemoved             = "seat.removed"
+	EventPlanChanged             = "plan.changed"
+	EventReleasePublished        = "release.published"
+	EventReleaseYanked           = "release.yanked"
+	EventReleaseUnyanked         = "release.unyanked"
 )
+
+// WebhookEvents is every event a webhook can subscribe to. Delivery
+// matches the name exactly, so a subscription to anything else would
+// never fire; it is refused instead. webhook.test is sent to an
+// endpoint on request whatever it subscribes to, so it is not here.
+var WebhookEvents = []string{
+	EventLicenseCreated, EventLicenseActivated, EventLicenseDeactivated,
+	EventLicenseExpiryChanged, EventLicenseUpdatesChanged, EventLicenseExpired,
+	EventLicenseCanceled, EventLicenseSuspended, EventLicenseReinstated,
+	EventLicenseRevoked, EventLicensePaymentFailed, EventLicensePaymentRecovered,
+	EventLicenseQuantityChanged, EventQuotaWarning, EventQuotaExceeded,
+	EventSeatAdded, EventSeatRemoved, EventPlanChanged, EventReleasePublished, EventReleaseYanked, EventReleaseUnyanked,
+}
+
+// IsValidWebhookEvent reports whether e is in WebhookEvents.
+func IsValidWebhookEvent(e string) bool {
+	return slices.Contains(WebhookEvents, e)
+}
 
 // ─── Release (logical release event) ───
 //

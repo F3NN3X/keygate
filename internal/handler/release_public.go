@@ -140,10 +140,11 @@ type feedRequest struct {
 	licensed bool
 }
 
-// parseFeedRequest validates path + query params. All channels (stable
-// / beta / alpha / dev) are public — trust is established by the
-// artifact's ed25519 signature, not by URL secrecy. On any error the
-// response is already written and ok=false.
+// parseFeedRequest validates path + query params. Every channel is
+// public unless the product has feed_license_required, in which case a
+// license key or token is required. Trust in an artifact comes from its
+// ed25519 signature, not from URL secrecy. On any error the response is
+// already written and ok=false.
 func (h *ReleasePublicHandler) parseFeedRequest(c *gin.Context) (req feedRequest, ok bool) {
 	// Every feed response varies on the key header, and a response
 	// built for a key — including a 404 for a bad key and Tauri's
@@ -251,7 +252,7 @@ func (h *ReleasePublicHandler) parseFeedRequest(c *gin.Context) (req feedRequest
 			response.NotFound(c, "license not found")
 			return
 		}
-		cutoff, err := h.svc.FeedCutoffForToken(c.Request.Context(), claims.LicenseID, prod.ID)
+		cutoff, err := h.svc.FeedCutoffForToken(c.Request.Context(), claims.LicenseID, prod.ID, claims.Identifier)
 		if err != nil {
 			writeAppErr(c, err)
 			return
@@ -518,5 +519,12 @@ func (h *ReleasePublicHandler) writeFeedCacheHeaders(c *gin.Context, req feedReq
 	if req.licensed {
 		return
 	}
-	c.Header("Cache-Control", "public, max-age="+strconv.Itoa(int(FeedPublicMaxAge.Seconds())))
+	// No longer than the download links in it stay valid: with a feed
+	// URL TTL under FeedPublicMaxAge, a cache would go on serving links
+	// that already answer 403.
+	maxAge := FeedPublicMaxAge
+	if h.feedTTL > 0 {
+		maxAge = min(maxAge, h.feedTTL)
+	}
+	c.Header("Cache-Control", "public, max-age="+strconv.Itoa(int(maxAge.Seconds())))
 }

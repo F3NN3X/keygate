@@ -12,6 +12,11 @@ export function errorCode(err: unknown): string | undefined {
   return (err as { code?: string } | null)?.code
 }
 
+// errorDetails reads the details the server attached to an error, if any.
+export function errorDetails(err: unknown): Record<string, unknown> | undefined {
+  return (err as { details?: Record<string, unknown> } | null)?.details
+}
+
 type RefreshOutcome = "ok" | "denied" | "unavailable"
 
 // The session cookie lives 24 hours; the refresh cookie 30 days. When a
@@ -56,7 +61,10 @@ async function request<T>(path: string, opts?: RequestInit, retried = false): Pr
   // is the exception: it needs a live session to revoke the refresh
   // token, and if it fails the login page would silently renew the
   // session and sign the user straight back in.
-  const renewable = !path.startsWith("/auth/") || path === "/auth/logout"
+  // The sign-up form answers 401 for a wrong code, not for a session: it
+  // keeps its own error and is never renewed or sent to the login page.
+  const signup = path.startsWith("/signup/")
+  const renewable = (!path.startsWith("/auth/") && !signup) || path === "/auth/logout"
   if (res.status === 401 && !retried && renewable) {
     const outcome = await refreshSession()
     if (outcome === "ok") return request<T>(path, opts, true)
@@ -67,7 +75,7 @@ async function request<T>(path: string, opts?: RequestInit, retried = false): Pr
   }
 
   // Could not renew: redirect to login
-  if (res.status === 401) {
+  if (res.status === 401 && !signup) {
     // Don't redirect if already on login page or fetching auth state
     if (!window.location.pathname.startsWith("/login") && path !== "/portal/me") {
       window.location.href = "/login"
@@ -101,7 +109,10 @@ async function request<T>(path: string, opts?: RequestInit, retried = false): Pr
     // failing. Callers that decide "signed in or not" must tell it apart.
     // The server's error code rides along for callers that translate it.
     const err = res.status === 429 || res.status >= 500 ? new ServiceUnavailableError(msg) : new Error(msg)
-    throw Object.assign(err, { code: typeof json?.error?.code === "string" ? json.error.code : undefined })
+    throw Object.assign(err, {
+      code: typeof json?.error?.code === "string" ? json.error.code : undefined,
+      details: json?.error?.details && typeof json.error.details === "object" ? json.error.details : undefined,
+    })
   }
   return (json?.data !== undefined ? json.data : json) as T
 }
@@ -157,6 +168,35 @@ export const auth = {
     }),
 }
 
+// ─── Self sign-up (public) ───
+// A free plan's /pay link leads to /signup/:checkoutId when the plan
+// takes self sign-ups. verify signs the visitor in and emails the key.
+export interface SignupInfo {
+  product_name: string
+  plan_name: string
+  license_type: string
+  trial_days: number
+  consent_text: string
+}
+
+export const signup = {
+  info: (checkoutId: string) => get<SignupInfo>(`/signup/${encodeURIComponent(checkoutId)}`),
+  send: (checkoutId: string, email: string) =>
+    post<{ status: string }>(`/signup/${encodeURIComponent(checkoutId)}/send`, { email }),
+  // consentText is the wording the form showed; the server records a
+  // yes only against the wording it holds now.
+  verify: (checkoutId: string, email: string, code: string, marketingConsent: boolean, consentText: string) =>
+    post<{ status: "created" | "existing"; license_id: string; license_status?: string; license_usable?: boolean }>(
+      `/signup/${encodeURIComponent(checkoutId)}/verify`,
+      {
+        email,
+        code,
+        marketing_consent: marketingConsent,
+        consent_text: consentText,
+      },
+    ),
+}
+
 // ─── Checkout ───
 export const checkout = {
   verify: (sessionId: string) =>
@@ -166,7 +206,8 @@ export const checkout = {
 // ─── Invites (public, token-only) ───
 // The plain invite token IS the email-ownership proof — no session
 // required. Backend collapses bad/expired/already-accepted into one
-// generic error so an attacker can't probe token validity.
+// generic error so an attacker can't probe token validity; only a valid
+// invitation with no seat free says so (SEAT_LIMIT).
 export const invites = {
   accept: (token: string) =>
     post<{ user_id: string; email: string; license_id: string; product_name?: string; role: string }>(
@@ -189,8 +230,8 @@ export const portal = {
   // authed (cookie); the body's license_key only names the target
   // license — the cookie is the actual authentication.
   // Self-service device/activation management. Backend authorises the
-  // license owner OR any accepted seat (member or admin) — a teammate
-  // who lost a laptop can free their own slot without a support ticket
+  // license owner (every device) OR an accepted member (their own) — a
+  // teammate who lost a laptop can free their own slot without a support ticket
   // (internal/handler/portal_activations.go). license_key is in the
   // path; the session cookie is the actual auth.
   listActivations: (licenseKey: string) =>
@@ -200,14 +241,24 @@ export const portal = {
       `/portal/licenses/${encodeURIComponent(licenseKey)}/activations/${encodeURIComponent(activationId)}`,
     ),
   listSeats: (licenseKey: string) => post<{ seats: Seat[] }>("/portal/seats", { license_key: licenseKey }),
-  addSeat: (data: { license_key: string; email: string; role?: string }) => post<Seat>("/portal/seats/add", data),
+  addSeat: (data: { license_key: string; email: string }) => post<Seat>("/portal/seats/add", data),
   removeSeat: (data: { license_key: string; seat_id: string }) =>
     post<{ status: string }>("/portal/seats/remove", data),
-  changePlan: (data: { license_id: string; new_price_id: string; prorate?: boolean }) =>
-    post<{ status: string; new_plan_id: string; new_plan_name: string; proration: string }>(
-      "/portal/subscription/change-plan",
-      data,
-    ),
+  // A change to the subscription's plan or seats: previewed, then made
+  // from the preview's signed token (its target, the terms it started
+  // from and its proration date).
+  previewChange: (data: { license_id: string; price_id?: string; quantity?: number }) =>
+    post<SubscriptionChangePreview>("/portal/subscription/preview", data),
+  changeSubscription: (data: { license_id: string; preview_token: string }) =>
+    post<SubscriptionChangeResult>("/portal/subscription/change", data),
+  pendingChange: (data: { license_id: string }) =>
+    post<{
+      status: "none" | "pending_payment"
+      hosted_invoice_url?: string
+      expires_at?: string
+      quantity?: number
+      plan_name?: string
+    }>("/portal/subscription/pending", data),
   cancelSubscription: (data: { license_id: string; immediate?: boolean }) =>
     post<{ status: string; immediate: boolean }>("/portal/subscription/cancel", data),
   getBillingPortal: (data: { license_id: string }) =>
@@ -215,6 +266,52 @@ export const portal = {
   getInvoices: (licenseId: string) =>
     get<{ invoices: Invoice[] }>(`/portal/subscription/invoices?license_id=${licenseId}`),
   renewUpdates: (data: { license_id: string }) => post<{ url: string }>("/portal/updates/renew", data),
+  // Moves a licence Stripe doesn't bill (a free plan's) to a paid plan
+  // through checkout; the licence keeps its key.
+  upgrade: (data: { license_id: string; plan_id: string }) => post<{ url: string }>("/portal/licenses/upgrade", data),
+}
+
+export interface SubscriptionTerms {
+  plan_id: string
+  plan_name: string
+  price_id: string
+  per_seat: boolean
+  quantity: number
+  seat_limit: number
+  activation_limit: number
+}
+
+export interface SubscriptionChangePreview {
+  current: SubscriptionTerms
+  target: SubscriptionTerms
+  // The change itself in the smallest currency unit: charged now when
+  // positive, credited to the customer's balance when negative.
+  total: number
+  credit_balance: number
+  due_now: number
+  currency: string
+  proration_date: number
+  seats_in_use: number
+  devices_in_use: number
+  replaces_pending: boolean
+  // A downgrade (it lowers a limit) applies now and is not prorated:
+  // nothing is charged or credited today, and the next invoice, due at
+  // next_invoice_at (unix seconds), bills next_invoice_total.
+  downgrade: boolean
+  next_invoice_total?: number
+  next_invoice_at?: number
+  preview_token: string
+}
+
+export interface SubscriptionChangeResult {
+  status: "applied" | "pending_payment" | "processing"
+  plan_id: string
+  plan_name: string
+  quantity: number
+  hosted_invoice_url?: string
+  expires_at?: string
+  downgrade?: boolean
+  keep?: boolean
 }
 
 // ─── Admin ───
@@ -244,6 +341,7 @@ export const admin = {
     name: string
     slug: string
     type: string
+    license_prefix?: string
     feed_license_required?: boolean
     download_url?: string
   }) => post<Product>("/admin/products", data),
@@ -255,6 +353,9 @@ export const admin = {
   getPlan: (id: string) => get<Plan>(`/admin/plans/${id}`),
   createPlan: (data: Partial<Plan>) => post<Plan>("/admin/plans", data),
   updatePlan: (id: string, data: Partial<Plan>) => put<Plan>(`/admin/plans/${id}`, data),
+  // How many of the plan's licenses would hold more people than maxSeats.
+  planSeatImpact: (id: string, maxSeats: number) =>
+    get<{ max_seats: number; licenses_over: number }>(`/admin/plans/${id}/seat-impact?max_seats=${maxSeats}`),
   deletePlan: (id: string) => del(`/admin/plans/${id}`),
 
   createEntitlement: (data: { plan_id: string; feature: string; value_type: string; value: string }) =>
@@ -293,17 +394,25 @@ export const admin = {
       limit: number
       offset: number
       license_key_hints: Record<string, string>
+      license_key_prefixes: Record<string, string>
     }>(`/admin/licenses?${q}`)
   },
   // The licence keeps its own shape; only the key is gone, replaced by
-  // a last-four hint.
+  // a last-four hint and the key's prefix.
   getLicense: (id: string) =>
-    get<License & { license_key_hint: string; key_usable: boolean; key_unusable_reason?: string }>(
-      `/admin/licenses/${id}`,
-    ),
+    get<
+      License & {
+        license_key_hint: string
+        license_key_prefix: string
+        key_usable: boolean
+        key_unusable_reason?: string
+      }
+    >(`/admin/licenses/${id}`),
   // The key is never in a list or detail payload — one explicit
   // request per key, audited server-side.
   revealLicenseKey: (id: string) => get<{ license_key: string }>(`/admin/licenses/${id}/key`),
+  rotateLicenseKey: (id: string) =>
+    post<{ license_key: string; devices_removed: number }>(`/admin/licenses/${id}/rotate-key`, {}),
   // Re-queues the "here is your key" mail. The address is the one on
   // the licence; the server does not accept one from here.
   resendLicenseEmail: (id: string) =>
@@ -325,7 +434,8 @@ export const admin = {
     post<License>(`/admin/licenses/${id}/updates-until`, { updates_until: updatesUntil }),
   revokeLicense: (id: string) => post(`/admin/licenses/${id}/revoke`),
   suspendLicense: (id: string) => post(`/admin/licenses/${id}/suspend`),
-  reinstateLicense: (id: string) => post(`/admin/licenses/${id}/reinstate`),
+  reinstateLicense: (id: string) =>
+    post<{ status: string; usable?: boolean; notice?: string }>(`/admin/licenses/${id}/reinstate`),
   refundLicense: (id: string) => post(`/admin/licenses/${id}/refund`),
 
   deleteActivation: (id: string) => del(`/admin/activations/${id}`),
@@ -372,7 +482,18 @@ export const admin = {
     post(`/admin/licenses/${id}/usage/reset`, data),
 
   getLicenseSeats: (id: string, params?: { limit?: number; offset?: number }) =>
-    get<Paged<{ seats: Seat[]; active_count: number }>>(`/admin/licenses/${id}/seats?${listQuery(params)}`),
+    get<Paged<{ seats: AdminSeat[]; active_count: number }>>(`/admin/licenses/${id}/seats?${listQuery(params)}`),
+  // A member's own key: revealed one at a time and audited, reissued, or
+  // the seat removed (an invitation cancelled), as the owner would.
+  revealMemberKey: (licenseId: string, seatId: string) =>
+    get<{ license_key: string }>(`/admin/licenses/${licenseId}/seats/${seatId}/key`),
+  rotateMemberKey: (licenseId: string, seatId: string) =>
+    post<{ license_key: string; devices_removed: number }>(
+      `/admin/licenses/${licenseId}/seats/${seatId}/rotate-key`,
+      {},
+    ),
+  removeLicenseSeat: (licenseId: string, seatId: string) =>
+    del<{ status: string }>(`/admin/licenses/${licenseId}/seats/${seatId}`),
 
   getAnalytics: (params?: { product_id?: string; from?: string; to?: string; granularity?: string }) => {
     const q = new URLSearchParams()
@@ -443,6 +564,7 @@ export const admin = {
   // has the subscription.
   unlinkStripeSubscription: (id: string) => post<{ status: string }>(`/admin/licenses/${id}/stripe/unlink`, {}),
   changeLicensePlan: (id: string, data: { plan_id: string }) => post(`/admin/licenses/${id}/change-plan`, data),
+  setLicenseQuantity: (id: string, quantity: number) => post<License>(`/admin/licenses/${id}/quantity`, { quantity }),
 
   // Addons
   listAddons: (params?: { product_id?: string; search?: string; limit?: number; offset?: number }) =>
@@ -494,7 +616,16 @@ export const admin = {
     return get<AnalyticsInsights>(`/admin/analytics/insights?${q}`)
   },
 
-  getUserDetail: (id: string) => get<UserDetail & { license_key_hints: Record<string, string> }>(`/admin/users/${id}`),
+  getUserDetail: (id: string) =>
+    get<
+      UserDetail & {
+        license_key_hints: Record<string, string>
+        license_key_prefixes: Record<string, string>
+        // By seat ID: a membership's own key.
+        member_key_hints: Record<string, string>
+        member_key_prefixes: Record<string, string>
+      }
+    >(`/admin/users/${id}`),
 
   // Settings
   getSettings: () =>
@@ -539,7 +670,15 @@ export const admin = {
     if (params?.status) q.set("status", params.status)
     if (params?.limit) q.set("limit", String(params.limit))
     if (params?.offset) q.set("offset", String(params.offset))
-    return get<{ releases: Release[]; total: number; limit: number; offset: number }>(`/admin/releases?${q}`)
+    return get<{
+      releases: Release[]
+      total: number
+      limit: number
+      offset: number
+      // Highest published version per product and channel, whatever the
+      // filter and page.
+      latest_published?: { product_id: string; channel: string; version: string }[]
+    }>(`/admin/releases?${q}`)
   },
   getRelease: (id: string) => get<Release>(`/admin/releases/${id}`),
   createRelease: (data: {
@@ -606,6 +745,7 @@ export interface Product {
   name: string
   slug: string
   type: string
+  license_prefix: string
   minimum_supported_version?: string
   minimum_supported_message?: string
   require_signing: boolean
@@ -629,8 +769,21 @@ export interface Plan {
   license_model?: string
   floating_timeout?: number
   token_ttl_days?: number
+  // Self sign-up (free plans only): visitors claim a licence from the
+  // plan's /pay link by confirming their email.
+  self_signup?: boolean
+  signup_daily_cap?: number
+  signup_consent_text?: string
   max_seats: number
+  // Sold per seat (subscriptions only): the buyer picks a quantity in
+  // [min_quantity, max_quantity]; max_activations is per seat.
+  per_seat?: boolean
+  min_quantity?: number
+  max_quantity?: number
   trial_days: number
+  // Trial plans only: the free plan a licence moves to when its trial
+  // ends, instead of expiring. Absent = the trial expires.
+  trial_fallback_plan_id?: string
   grace_days: number
   stripe_price_id?: string
   // Maintenance period (perpetual plans): days of updates a purchase
@@ -681,6 +834,19 @@ export interface License {
   notes?: string
   external_customer_id?: string
   external_workspace_id?: string
+  // Set on a licence the customer claimed through self sign-up.
+  signup_source?: string
+  marketing_consent?: boolean
+  marketing_consent_at?: string
+  // Seats the licence is paid for; only a plan sold per seat turns it
+  // into limits.
+  quantity?: number
+  // The limits the server enforces (people, devices or floating
+  // sessions); 0 seats means no limit. Present when the plan is loaded.
+  seat_limit?: number
+  activation_limit?: number
+  // A subscription change waits for payment until this moment.
+  stripe_pending_update_expires_at?: string
   created_at: string
   updated_at: string
   product?: Product
@@ -703,6 +869,14 @@ export interface License {
 // endpoints. Admin payloads never carry it.
 export interface PortalLicense extends License {
   license_key: string
+  // The owner can upgrade it to a paid plan now, keeping the key.
+  upgradable?: boolean
+  // For a member: their seat is paused (over the seat limit).
+  key_paused?: boolean
+  // Its subscription ends at the period end rather than renews (owner only).
+  cancel_scheduled?: boolean
+  // What the license grants: the plan's features with its addons applied.
+  features?: Entitlement[]
 }
 
 export interface Activation {
@@ -714,6 +888,10 @@ export interface Activation {
   ip_address?: string
   last_verified: string
   created_at: string
+  // The member whose own key activated the device; absent for the
+  // owner's key.
+  seat_id?: string
+  member_email?: string
 }
 
 export interface APIKey {
@@ -759,9 +937,21 @@ export interface Seat {
   role: string
   user_id?: string
   invited_at: string
+  invite_expires_at?: string
+  // Over the licence's seat limit: joined after the places ran out, so
+  // their own key may not be used until a place is free.
+  paused?: boolean
   accepted_at?: string
   removed_at?: string
   created_at: string
+}
+
+// A seat as the admin's seat list gives it: the member's own key by its
+// prefix and last four characters, absent until they have one.
+export interface AdminSeat extends Seat {
+  key_prefix?: string
+  key_hint?: string
+  device_count: number
 }
 
 export interface UsageEvent {
@@ -987,6 +1177,9 @@ export interface Invoice {
   status: string
   amount_due: number
   amount_paid: number
+  // What the invoice billed, after discounts and tax. Not what was paid:
+  // amount_paid is 0 for one settled outside Stripe or from the balance.
+  total: number
   currency: string
   created: number
   period_start: number
@@ -998,6 +1191,8 @@ export interface Invoice {
 export interface UserDetail {
   user: User
   licenses: License[]
+  // Seats the customer holds on other people's licences, each with it.
+  memberships: (Seat & { license?: License })[]
   subscriptions: Subscription[]
   total_usage: number
   active_seats: number

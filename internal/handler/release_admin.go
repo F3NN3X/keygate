@@ -75,6 +75,11 @@ func (h *ReleaseAdminHandler) Create(c *gin.Context) {
 		return
 	}
 
+	// Scope before the lookup, so a bound key cannot learn whether
+	// another product exists.
+	if !requireKeyProductScope(c, req.ProductID) {
+		return
+	}
 	prod, err := h.store.FindProductByID(c.Request.Context(), req.ProductID)
 	if err != nil {
 		response.NotFound(c, "product not found")
@@ -83,9 +88,6 @@ func (h *ReleaseAdminHandler) Create(c *gin.Context) {
 	if !model.ProductSupports(prod.Type, model.CapReleases) {
 		response.Err(c, 400, "INCOMPATIBLE_PRODUCT_TYPE",
 			"release management is not available for "+prod.Type+" products")
-		return
-	}
-	if !requireKeyProductScope(c, req.ProductID) {
 		return
 	}
 
@@ -230,6 +232,7 @@ func (h *ReleaseAdminHandler) DeleteArtifact(c *gin.Context) {
 	h.store.Audit(c.Request.Context(), &model.AuditLog{
 		Entity: "release_artifact", EntityID: aid, Action: "deleted",
 		ActorType: "admin", ActorID: adminID(c), IPAddress: c.ClientIP(),
+		ProductID: h.store.ProductOfAudited(c.Request.Context(), "release", id),
 	})
 	response.OK(c, gin.H{"status": "deleted"})
 }
@@ -428,13 +431,14 @@ func (h *ReleaseAdminHandler) Delete(c *gin.Context) {
 	if !h.checkReleaseScope(c, id) {
 		return
 	}
+	pid := h.store.ProductOfAudited(c.Request.Context(), "release", id) // gone after the delete
 	if err := h.svc.DeleteDraft(c.Request.Context(), id); err != nil {
 		writeAppErr(c, err)
 		return
 	}
 	h.store.Audit(c.Request.Context(), &model.AuditLog{
 		Entity: "release", EntityID: id, Action: "deleted",
-		ActorType: "admin", ActorID: adminID(c), IPAddress: c.ClientIP(),
+		ActorType: "admin", ActorID: adminID(c), IPAddress: c.ClientIP(), ProductID: pid,
 	})
 	response.OK(c, gin.H{"status": "deleted"})
 }
@@ -463,19 +467,11 @@ func (h *ReleaseAdminHandler) List(c *gin.Context) {
 		}
 	}
 
-	productID := c.Query("product_id")
-	// Same auto-narrowing pattern as AdminHandler.ListLicenses: a
-	// product-scoped key never sees other products' releases, even
+	// A product-scoped key never sees other products' releases, even
 	// if it forgets the product_id filter.
-	if v, ok := c.Get("api_key"); ok {
-		if ak, ok := v.(*model.APIKey); ok && ak != nil && ak.ProductID != "" {
-			if productID != "" && productID != ak.ProductID {
-				response.Err(c, 403, "PRODUCT_SCOPE_MISMATCH",
-					"api_key is bound to a different product")
-				return
-			}
-			productID = ak.ProductID
-		}
+	productID, ok := keyProductFilter(c, c.Query("product_id"))
+	if !ok {
+		return
 	}
 
 	filter := store.ReleaseFilter{
@@ -496,7 +492,14 @@ func (h *ReleaseAdminHandler) List(c *gin.Context) {
 		response.Internal(c, err)
 		return
 	}
-	listOK(c, "releases", releases, total, page)
+	// The newest published version per product and channel, whatever
+	// the filter and page: what the dashboard warns a draft against.
+	latest, err := h.store.LatestPublishedVersions(c.Request.Context(), productID)
+	if err != nil {
+		response.Internal(c, err)
+		return
+	}
+	listOK(c, "releases", releases, total, page, gin.H{"latest_published": latest})
 }
 
 // GET /api/v1/admin/releases/:id

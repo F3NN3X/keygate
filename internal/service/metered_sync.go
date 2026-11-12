@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -97,45 +99,107 @@ func stripeMeterEventDispatch(ctx context.Context, in stripeMeterEvent) (string,
 	return ev.Identifier, nil
 }
 
-// RunOnce drains up to `limit` pending events. Returns the number
+// meteredFailuresEndPass is how many pushes failing in a row end a sync
+// pass (see TryRunOnce).
+const meteredFailuresEndPass = 10
+
+// RunOnce drains every pending event, `limit` at a time. Returns the number
 // of rows that were actually pushed to Stripe (excludes sentinel-
 // drained rows like missing customer / cleared event_name / legacy
 // no-identifier). Errors are logged + recorded per-row, never
 // propagated — a poison-pill row should not block the rest of the
 // queue.
+//
+// One pass runs at a time across replicas (see store.TryMeteredSyncLock):
+// a pass that finds another running returns 0 and leaves the rows to it.
 func (m *MeteredBillingSyncer) RunOnce(ctx context.Context, limit int) (pushed int) {
+	pushed, _, _ = m.TryRunOnce(ctx, limit)
+	return pushed
+}
+
+// TryRunOnce is RunOnce, and says whether the pass ran: ran is false
+// when another pass held the lock. err is the lock not being taken at
+// all (the database unreachable, say), which is not another pass.
+func (m *MeteredBillingSyncer) TryRunOnce(ctx context.Context, limit int) (pushed int, ran bool, err error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := m.store.ListUnsyncedMetered(ctx, limit, m.maxAttempts)
+	release, ok, err := m.store.TryMeteredSyncLock(ctx)
 	if err != nil {
-		m.logger.Error("metered: list unsynced failed", "error", err)
-		return 0
+		m.logger.Error("metered: sync lock failed", "error", err)
+		return 0, false, err
 	}
-	for _, row := range rows {
-		if row.Attempts >= m.maxAttempts {
-			// Hit the ceiling. Don't keep retrying forever; admin
-			// inspection required. Skip silently — the row's
-			// last_error already records the situation.
-			continue
-		}
-		sent, err := m.syncOne(ctx, row)
+	if !ok {
+		m.logger.Debug("metered: another replica is syncing; skipping this pass")
+		return 0, false, nil
+	}
+	defer release()
+	ran = true
+	// The whole queue, limit rows at a time: one batch a pass let a
+	// product recording more than a batch an interval fall behind for
+	// good, and usage that reaches Stripe after its invoice is finalized
+	// is never billed. Each row is tried once a pass (see
+	// ListUnsyncedMeteredAfter); one that failed waits for the next.
+	//
+	// A run of failures in a row ends the pass: Stripe unreachable makes
+	// every push fail slowly (the client's own retries), and a pass that
+	// went on through a backlog of thousands would hold the lock, and an
+	// admin's request, for hours. What is left goes with the next pass.
+	// Only Stripe failing as a whole counts (no answer, 5xx, 429, the key
+	// refused): a row Stripe refuses on its own merits is skipped, or a
+	// run of one customer's refused rows at the head of the queue would
+	// hold every other customer's usage back each pass until their
+	// retries ran out.
+	var last *model.MeteredBilling
+	failedInARow := 0
+	for ctx.Err() == nil && failedInARow < meteredFailuresEndPass {
+		rows, err := m.store.ListUnsyncedMeteredAfter(ctx, last, limit, m.maxAttempts)
 		if err != nil {
-			m.logger.Warn("metered: push failed",
-				"id", row.ID, "license_id", row.LicenseID,
-				"feature", row.Feature, "attempts", row.Attempts+1,
-				"error", err)
-			// Single source of attempts bump on failure. syncOne
-			// does NOT touch attempts; RecordMeteredSyncFailure
-			// owns it. Without this split the counter doubled.
-			_ = m.store.RecordMeteredSyncFailure(ctx, row.ID, err.Error())
-			continue
+			m.logger.Error("metered: list unsynced failed", "error", err)
+			return pushed, true, err
 		}
-		if sent {
-			pushed++
+		for _, row := range rows {
+			if row.Attempts >= m.maxAttempts {
+				// Hit the ceiling. Don't keep retrying forever; admin
+				// inspection required. Skip silently — the row's
+				// last_error already records the situation.
+				continue
+			}
+			sent, err := m.syncOne(ctx, row)
+			if err != nil {
+				m.logger.Warn("metered: push failed",
+					"id", row.ID, "license_id", row.LicenseID,
+					"feature", row.Feature, "attempts", row.Attempts+1,
+					"error", err)
+				// Single source of attempts bump on failure. syncOne
+				// does NOT touch attempts; RecordMeteredSyncFailure
+				// owns it. Without this split the counter doubled.
+				_ = m.store.RecordMeteredSyncFailure(ctx, row.ID, err.Error())
+				var refused *rowRefusedError
+				if errors.As(err, &refused) {
+					// About this row alone: the next may well go through.
+					continue
+				}
+				if failedInARow++; failedInARow >= meteredFailuresEndPass {
+					m.logger.Warn("metered: pushes keep failing; ending this pass", "failed_in_a_row", failedInARow)
+					break
+				}
+				continue
+			}
+			// Only a push Stripe took ends a run of failures: a row
+			// drained without asking Stripe (no customer, no meter) says
+			// nothing about whether it is back.
+			if sent {
+				failedInARow = 0
+				pushed++
+			}
 		}
+		if len(rows) < limit {
+			break
+		}
+		last = rows[len(rows)-1]
 	}
-	return pushed
+	return pushed, true, nil
 }
 
 // syncOne pushes a single event. Returns (sent, err):
@@ -199,6 +263,9 @@ func (m *MeteredBillingSyncer) syncOne(ctx context.Context, row *model.MeteredBi
 		Timestamp:  row.CreatedAt,
 	})
 	if err != nil {
+		if rowRefused(err) {
+			return false, &rowRefusedError{classifyStripeError(err)}
+		}
 		return false, classifyStripeError(err)
 	}
 	if externalID == "" {
@@ -208,6 +275,34 @@ func (m *MeteredBillingSyncer) syncOne(ctx context.Context, row *model.MeteredBi
 		return false, err
 	}
 	return true, nil
+}
+
+// rowRefusedError is a push Stripe answered and refused for this row
+// itself (a customer it does not know, a meter gone; see rowRefused).
+// Unlike Stripe being unreachable, failing, throttling or refusing the
+// account's key, it says nothing about the rows after it, so it does
+// not count towards ending the pass (see meteredFailuresEndPass).
+type rowRefusedError struct{ err error }
+
+func (e *rowRefusedError) Error() string { return e.err.Error() }
+func (e *rowRefusedError) Unwrap() error { return e.err }
+
+// rowRefused reports whether Stripe answered err as about this request
+// alone: 400 (a parameter it rejects, such as a customer it does not
+// know), 404, 409 or 422. Everything else is about the account or the
+// service and holds for every row: 401 and 403 (the key missing,
+// revoked, rotated or short of a permission), 402, 429, 5xx, and no
+// answer at all.
+func rowRefused(err error) bool {
+	var se *stripe.Error
+	if !errors.As(err, &se) {
+		return false
+	}
+	switch se.HTTPStatusCode {
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusUnprocessableEntity:
+		return true
+	}
+	return false
 }
 
 // classifyStripeError keeps the error message compact for the

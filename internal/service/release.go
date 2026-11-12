@@ -204,10 +204,13 @@ var platformAliases = map[string]string{
 	"linux-armv7":     "linux-armhf",
 }
 
-// NormalizePlatform returns the canonical identifier for p, or p
-// unchanged when there is no alias (validation then rejects it).
+// NormalizePlatform returns the canonical identifier for p, matched
+// whatever its case, as aliases are: "Linux-X64" is linux-x64 as
+// "Linux-X86_64" is. Anything else comes back lower-cased, for
+// validation to reject.
 func NormalizePlatform(p string) string {
-	if canon, ok := platformAliases[strings.ToLower(p)]; ok {
+	p = strings.ToLower(p)
+	if canon, ok := platformAliases[p]; ok {
 		return canon
 	}
 	return p
@@ -289,6 +292,15 @@ func (s *ReleaseService) CreateRelease(ctx context.Context, in CreateReleaseInpu
 	if err := s.store.CreateRelease(ctx, rel); err != nil {
 		if errors.Is(err, store.ErrReleaseAlreadyExists) {
 			return nil, apperr.New(409, "RELEASE_EXISTS", "a release for this product/version already exists")
+		}
+		if errors.Is(err, store.ErrProductNoReleases) {
+			// The product changed type since the handler checked it.
+			return nil, apperr.New(400, "INCOMPATIBLE_PRODUCT_TYPE",
+				"release management is not available for this product's type")
+		}
+		if errors.Is(err, sql.ErrNoRows) || store.IsForeignKeyViolation(err) {
+			// The product was deleted since the handler checked it.
+			return nil, apperr.New(404, "NOT_FOUND", "product not found")
 		}
 		return nil, apperr.Internal(err)
 	}
@@ -389,10 +401,45 @@ func (s *ReleaseService) FinalizeArtifact(ctx context.Context, in FinalizeArtifa
 		}
 		return nil, apperr.Internal(err)
 	}
+	rel, err := s.store.FindReleaseByID(ctx, a.ReleaseID)
+	if err != nil {
+		if errors.Is(err, store.ErrReleaseNotFound) {
+			return nil, apperr.New(404, "ARTIFACT_NOT_FOUND", "artifact not found")
+		}
+		return nil, apperr.Internal(err)
+	}
 
-	info, err := s.storage.Head(ctx, a.FileKey)
+	// The upload lands where the presigned URL points, and that URL
+	// stays valid for its whole TTL: storage cannot revoke it. Served
+	// from there, the file could be replaced after it was hashed,
+	// signed and published, by anyone holding the URL. So the upload is
+	// copied, inside the store, to a key no URL was ever issued for,
+	// and that copy is what is hashed and served.
+	//
+	// The upload key is the one AddArtifact built and the presigned URL
+	// points at. Never finalized, the artifact still records it as its
+	// file key, which is also what an upload made under an older key
+	// scheme (v0.1.1 to v0.1.3 named the product by slug) still points
+	// at. Finalized, its file key is the served copy, and the upload key
+	// is built again as AddArtifact builds it (the extension is the
+	// copy's own).
+	uploadKey := a.FileKey
+	if a.SHA256 != "" {
+		uploadKey = buildFileKey(rel.ProductID, a.Platform, rel.Version, a.FileKey)
+	}
+	info, err := s.storage.Head(ctx, uploadKey)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotFound) {
+			// Finalized already, and asked again (a client retrying after
+			// a lost answer): the upload was copied and removed, and the
+			// artifact is what that finalize made.
+			if a.SHA256 != "" && a.FileKey != uploadKey {
+				if in.ExpectedSHA256 != "" && in.ExpectedSHA256 != a.SHA256 {
+					return nil, apperr.New(409, "SHA256_MISMATCH",
+						fmt.Sprintf("uploaded bytes hash to %s; client expected %s", a.SHA256, in.ExpectedSHA256))
+				}
+				return a, nil
+			}
 			return nil, apperr.New(409, "UPLOAD_INCOMPLETE", ErrReleaseUploadIncomplete.Error())
 		}
 		return nil, apperr.Internal(err)
@@ -401,12 +448,26 @@ func (s *ReleaseService) FinalizeArtifact(ctx context.Context, in FinalizeArtifa
 		return nil, apperr.New(413, "ARTIFACT_TOO_LARGE",
 			fmt.Sprintf("artifact size %d exceeds finalize limit %d", info.Size, maxFinalizeReadSize))
 	}
-
-	computed, err := s.computeArtifactSHA256(ctx, a.FileKey, info.Size)
-	if err != nil {
+	servedKey := servedFileKey(rel.ProductID, a.Platform, rel.Version, normalizeExt(uploadKey))
+	if err := s.storage.Copy(ctx, uploadKey, servedKey, info.Size); err != nil {
 		if errors.Is(err, storage.ErrObjectNotFound) {
 			return nil, apperr.New(409, "UPLOAD_INCOMPLETE", ErrReleaseUploadIncomplete.Error())
 		}
+		return nil, apperr.Internal(err)
+	}
+	// Removed again if this finalize does not record it.
+	recorded := false
+	defer func() {
+		if !recorded {
+			s.deleteObject(servedKey)
+		}
+	}()
+	if info, err = s.storage.Head(ctx, servedKey); err != nil {
+		return nil, apperr.Internal(err)
+	}
+
+	computed, err := s.computeArtifactSHA256(ctx, servedKey, info.Size)
+	if err != nil {
 		return nil, apperr.Internal(err)
 	}
 
@@ -425,9 +486,17 @@ func (s *ReleaseService) FinalizeArtifact(ctx context.Context, in FinalizeArtifa
 		contentType = "application/octet-stream"
 	}
 
-	if err := s.store.UpdateArtifactFile(ctx, a.ID, a.FileKey, info.Size, computed, contentType); err != nil {
+	replaced, err := s.store.ReplaceArtifactFile(ctx, a.ID, servedKey, info.Size, computed, contentType)
+	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrReleaseNotPublishable):
+			// Uploaded again after the release went out: nothing will
+			// take it, so it goes. Not when it is what the release
+			// serves, as for an artifact finalized before served copies,
+			// whose upload key is its file key.
+			if uploadKey != a.FileKey {
+				s.deleteObject(uploadKey)
+			}
 			return nil, apperr.New(409, "RELEASE_NOT_DRAFT", "artifact's release is no longer draft")
 		case errors.Is(err, store.ErrArtifactNotFound):
 			return nil, apperr.New(404, "ARTIFACT_NOT_FOUND", "artifact not found")
@@ -435,9 +504,21 @@ func (s *ReleaseService) FinalizeArtifact(ctx context.Context, in FinalizeArtifa
 			return nil, apperr.Internal(err)
 		}
 	}
+	recorded = true
+	// The upload is copied; the copy this write replaced (an earlier
+	// finalize's, read under the lock, see ReplaceArtifactFile) is not
+	// referenced any more. Neither is the upload.
+	s.deleteObject(uploadKey)
+	if replaced != uploadKey && replaced != servedKey {
+		s.deleteObject(replaced)
+	}
 
 	out, err := s.store.FindArtifact(ctx, a.ID)
 	if err != nil {
+		if errors.Is(err, store.ErrArtifactNotFound) {
+			// Deleted right after this finalize recorded it.
+			return nil, apperr.New(404, "ARTIFACT_NOT_FOUND", "artifact not found")
+		}
 		return nil, apperr.Internal(err)
 	}
 	return out, nil
@@ -471,8 +552,16 @@ func (s *ReleaseService) computeArtifactSHA256(ctx context.Context, key string, 
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// DeleteArtifact removes an artifact from a draft release + its storage object.
+// DeleteArtifact removes an artifact from a draft release + its storage
+// object, and the upload the served copy was made from, should its
+// presigned URL have been used again since (see FinalizeArtifact).
 func (s *ReleaseService) DeleteArtifact(ctx context.Context, artifactID string) error {
+	uploadKey := ""
+	if a, err := s.store.FindArtifact(ctx, artifactID); err == nil {
+		if rel, err := s.store.FindReleaseByID(ctx, a.ReleaseID); err == nil {
+			uploadKey = buildFileKey(rel.ProductID, a.Platform, rel.Version, a.FileKey)
+		}
+	}
 	fileKey, err := s.store.DeleteArtifact(ctx, artifactID)
 	if err != nil {
 		switch {
@@ -488,6 +577,9 @@ func (s *ReleaseService) DeleteArtifact(ctx context.Context, artifactID string) 
 		if err := s.storage.Delete(ctx, fileKey); err != nil {
 			s.logger.Warn("artifact storage cleanup failed", "artifact_id", artifactID, "file_key", fileKey, "err", err)
 		}
+	}
+	if uploadKey != "" && uploadKey != fileKey {
+		s.deleteObject(uploadKey)
 	}
 	return nil
 }
@@ -617,10 +709,22 @@ func (s *ReleaseService) Publish(ctx context.Context, releaseID string) (*model.
 					return nil, apperr.Internal(err)
 				}
 			}
-			if storeErr := s.store.UpdateArtifactSignature(ctx, a.ID, result.Signature, result.SigningKeyID, result.TauriSignature); storeErr != nil {
+			if storeErr := s.store.UpdateArtifactSignatureOf(ctx, a.ID, a.FileKey, a.SHA256, result.Signature, result.SigningKeyID, result.TauriSignature); storeErr != nil {
 				if errors.Is(storeErr, store.ErrReleaseNotPublishable) {
 					// Another publish won while we were signing.
 					return nil, apperr.New(409, "NOT_PUBLISHABLE", "release must be a draft")
+				}
+				if errors.Is(storeErr, store.ErrArtifactReplaced) {
+					// Finalized again while we were signing the file it
+					// pointed at before; publishing again signs the new one.
+					return nil, apperr.New(409, "ARTIFACT_MODIFIED",
+						fmt.Sprintf("artifact for platform %q was replaced while the release was being published; publish again", a.Platform))
+				}
+				if errors.Is(storeErr, store.ErrArtifactNotFound) {
+					// Deleted while we were signing it; the publish is
+					// asked again with the artifacts the release has now.
+					return nil, apperr.New(409, "ARTIFACT_MISSING",
+						fmt.Sprintf("artifact for platform %q was removed while the release was being published; publish again", a.Platform))
 				}
 				s.logger.Error("publish: store artifact signature failed",
 					"release_id", rel.ID, "artifact_id", a.ID, "error", storeErr)
@@ -653,6 +757,12 @@ func (s *ReleaseService) Publish(ctx context.Context, releaseID string) (*model.
 			// artifact with one key.
 			return nil, apperr.New(409, "ARTIFACTS_NOT_SIGNED",
 				"a concurrent upload cleared one or more signatures; retry publish")
+		case errors.Is(err, store.ErrReleaseSigningKeyRetired):
+			// Rotated or deactivated while we were signing; publishing
+			// again signs with the key active then, or refuses as for
+			// none.
+			return nil, apperr.New(409, "SIGNING_KEY_MISSING",
+				"the signing key was rotated or deactivated during publish; retry")
 		case errors.Is(err, store.ErrReleaseNotPublishable):
 			return nil, apperr.New(409, "NOT_PUBLISHABLE", "release must be a draft")
 		default:
@@ -722,6 +832,10 @@ func (s *ReleaseService) Unyank(ctx context.Context, releaseID string) (*model.R
 			return nil, apperr.New(404, "RELEASE_NOT_FOUND", "release not found")
 		case errors.Is(err, store.ErrReleaseNotYankable):
 			return nil, apperr.New(409, "NOT_UNYANKABLE", "only yanked releases can be unyanked")
+		case errors.Is(err, store.ErrProductNoReleases):
+			// The product changed type since the check above.
+			return nil, apperr.New(409, "NOT_UNYANKABLE",
+				"release management is not available for this product's type; change the product type back before unyanking")
 		default:
 			return nil, apperr.Internal(err)
 		}
@@ -737,6 +851,15 @@ func (s *ReleaseService) Unyank(ctx context.Context, releaseID string) (*model.R
 // DeleteDraft removes a draft release + all its artifacts (CASCADE) +
 // cleans up storage objects best-effort.
 func (s *ReleaseService) DeleteDraft(ctx context.Context, releaseID string) error {
+	// The uploads the served copies were made from, as in DeleteArtifact.
+	var uploadKeys []string
+	if rel, err := s.store.FindReleaseByID(ctx, releaseID); err == nil {
+		for _, a := range rel.Artifacts {
+			if k := buildFileKey(rel.ProductID, a.Platform, rel.Version, a.FileKey); k != a.FileKey {
+				uploadKeys = append(uploadKeys, k)
+			}
+		}
+	}
 	fileKeys, err := s.store.DeleteRelease(ctx, releaseID)
 	if err != nil {
 		switch {
@@ -752,6 +875,9 @@ func (s *ReleaseService) DeleteDraft(ctx context.Context, releaseID string) erro
 		if err := s.storage.Delete(ctx, key); err != nil {
 			s.logger.Warn("draft delete: storage cleanup failed", "release_id", releaseID, "file_key", key, "err", err)
 		}
+	}
+	for _, key := range uploadKeys {
+		s.deleteObject(key)
 	}
 	return nil
 }
@@ -814,7 +940,7 @@ func (s *ReleaseService) GenerateDownload(ctx context.Context, in DownloadInput)
 	if until := lic.EffectiveUpdatesUntil(); !releaseWithinUpdates(rel, until) {
 		return nil, apperr.New(403, "UPDATES_EXPIRED",
 			fmt.Sprintf("release %s was published after this license's update period ended on %s; renew to install it",
-				rel.Version, until.Format("2006-01-02")))
+				rel.Version, utcDate(*until)))
 	}
 
 	// Find the artifact for the requested platform within this release.
@@ -1032,7 +1158,14 @@ func (s *ReleaseService) FeedCutoff(ctx context.Context, licenseKey, productID s
 // cutoff comes from the license row, never from the token: a token
 // signed before a renewal, a revocation or a plan change must not
 // decide what the feed shows.
-func (s *ReleaseService) FeedCutoffForToken(ctx context.Context, licenseID, productID string) (*time.Time, error) {
+//
+// identifier is the device id from the token (did). The device must
+// still be activated, as Verify requires, and a member's device must
+// not be on a paused seat, as FeedCutoff refuses the member's key via
+// KeySeatPaused: otherwise a token issued before the device was
+// released, the member removed or the seat paused keeps unlocking
+// updates until it expires.
+func (s *ReleaseService) FeedCutoffForToken(ctx context.Context, licenseID, productID, identifier string) (*time.Time, error) {
 	lic, err := s.store.FindLicenseByID(ctx, licenseID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1045,7 +1178,40 @@ func (s *ReleaseService) FeedCutoffForToken(ctx context.Context, licenseID, prod
 		!IsLicenseUsable(lic) {
 		return nil, licenseNotFound()
 	}
+	if err := s.refuseTokenDevice(ctx, lic, identifier); err != nil {
+		return nil, err
+	}
 	return lic.EffectiveUpdatesUntil(), nil
+}
+
+// refuseTokenDevice collapses a still-valid license token into
+// LICENSE_NOT_FOUND when its device is no longer activated or is a
+// member's that the member's key no longer opens: on a paused seat, or
+// on a product that no longer has seats (FindLicenseByKey refuses member
+// keys there). This matches what Verify and FeedCutoff's key path answer
+// for that device.
+func (s *ReleaseService) refuseTokenDevice(ctx context.Context, lic *model.License, identifier string) error {
+	act, err := s.store.FindActivation(ctx, lic.ID, identifier)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return licenseNotFound()
+		}
+		return apperr.Internal(err)
+	}
+	if act.SeatID == "" {
+		return nil
+	}
+	if !model.ProductSupports(lic.Product.Type, model.CapSeats) {
+		return licenseNotFound()
+	}
+	paused, err := s.store.SeatPaused(ctx, act.SeatID)
+	if err != nil {
+		return apperr.Internal(err)
+	}
+	if paused {
+		return licenseNotFound()
+	}
+	return nil
 }
 
 // ─── Helpers ───
@@ -1057,6 +1223,32 @@ func (s *ReleaseService) FeedCutoffForToken(ctx context.Context, licenseID, prod
 // The product ID, not the slug: slugs can be renamed and reused, and
 // a second product taking over an old slug would otherwise presign
 // PUTs (and deletes) onto the first product's published binaries.
+// servedFileKey is a fresh key for the copy of an upload that is
+// served (see FinalizeArtifact): no presigned URL is ever issued for it.
+// It keeps the upload's extension, which DownloadFilename reads, and sits
+// beside the upload key rather than under it: an upload key with no
+// extension is an object, and stores such as MinIO refuse an object
+// "inside" another.
+func servedFileKey(productID, platform, version, ext string) string {
+	return fmt.Sprintf("releases/%s/%s/%s-%s%s",
+		safeKeyComponent(productID),
+		safeKeyComponent(version),
+		safeKeyComponent(platform),
+		store.NewID(),
+		ext)
+}
+
+// deleteObject removes an object nothing references, on a context of
+// its own: the request's may be done. A failure leaves an orphan behind,
+// not a broken release, so it is logged rather than returned.
+func (s *ReleaseService) deleteObject(key string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.storage.Delete(ctx, key); err != nil {
+		s.logger.Warn("release storage: delete unreferenced object failed", "key", key, "error", err)
+	}
+}
+
 func buildFileKey(productID, platform, version, originalFilename string) string {
 	ext := normalizeExt(originalFilename)
 	if !validExtension(ext) {
@@ -1151,10 +1343,7 @@ func DownloadFilename(rel *model.Release, a *model.ReleaseArtifact) string {
 // gating. Exported so handlers can share the same check.
 func IsLicenseUsable(lic *model.License) bool {
 	now := time.Now()
-	graceDays := 7
-	if lic.Plan != nil {
-		graceDays = lic.Plan.GraceDays
-	}
+	graceDays := lic.GraceDays()
 	switch lic.Status {
 	case model.StatusActive, model.StatusTrialing, model.StatusPastDue:
 		if lic.ValidUntil == nil {

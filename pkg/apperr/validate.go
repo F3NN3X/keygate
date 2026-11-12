@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/mod/semver"
 )
@@ -59,8 +60,25 @@ func ValidateName(field, value string) *AppError {
 	if value == "" {
 		return &AppError{Status: 400, Code: "INVALID_INPUT", Message: field + " is required"}
 	}
-	if len(value) > 200 {
+	// Characters, as the message says, not bytes: 200 of them is at
+	// most 800 bytes, which a session token carrying a name still fits.
+	if utf8.RuneCountInString(value) > 200 {
 		return &AppError{Status: 400, Code: "INVALID_INPUT", Message: field + " must be at most 200 characters"}
+	}
+	return nil
+}
+
+// ValidateLicensePrefix checks the first segment of a product's license
+// keys: 2 to 8 uppercase letters or digits. No hyphen, so the prefix is
+// always exactly the part of a key before its first hyphen.
+func ValidateLicensePrefix(value string) *AppError {
+	if len(value) < 2 || len(value) > 8 {
+		return &AppError{Status: 400, Code: "INVALID_INPUT", Message: "license_prefix must be 2 to 8 characters"}
+	}
+	for _, c := range value {
+		if !((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+			return &AppError{Status: 400, Code: "INVALID_INPUT", Message: "license_prefix must contain only uppercase letters and numbers (A-Z, 0-9)"}
+		}
 	}
 	return nil
 }
@@ -95,6 +113,11 @@ func ValidateURL(value string) *AppError {
 	}
 	if !strings.HasPrefix(value, "https://") && !strings.HasPrefix(value, "http://") {
 		return &AppError{Status: 400, Code: "INVALID_INPUT", Message: "url must start with https:// or http://"}
+	}
+	// "http://" and "https:///hook" pass the prefix check but name no host,
+	// so a webhook saved with one could never be delivered.
+	if u, err := url.Parse(value); err != nil || u.Hostname() == "" {
+		return &AppError{Status: 400, Code: "INVALID_INPUT", Message: "url must include a host, such as https://example.com/hook"}
 	}
 	return nil
 }

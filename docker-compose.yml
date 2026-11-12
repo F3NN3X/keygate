@@ -48,6 +48,9 @@ services:
       STORAGE_UPLOAD_TTL: ${STORAGE_UPLOAD_TTL:-1h}
       STORAGE_DOWNLOAD_TTL: ${STORAGE_DOWNLOAD_TTL:-10m}
       MAX_RELEASE_SIGN_SIZE_MB: ${MAX_RELEASE_SIGN_SIZE_MB:-500}
+      # Proxies whose X-Forwarded-For / X-Real-Ip are believed for rate limits and lockouts (v0.1.20).
+      # Empty trusts private networks, which covers Traefik on dokploy-network; "none" trusts no proxy.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
       # Shared rate-limit backend across instances; empty = in-memory (single instance).
       REDIS_URL: ${REDIS_URL:-}
     # keygate calls the object store server-side (finalize HEADs the object, publish reads it back to

@@ -1,10 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -13,11 +12,14 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
+	"regexp"
 	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -41,8 +43,11 @@ import (
 // credentialQueryParams are query parameters whose values must never
 // reach a log line. An updater sends a signed token this way when it
 // cannot set a header; the license key itself is refused in the URL,
-// but a client that tries still must not have it logged.
-var credentialQueryParams = []string{"license_key", "license_token"}
+// but a client that tries still must not have it logged. The invite
+// link (/accept-invite?token=) carries the claim token: a link scanner
+// fetching it leaves the token unspent, and whoever reads it in the log
+// could accept the invite. Names match whatever their case.
+var credentialQueryParams = []string{"license_key", "license_token", "token"}
 
 // credentialPathPrefixes name the routes that carry a credential as a
 // path segment rather than a parameter. The customer portal addresses
@@ -52,8 +57,10 @@ var credentialQueryParams = []string{"license_key", "license_token"}
 // holding a working credential.
 //
 // Each entry is the literal prefix up to and including the trailing
-// slash; the segment that follows it is the secret.
-var credentialPathPrefixes = []string{"/api/v1/portal/licenses/"}
+// slash; the segment that follows it is the secret. The second is the
+// same shape without the API prefix: no route serves it, but a request
+// for it is logged all the same.
+var credentialPathPrefixes = []string{"/api/v1/portal/licenses/", "/portal/licenses/"}
 
 // credentialPathSuffixes name the first segment of each continuation
 // that may follow the secret and be kept in a log line. Keeping the
@@ -82,14 +89,14 @@ var credentialPathSuffixes = map[string]bool{"activations": true}
 //
 // A new sub-route not listed above costs a little log detail until
 // someone adds it. The failure runs in the safe direction.
-func redactCredentialSegments(path string) string {
+func redactCredentialSegments(urlPath string) string {
 	for _, prefix := range credentialPathPrefixes {
-		if !strings.HasPrefix(path, prefix) {
+		if !strings.HasPrefix(urlPath, prefix) {
 			continue
 		}
-		rest := path[len(prefix):]
+		rest := urlPath[len(prefix):]
 		if rest == "" {
-			return path
+			return urlPath
 		}
 		secret, suffix, hasSuffix := strings.Cut(rest, "/")
 		// Only the first segment of the continuation is checked. The
@@ -102,7 +109,17 @@ func redactCredentialSegments(path string) string {
 		}
 		return prefix + "redacted"
 	}
-	return path
+	// A shape the router would not match, the prefix in another case or
+	// with an extra slash or dot segment in it (/api/v1//portal/...,
+	// /api/v1/Portal/...), still reaches the access log: the whole tail
+	// goes.
+	cleaned := strings.ToLower(path.Clean(urlPath))
+	for _, prefix := range credentialPathPrefixes {
+		if strings.HasPrefix(cleaned, prefix) && len(cleaned) > len(prefix) {
+			return prefix + "redacted"
+		}
+	}
+	return urlPath
 }
 
 // redactRequestPath renders one request's path and query for a log
@@ -137,10 +154,12 @@ func redactPath(path string) string {
 		return path[:i] + "?<redacted>"
 	}
 	redacted := false
-	for _, name := range credentialQueryParams {
-		if _, ok := query[name]; ok {
-			query.Set(name, "redacted")
-			redacted = true
+	for name := range query {
+		for _, credential := range credentialQueryParams {
+			if strings.ToLower(name) == credential {
+				query.Set(name, "redacted")
+				redacted = true
+			}
 		}
 	}
 	if !redacted {
@@ -245,14 +264,8 @@ func main() {
 		stripe.Key = cfg.StripeSecretKey
 	}
 
-	webhookHTTPTimeout, err := time.ParseDuration(cfg.WebhookHTTPTimeout)
-	if err != nil {
-		webhookHTTPTimeout = 10 * time.Second
-	}
-	webhookRetryInterval, err := time.ParseDuration(cfg.WebhookRetryInterval)
-	if err != nil {
-		webhookRetryInterval = 30 * time.Second
-	}
+	webhookHTTPTimeout := positiveDuration(cfg.WebhookHTTPTimeout, 10*time.Second)
+	webhookRetryInterval := positiveDuration(cfg.WebhookRetryInterval, 30*time.Second)
 
 	bf := middleware.NewBruteForceProtection(
 		cfg.BFMaxFails,
@@ -402,7 +415,7 @@ func main() {
 	})
 
 	licenseH := handler.NewLicenseHandler(licenseSvc)
-	authH := &handler.AuthHandler{Store: db, Config: cfg, Email: emailSvc}
+	authH := &handler.AuthHandler{Store: db, Config: cfg, Email: emailSvc, Webhook: webhookSvc}
 	stripeH := &payment.StripeHandler{
 		Store:         db,
 		WebhookSecret: cfg.StripeWebhookSecret,
@@ -410,10 +423,17 @@ func main() {
 		Email:         emailSvc,
 		WebhookSvc:    webhookSvc,
 		Livemode:      cfg.StripeLivemode,
+		// Previews of subscription changes are signed with a key every
+		// replica derives from the same secret.
+		ChangeKey: changePreviewKey(cfg.JWTSecret),
 	}
 	// Initialize thread-safe webhook secret with config value
 	stripeH.SetWebhookSecret(cfg.StripeWebhookSecret)
 	expiryChecker := service.NewExpiryChecker(db, emailSvc, webhookSvc, logger)
+	if cfg.StripeSecretKey != "" {
+		expiryChecker.EndPastDueUpgrade = stripeH.EndPastDueUpgrade
+		expiryChecker.EndGraceExpiredUpgrade = stripeH.EndGraceExpiredUpgrade
+	}
 	meteredSyncer := service.NewMeteredBillingSyncer(db, logger)
 	adminH := handler.NewAdminHandler(db, webhookSvc, emailSvc, expiryChecker, meteredSyncer)
 	// An update period may only be written once the links a public
@@ -425,12 +445,15 @@ func main() {
 	// are gone.
 	db.SetFeedURLTTL(feedTTL)
 	adminH.FeedURLTTL = feedTTL
+	adminH.Seats = seatSvc
 	// Whether a Stripe subscription is over is Stripe's answer to
 	// give; the admin API asks through this rather than reaching for
 	// the SDK itself. Left nil without an API key, where the question
 	// cannot be put at all.
 	if cfg.StripeSecretKey != "" {
 		adminH.SubscriptionEnded = stripeH.SubscriptionEnded
+		adminH.CancelSubscription = stripeH.CancelForAdmin
+		adminH.FollowSubscription = stripeH.FollowSubscription
 	}
 	// Recorded across replicas and across restarts: links signed
 	// before this start keep the lifetime they were signed with, so
@@ -547,22 +570,30 @@ func main() {
 					stripeH.SyncPendingCheckouts(ctx)
 					stripeH.RetireReplacedEndpoint(ctx)
 					stripeH.SyncCancelStates(ctx)
+					stripeH.SyncLapsedTermHolds(ctx)
 				}
 			}
 		}()
 	}
 
+	// Yesterday's analytics snapshot, taken at start and checked for every
+	// hour, so a server restarted more than once a day still takes one
+	// (see store.TakeMissingSnapshots).
 	go func() {
-		ticker := time.NewTicker(24 * time.Hour)
+		snapshot := func() {
+			if err := db.TakeMissingSnapshots(context.Background(), time.Now().Add(-24*time.Hour)); err != nil {
+				logger.Error("analytics snapshot failed", "error", err)
+			}
+		}
+		snapshot()
+		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := db.TakeAllSnapshots(context.Background(), time.Now().Add(-24*time.Hour)); err != nil {
-					logger.Error("analytics snapshot failed", "error", err)
-				}
+				snapshot()
 			}
 		}
 	}()
@@ -586,10 +617,20 @@ func main() {
 
 	r.Use(gin.LoggerWithFormatter(redactedLogFormatter), redactedRecovery())
 
-	// Trust reverse proxy headers (Traefik, Nginx, etc.) to get real client IP.
-	// Trusts X-Forwarded-For / X-Real-Ip from private network ranges.
-	r.SetTrustedProxies([]string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"})
-	r.RemoteIPHeaders = []string{"X-Forwarded-For", "X-Real-Ip"}
+	proxies, err := trustProxies(r, cfg.TrustedProxies)
+	if err != nil {
+		logger.Error("TRUSTED_PROXIES is not a list of addresses", "error", err)
+		os.Exit(1)
+	}
+	switch {
+	case len(proxies) == 0:
+		logger.Info("client address: no proxy trusted", "trusted_proxies", "none")
+	case trustsEveryone(proxies):
+		logger.Warn("TRUSTED_PROXIES trusts every address: any client can choose the address its rate limits and lockouts count under",
+			"trusted_proxies", strings.Join(proxies, ","))
+	default:
+		logger.Info("client address: X-Forwarded-For believed from", "trusted_proxies", strings.Join(proxies, ","))
+	}
 
 	r.Use(middleware.RequestID())
 	r.Use(middleware.PrometheusMetrics())
@@ -635,6 +676,13 @@ func main() {
 		c.Next()
 	})
 
+	// After the attribution, security and CORS headers, so a body refused
+	// as too large is answered with them like any other response (AGPL v3
+	// Section 7b: X-Powered-By on every API response), and a browser can
+	// read the refusal. None of those read the body; every handler comes
+	// after this.
+	r.Use(middleware.BodyLimit(middleware.MaxRequestBody))
+
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	r.GET("/health", func(c *gin.Context) {
@@ -643,8 +691,11 @@ func main() {
 
 		// DB check
 		if err := db.DB.PingContext(c.Request.Context()); err != nil {
+			// The cause goes to the log, not to a public endpoint: a
+			// driver error can carry host names and user names.
 			status = "degraded"
-			checks["database"] = "error: " + err.Error()
+			checks["database"] = "error"
+			logger.Error("health check: database unreachable", "error", err)
 		} else {
 			checks["database"] = "ok"
 		}
@@ -779,12 +830,12 @@ func main() {
 
 	// Release feed endpoints.
 	//
-	// Auth model: all channels (stable / beta / alpha / dev) are public.
-	// Trust comes from the artifact's ed25519 signature, verified by
-	// Sparkle/Velopack/Tauri on the client — not from URL secrecy.
-	// License enforcement happens at app start (POST /license/verify),
-	// not at update-feed time. To keep a pre-release channel private,
-	// don't publish to it; once published, treat the feed URL as public.
+	// Auth model: every channel (stable / beta / alpha / dev) is public,
+	// unless the product sets feed_license_required: its feeds then need
+	// a license key or token, and only serve releases inside the
+	// license's update period. Trust comes from the artifact's ed25519
+	// signature, verified by Sparkle/Velopack/Tauri on the client, not
+	// from URL secrecy.
 	//
 	// Feed clients poll on a timer — sometimes once a minute. We give
 	// the per-IP bucket 4× the regular API limit so a single host
@@ -855,6 +906,20 @@ func main() {
 	// Unified checkout: GET /pay/:checkout_id → Stripe
 	r.GET("/pay/:checkout_id", stripeH.CheckoutByPlan)
 
+	// Self sign-up for free plans (/pay sends those plans to the form).
+	// The code-sending step shares the login's buckets, so it cannot be
+	// used to mail more codes than the login form could.
+	v1.GET("/signup/:checkout_id",
+		middleware.RateLimitByIPScoped("public_plans", cfg.RateLimitAPI, time.Minute),
+		authH.SignupInfo)
+	signup := v1.Group("/signup", middleware.RateLimitByIPScoped("auth", cfg.RateLimitAuth, time.Minute))
+	{
+		signup.POST("/:checkout_id/send",
+			middleware.RateLimitByIPScoped("otp_send", cfg.RateLimitOTPSend, time.Hour),
+			authH.SignupSend)
+		signup.POST("/:checkout_id/verify", authH.SignupVerify)
+	}
+
 	portal := v1.Group("/portal", middleware.SessionAuth(cfg.JWTSecret, db.FindUserIsAdmin))
 	{
 		portal.GET("/me", authH.Me)
@@ -874,14 +939,56 @@ func main() {
 			// payloads by accident. Here it is the customer's own
 			// credential and the portal genuinely needs it — it is
 			// both displayed and used to address the activation and
-			// seat endpoints — so re-attach it explicitly.
+			// seat endpoints — so re-attach it explicitly: the
+			// owner's key for the owner, a member's own for them.
 			type portalLicense struct {
 				*model.License
 				LicenseKey string `json:"license_key"`
+				// Upgradable says the owner can upgrade it to a paid
+				// plan now (see StripeHandler.UpgradableLicenses).
+				Upgradable bool `json:"upgradable"`
+				// CancelScheduled says its subscription ends at the
+				// period end rather than renews; told to the owner.
+				CancelScheduled bool `json:"cancel_scheduled,omitempty"`
+				// Features are what the license grants, its addons
+				// included, as verify and the token read them.
+				Features []*model.Entitlement `json:"features"`
+			}
+			model.FillLimits(licenses...)
+			upgradable, err := stripeH.UpgradableLicenses(c, emailStr, licenses)
+			if err != nil {
+				response.Internal(c, err)
+				return
+			}
+			ids := make([]string, len(licenses))
+			for i, l := range licenses {
+				ids[i] = l.ID
+			}
+			ending, err := db.CancelScheduledLicenses(c, ids)
+			if err != nil {
+				response.Internal(c, err)
+				return
 			}
 			out := make([]portalLicense, 0, len(licenses))
 			for _, l := range licenses {
-				out = append(out, portalLicense{License: l, LicenseKey: db.DecryptLicenseKey(l)})
+				key, ok, err := handler.PortalLicenseView(c, db, l, emailStr)
+				if err != nil {
+					response.Internal(c, err)
+					return
+				}
+				if !ok {
+					continue
+				}
+				features, err := service.LicenseFeatures(c, db, l)
+				if err != nil {
+					response.Internal(c, err)
+					return
+				}
+				if features == nil {
+					features = []*model.Entitlement{}
+				}
+				out = append(out, portalLicense{License: l, LicenseKey: key, Upgradable: upgradable[l.ID],
+					CancelScheduled: ending[l.ID] && strings.EqualFold(l.Email, emailStr), Features: features})
 			}
 			// The portal hides the renewal button while the switch is
 			// off; the endpoint refuses the sale regardless.
@@ -909,11 +1016,8 @@ func main() {
 				return
 			}
 
-			// Sanitize: trim whitespace, strip HTML tags, limit length
-			name := strings.TrimSpace(req.Name)
-			// Strip HTML tags to prevent XSS
-			name = stripHTMLTags(name)
-			if len(name) > 100 {
+			name, ok := profileName(req.Name)
+			if !ok {
 				response.BadRequest(c, "name too long (max 100 characters)")
 				return
 			}
@@ -953,137 +1057,23 @@ func main() {
 						"id": p.ID, "name": p.Name, "slug": p.Slug,
 						"license_type": p.LicenseType, "billing_interval": p.BillingInterval,
 						"stripe_price_id": p.StripePriceID, "checkout_id": p.CheckoutID,
+						// The portal's upgrade offers no plan selling an
+						// update period; it needs this to leave them out.
+						"updates_days": p.UpdatesDays,
+						// A plan sold per seat lets the customer pick the
+						// seats when switching to it, and the portal shows
+						// what they include.
+						"per_seat": p.PerSeat, "min_quantity": p.MinQuantity, "max_quantity": p.MaxQuantity,
+						"max_activations": p.MaxActivations, "max_seats": p.MaxSeats, "license_model": p.LicenseModel,
 					})
 				}
 			}
 			response.OK(c, gin.H{"plans": response.Array(active)})
 		})
-		// Both portal guards parse the request body to extract
-		// license_key. Without an explicit cap a logged-in user could
-		// stream gigabytes through the body buffer; session auth is a
-		// weak defense against compromised credentials sending
-		// memory-exhaustion payloads. 64 KiB is comfortably above any
-		// real portal request (license_key + a handful of fields).
-		const portalGuardMaxBody = 64 * 1024
-
-		// readGuardBody is shared by both guards: cap the body, read
-		// it, restore an in-memory reader for the downstream handler
-		// (so c.ShouldBindJSON still sees the same bytes).
-		readGuardBody := func(c *gin.Context) ([]byte, bool) {
-			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, portalGuardMaxBody)
-			body, err := io.ReadAll(c.Request.Body)
-			if err != nil {
-				response.Err(c, http.StatusRequestEntityTooLarge, "BODY_TOO_LARGE",
-					"request body exceeds 64 KiB")
-				c.Abort()
-				return nil, false
-			}
-			c.Request.Body = io.NopCloser(bytes.NewBuffer(body))
-			return body, true
-		}
-
-		// Portal license operations — verify the license belongs to the logged-in user
-		portalLicenseGuard := func(c *gin.Context) {
-			body, ok := readGuardBody(c)
-			if !ok {
-				return
-			}
-			var req struct {
-				LicenseKey string `json:"license_key"`
-			}
-			if json.Unmarshal(body, &req) != nil || req.LicenseKey == "" {
-				c.Next()
-				return
-			}
-			email, _ := c.Get("email")
-			emailStr, _ := email.(string)
-			if emailStr == "" {
-				response.Unauthorized(c, "unauthorized")
-				c.Abort()
-				return
-			}
-			// Check license belongs to user (by email or seat). Use
-			// EqualFold so mixed-case email rows don't lock the owner
-			// out of their own license — emails are case-insensitive
-			// per RFC 5321 in practice, and admin-created licenses
-			// may have stored mixed case.
-			lic, err := db.FindLicenseByKey(c, req.LicenseKey)
-			if err != nil {
-				c.Next() // let handler return proper 404
-				return
-			}
-			if !strings.EqualFold(lic.Email, emailStr) {
-				// Check if user has a seat on this license. Return
-				// the same 404 the handler returns when the license
-				// doesn't exist — otherwise the differential between
-				// 403 (exists but yours) and 404 (doesn't exist) is
-				// a license-existence oracle. License keys are 32-
-				// byte random so the keyspace defeats enumeration in
-				// practice, but the oracle is gratuitous.
-				if _, err := db.FindSeatByEmail(c, lic.ID, emailStr); err != nil {
-					response.NotFound(c, "license not found")
-					c.Abort()
-					return
-				}
-			}
-			c.Next()
-		}
-		// Seat mutation guard — only license owner or accepted admin seat can add/remove seats
-		portalSeatMutationGuard := func(c *gin.Context) {
-			body, ok := readGuardBody(c)
-			if !ok {
-				return
-			}
-			var req struct {
-				LicenseKey string `json:"license_key"`
-			}
-			if json.Unmarshal(body, &req) != nil || req.LicenseKey == "" {
-				c.Next()
-				return
-			}
-			email, _ := c.Get("email")
-			emailStr, _ := email.(string)
-			// Defense in depth: a malformed JWT that produced an empty
-			// email claim must not fall through to seat lookups with
-			// "" — that would only match seats whose email column is
-			// literally empty (forbidden by schema, but belt-and-
-			// suspenders).
-			if emailStr == "" {
-				response.Unauthorized(c, "unauthorized")
-				c.Abort()
-				return
-			}
-			lic, err := db.FindLicenseByKey(c, req.LicenseKey)
-			if err != nil {
-				c.Next()
-				return
-			}
-			// License owner can always manage seats. EqualFold for the
-			// same case-folding reason as portalLicenseGuard.
-			if strings.EqualFold(lic.Email, emailStr) {
-				c.Next()
-				return
-			}
-			// Seat-based access: only ACCEPTED admin can mutate. Seat
-			// roles are 2-tier (admin / member) — the license owner is
-			// implicit via license.email and was already matched above.
-			// A still-pending admin invite confers no authority until
-			// the invitee has explicitly claimed the seat — otherwise
-			// possession of an unclaimed admin token would let an
-			// OTP-logged-in user act as admin on the license without
-			// going through the accept flow.
-			//
-			// Same shape as the 404 the handler returns when the
-			// license doesn't exist, so this middleware doesn't act
-			// as a "this license exists but isn't yours" oracle.
-			seat, err := db.FindSeatByEmail(c, lic.ID, emailStr)
-			if err != nil || seat.AcceptedAt == nil || seat.Role != "admin" {
-				response.NotFound(c, "license not found")
-				c.Abort()
-				return
-			}
-			c.Next()
-		}
+		// The portal guards: licence operations for the owner and its
+		// accepted members, team changes for the owner alone.
+		portalLicenseGuard := handler.PortalLicenseGuard(db)
+		portalSeatMutationGuard := handler.PortalSeatOwnerGuard(db)
 		portal.POST("/usage", portalLicenseGuard, usageH.RecordUsage)
 		portal.POST("/usage/status", portalLicenseGuard, usageH.GetQuotaStatus)
 		portal.POST("/seats", portalLicenseGuard, seatH.ListSeats)
@@ -1101,13 +1091,20 @@ func main() {
 		// (see stripe.go), so nesting under /portal makes the URL
 		// match the trust model rather than reading like a system
 		// endpoint sitting at the top level.
-		portal.POST("/subscription/change-plan", stripeH.ChangePlan)
+		// Seats and plan changes, previewed first. Each call reads
+		// Stripe, so they have a bucket of their own.
+		subChangeLimit := middleware.RateLimitByIPScoped("subscription_change", 30, time.Minute)
+		portal.POST("/subscription/change-plan", subChangeLimit, stripeH.ChangePlan)
+		portal.POST("/subscription/preview", subChangeLimit, stripeH.PreviewSubscriptionChange)
+		portal.POST("/subscription/change", subChangeLimit, stripeH.ChangeSubscription)
+		portal.POST("/subscription/pending", subChangeLimit, stripeH.PendingSubscriptionChange)
 		portal.POST("/subscription/cancel", stripeH.CancelSubscription)
 		portal.POST("/subscription/billing-portal", stripeH.CreatePortalSession)
 		portal.GET("/subscription/invoices", stripeH.ListInvoices)
 		// Maintenance renewal for perpetual licenses: a one-time
 		// checkout that extends updates_until.
 		portal.POST("/updates/renew", stripeH.RenewUpdates)
+		portal.POST("/licenses/upgrade", stripeH.StartUpgrade)
 	}
 
 	// Admin route layout: three groups under /admin, all sharing the
@@ -1157,6 +1154,7 @@ func main() {
 		admin.GET("/plans/:id", adminH.GetPlan)
 		admin.POST("/plans", adminH.CreatePlan)
 		admin.PUT("/plans/:id", adminH.UpdatePlan)
+		admin.GET("/plans/:id/seat-impact", adminH.PlanSeatImpact)
 		admin.DELETE("/plans/:id", adminH.DeletePlan)
 
 		admin.POST("/entitlements", adminH.CreateEntitlement)
@@ -1168,6 +1166,7 @@ func main() {
 		licWrite.GET("/licenses/export", adminH.ExportLicenses)
 		licWrite.GET("/licenses/:id", adminH.GetLicense)
 		licWrite.GET("/licenses/:id/key", adminH.RevealLicenseKey)
+		licWrite.POST("/licenses/:id/rotate-key", adminH.RotateLicenseKey)
 		// Mails the key to the address on the licence, for a send
 		// that never arrived. Recipient is not caller-supplied.
 		licWrite.POST("/licenses/:id/resend-email", adminH.ResendLicenseEmail)
@@ -1177,6 +1176,7 @@ func main() {
 		licWrite.POST("/licenses/:id/suspend", adminH.SuspendLicense)
 		licWrite.POST("/licenses/:id/reinstate", adminH.ReinstateLicense)
 		licWrite.POST("/licenses/:id/valid-until", adminH.SetLicenseValidUntil)
+		licWrite.POST("/licenses/:id/quantity", adminH.SetLicenseQuantity)
 		licWrite.POST("/licenses/:id/updates-until", adminH.SetLicenseUpdatesUntil)
 		licWrite.POST("/licenses/:id/change-plan", adminH.ChangeLicensePlan)
 		// Cuts a licence loose from a subscription Stripe has
@@ -1185,6 +1185,9 @@ func main() {
 		licWrite.GET("/licenses/:id/usage", adminH.ListLicenseUsage)
 		licWrite.POST("/licenses/:id/usage/reset", adminH.ResetLicenseUsage)
 		licWrite.GET("/licenses/:id/seats", adminH.ListLicenseSeats)
+		licWrite.GET("/licenses/:id/seats/:seat_id/key", adminH.RevealMemberKey)
+		licWrite.POST("/licenses/:id/seats/:seat_id/rotate-key", adminH.RotateMemberKey)
+		licWrite.DELETE("/licenses/:id/seats/:seat_id", adminH.RemoveLicenseSeat)
 
 		licWrite.GET("/licenses/:id/addons", adminH.ListLicenseAddons)
 		licWrite.POST("/licenses/:id/addons", adminH.AddLicenseAddon)
@@ -1292,9 +1295,16 @@ func main() {
 		response.NotFound(c, "no such endpoint")
 	})
 
+	// A client that sends its headers or body a byte at a time holds a
+	// connection, and its goroutine, until it is done; these bound how
+	// long that can be. No write timeout: an export or a slow download
+	// may take longer to send than any fixed limit.
 	srv := &http.Server{
-		Addr:    ":" + cfg.Port,
-		Handler: r,
+		Addr:              ":" + cfg.Port,
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {
@@ -1322,24 +1332,43 @@ func main() {
 	logger.Info("server exited gracefully")
 }
 
-// stripHTMLTags removes all HTML tags from a string to prevent XSS.
-func stripHTMLTags(s string) string {
-	var result strings.Builder
-	inTag := false
-	for _, r := range s {
-		if r == '<' {
-			inTag = true
-			continue
-		}
-		if r == '>' {
-			inTag = false
-			continue
-		}
-		if !inTag {
-			result.WriteRune(r)
-		}
+var htmlTagPattern = regexp.MustCompile(`(?i)<[/!]?[a-z][^<>]*>|<!--[\s\S]*?-->`)
+
+// positiveDuration parses a duration setting, falling back to def when
+// it does not parse or is not above zero. Zero is not "no limit" for the
+// webhook settings: a zero HTTP timeout leaves a send unbounded past the
+// lease that holds its delivery, so another replica sends it again, and
+// a zero retry interval makes the retry ticker panic.
+func positiveDuration(s string, def time.Duration) time.Duration {
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return def
 	}
-	return result.String()
+	return d
+}
+
+// profileName is the name a profile update stores: trimmed, at most 100
+// characters, with HTML tags stripped. ok is false when it is longer.
+//
+// The length is checked before the tags are stripped. Stripping takes a
+// pass per level of nested tags, so on an unbounded input its time grows
+// with the square of the length: a 60 KB name of nested tags took 30 s.
+func profileName(raw string) (name string, ok bool) {
+	name = strings.TrimSpace(raw)
+	if utf8.RuneCountInString(name) > 100 {
+		return "", false
+	}
+	return stripHTMLTags(name), true
+}
+
+// stripHTMLTags removes all HTML tags from a string to prevent XSS. It
+// takes a pass per level of nested tags; callers bound its input (see
+// profileName).
+func stripHTMLTags(s string) string {
+	for htmlTagPattern.MatchString(s) {
+		s = htmlTagPattern.ReplaceAllString(s, "")
+	}
+	return s
 }
 
 // frontendAssetExts are the extensions a browser asks for as files,
@@ -1354,7 +1383,8 @@ var frontendAssetExts = map[string]bool{
 // route of the app's own ("/licenses/1.0", say) has an extension too,
 // so the list is explicit rather than "anything with a dot".
 func isFrontendAsset(clean string) bool {
-	return strings.HasPrefix(clean, "/assets/") || frontendAssetExts[strings.ToLower(filepath.Ext(clean))]
+	// clean is a URL path (forward slashes); use path.Ext, not filepath.Ext.
+	return strings.HasPrefix(clean, "/assets/") || frontendAssetExts[strings.ToLower(path.Ext(clean))]
 }
 
 // newLogger builds the application logger and makes it the one that
@@ -1396,28 +1426,39 @@ func serveFrontend(r *gin.Engine) {
 	}
 
 	r.Use(func(c *gin.Context) {
-		path := c.Request.URL.Path
+		reqPath := c.Request.URL.Path
 
 		// Let backend routes pass through.
-		if strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "/pay/") || path == "/health" || path == "/metrics" || path == "/docs" || strings.HasPrefix(path, "/docs/") {
+		if strings.HasPrefix(reqPath, "/api/") || strings.HasPrefix(reqPath, "/pay/") || reqPath == "/health" || reqPath == "/metrics" || reqPath == "/docs" || strings.HasPrefix(reqPath, "/docs/") {
 			c.Next()
 			return
 		}
 
-		// Try to serve a static file using path.Clean to prevent traversal.
+		// Clean with path (URL) rules, not filepath. HTTP paths always use
+		// '/', and filepath.Clean on Windows turns "/assets/…" into
+		// `\assets\…`, which breaks the "/assets/" prefix check used for
+		// immutable Cache-Control on hashed builds.
 		// Uses c.File() instead of c.FileFromFS() to avoid http.FileServer's
 		// implicit 301 redirects (e.g. /index.html → /).
-		if clean := filepath.Clean(path); clean != "/" && clean != "/index.html" {
-			filePath := filepath.Join(distPath, clean)
-			if info, err := os.Stat(filePath); err == nil && !info.IsDir() {
-				if strings.HasPrefix(clean, "/assets/") {
-					// Every name under /assets carries a content hash,
-					// so one URL never changes what it holds.
-					c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		if clean := path.Clean(reqPath); clean != "/" && clean != "/index.html" {
+			// path.Clean leaves a backslash alone (%5C in the URL), and on
+			// Windows Join would take it as a separator and look outside
+			// dist: ServeFile refuses the file, but the answer still says
+			// it exists. Localize refuses a backslash, a drive letter and
+			// a device name (NUL, COM1) rather than turn them into a path,
+			// as http.Dir does.
+			if rel, err := filepath.Localize(strings.TrimPrefix(clean, "/")); err == nil {
+				filePath := filepath.Join(distPath, rel)
+				if info, err := os.Stat(filePath); err == nil && !info.IsDir() {
+					if strings.HasPrefix(clean, "/assets/") {
+						// Every name under /assets carries a content hash,
+						// so one URL never changes what it holds.
+						c.Header("Cache-Control", "public, max-age=31536000, immutable")
+					}
+					c.File(filePath)
+					c.Abort()
+					return
 				}
-				c.File(filePath)
-				c.Abort()
-				return
 			}
 			// A file that is missing is a 404, not the app shell. A tab
 			// still holding an older index.html asks for the asset that
@@ -1449,4 +1490,11 @@ func serveFrontend(r *gin.Engine) {
 		c.Data(http.StatusOK, "text/html; charset=utf-8", html)
 		c.Abort()
 	})
+}
+
+// changePreviewKey is the key subscription change previews are signed
+// with, kept apart from the session tokens the same secret signs.
+func changePreviewKey(secret string) []byte {
+	sum := sha256.Sum256([]byte("keygate subscription change preview\x00" + secret))
+	return sum[:]
 }

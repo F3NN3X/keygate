@@ -20,7 +20,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { type TranslationKeys, useI18n } from "@/i18n"
 import type { UserDetail } from "@/lib/api"
 import { admin } from "@/lib/api"
-import { formatDate, statusColor } from "@/lib/utils"
+import { formatDate, maskKey, statusColor } from "@/lib/utils"
 
 export default function CustomersPage() {
   const { t } = useI18n()
@@ -229,7 +229,7 @@ function CustomerDetailDialog({
 
               {/* Licenses Tab */}
               <TabsContent value="licenses" className="min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable]">
-                {(detail.licenses || []).length === 0 ? (
+                {(detail.licenses || []).length === 0 && (detail.memberships || []).length === 0 ? (
                   <Card>
                     <CardContent className="py-8">
                       <p className="text-sm text-muted-foreground text-center">No licenses found.</p>
@@ -241,6 +241,7 @@ function CustomerDetailDialog({
                       <DataTableRow>
                         <DataTableHead>{t("common.product")}</DataTableHead>
                         <DataTableHead>{t("common.plan")}</DataTableHead>
+                        <DataTableHead>{t("licenses.role")}</DataTableHead>
                         <DataTableHead>{t("common.status")}</DataTableHead>
                         <DataTableHead>{t("licenses.licenseKey")}</DataTableHead>
                         <DataTableHead>{t("licenses.validUntil")}</DataTableHead>
@@ -253,6 +254,9 @@ function CustomerDetailDialog({
                           <DataTableCell className="font-medium">{l.product?.name || l.product_id}</DataTableCell>
                           <DataTableCell>{l.plan?.name || l.plan_id}</DataTableCell>
                           <DataTableCell>
+                            <Badge variant="secondary">{t("portal.roleOwner")}</Badge>
+                          </DataTableCell>
+                          <DataTableCell>
                             <Badge className={statusColor(l.status)}>
                               {t(`status.${l.status}` as TranslationKeys)}
                             </Badge>
@@ -261,8 +265,8 @@ function CustomerDetailDialog({
                             {/* Only the tail — the key itself is revealed
                               one at a time from the licenses page, and
                               each reveal is audited. */}
-                            <code className="text-xs bg-muted px-1.5 py-0.5 rounded font-mono">
-                              {data?.license_key_hints?.[l.id] ? `KG-••••-${data.license_key_hints[l.id]}` : "••••"}
+                            <code className="text-xs bg-muted px-1.5 py-0.5 rounded font-mono whitespace-nowrap">
+                              {maskKey(data?.license_key_hints?.[l.id], data?.license_key_prefixes?.[l.id])}
                             </code>
                           </DataTableCell>
                           <DataTableCell className="text-xs text-muted-foreground">
@@ -270,6 +274,41 @@ function CustomerDetailDialog({
                           </DataTableCell>
                           <DataTableCell className="text-xs text-muted-foreground">
                             {formatDate(l.created_at)}
+                          </DataTableCell>
+                        </DataTableRow>
+                      ))}
+                      {/* Licences the customer is a member of: someone
+                        else's, used with the customer's own key, shown
+                        by its hint. */}
+                      {(detail.memberships || []).map((m) => (
+                        <DataTableRow key={m.id}>
+                          <DataTableCell className="font-medium">
+                            {m.license?.product?.name || m.license?.product_id}
+                            <div className="text-xs font-normal text-muted-foreground break-all">
+                              {t("customers.ownedBy").replace("{email}", m.license?.email ?? "")}
+                            </div>
+                          </DataTableCell>
+                          <DataTableCell>{m.license?.plan?.name || m.license?.plan_id}</DataTableCell>
+                          <DataTableCell>
+                            <Badge variant="secondary">{t("portal.roleMember")}</Badge>
+                          </DataTableCell>
+                          <DataTableCell>
+                            {m.license && (
+                              <Badge className={statusColor(m.license.status)}>
+                                {t(`status.${m.license.status}` as TranslationKeys)}
+                              </Badge>
+                            )}
+                          </DataTableCell>
+                          <DataTableCell>
+                            <code className="text-xs bg-muted px-1.5 py-0.5 rounded font-mono whitespace-nowrap">
+                              {maskKey(data?.member_key_hints?.[m.id], data?.member_key_prefixes?.[m.id])}
+                            </code>
+                          </DataTableCell>
+                          <DataTableCell className="text-xs text-muted-foreground">
+                            {m.license?.valid_until ? formatDate(m.license.valid_until) : "-"}
+                          </DataTableCell>
+                          <DataTableCell className="text-xs text-muted-foreground">
+                            {m.license ? formatDate(m.license.created_at) : "-"}
                           </DataTableCell>
                         </DataTableRow>
                       ))}

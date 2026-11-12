@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Copy, Package, Pencil, Plus, Trash2 } from "lucide-react"
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { Link } from "react-router-dom"
 import { CopyableId } from "@/components/copyable-id"
 import { ProductSelect } from "@/components/product-select"
@@ -42,7 +42,11 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { useI18n } from "@/i18n"
-import { admin, type Entitlement, type Plan } from "@/lib/api"
+import { admin, type Entitlement, errorCode, errorDetails, type Plan } from "@/lib/api"
+
+// model.MaxPlanQuantity: the most seats a plan sold per seat can sell.
+const MAX_PLAN_QUANTITY = 10000
+
 import { boolColor, formatDate } from "@/lib/utils"
 
 export default function PlansPage() {
@@ -65,6 +69,24 @@ export default function PlansPage() {
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Plan | null>(null)
   const [deleting, setDeleting] = useState<Plan | null>(null)
+  // An edit that lowers max_seats below what some licenses already hold,
+  // waiting for the admin to confirm it.
+  // The content stays set after closing, so the dialog's closing
+  // animation does not show it emptied; only the open flag clears.
+  const [seatWarning, setSeatWarning] = useState<{ update: Partial<Plan> & { id: string }; over: number } | null>(null)
+  const [seatWarningOpen, setSeatWarningOpen] = useState(false)
+  // While the impact is being fetched the save button stays busy. Each
+  // check takes a number, and opening or closing the editor moves it on:
+  // an answer for an older number (an editor since closed, even one
+  // reopened on the same plan) is dropped, success or error, and does
+  // not clear the busy state of a newer check.
+  const [checkingSeats, setCheckingSeats] = useState(false)
+  const checkSeq = useRef(0)
+  const openEditor = (plan: Plan | null) => {
+    checkSeq.current++
+    setCheckingSeats(false)
+    setEditing(plan)
+  }
 
   const products = productsData?.products || []
   const { items: plans, total, totalPages } = pg.from(data, data?.plans)
@@ -76,16 +98,57 @@ export default function PlansPage() {
       setCreating(false)
       showToast(t("toast.planCreated"), "success")
     },
+    meta: { ownErrors: true },
     onError: (e: Error) => showToast(e.message, "error"),
   })
+  // A plan trial plans fall back to keeps qualifying: say which ones.
+  const planError = (e: Error) => {
+    if (errorCode(e) !== "TRIAL_FALLBACK_IN_USE") return e.message
+    const names = errorDetails(e)?.plans
+    return t("plans.trialFallbackTargetInUse", {
+      plans: Array.isArray(names) ? names.join(t("common.listSeparator")) : "",
+    })
+  }
   const updateMut = useMutation({
     mutationFn: ({ id, ...data }: Partial<Plan> & { id: string }) => admin.updatePlan(id, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["admin", "plans"] })
-      setEditing(null)
+      openEditor(null)
     },
-    onError: (e: Error) => showToast(e.message, "error"),
+    meta: { ownErrors: true },
+    onError: (e: Error) =>
+      showToast(errorCode(e) === "PER_SEAT_LOCKED" ? t("plans.perSeatLockedError") : planError(e), "error"),
   })
+  // A plan's limits apply to every license on it at once. Lowering
+  // max_seats pauses the members who joined last on the licenses
+  // already above it, so the admin sees how many first.
+  const saveEdit = async (plan: Plan, update: Partial<Plan> & { id: string }) => {
+    const next = update.max_seats ?? plan.max_seats
+    const prev = plan.max_seats
+    // A plan sold per seat holds the seats each license bought, not
+    // max_seats, so there is nothing to check.
+    const perSeat = update.per_seat ?? plan.per_seat
+    if (!perSeat && next > 0 && (prev === 0 || next < prev)) {
+      if (checkingSeats) return
+      const seq = ++checkSeq.current
+      setCheckingSeats(true)
+      try {
+        const { licenses_over } = await admin.planSeatImpact(plan.id, next)
+        if (checkSeq.current !== seq) return
+        if (licenses_over > 0) {
+          setSeatWarning({ update, over: licenses_over })
+          setSeatWarningOpen(true)
+          return
+        }
+      } catch (e) {
+        if (checkSeq.current === seq) showToast((e as Error).message, "error")
+        return
+      } finally {
+        if (checkSeq.current === seq) setCheckingSeats(false)
+      }
+    }
+    updateMut.mutate(update)
+  }
   const deleteMut = useMutation({
     mutationFn: (id: string) => admin.deletePlan(id),
     onSuccess: () => {
@@ -93,7 +156,8 @@ export default function PlansPage() {
       setDeleting(null)
       showToast(t("toast.planDeleted"), "success")
     },
-    onError: (e: Error) => showToast(e.message, "error"),
+    meta: { ownErrors: true },
+    onError: (e: Error) => showToast(planError(e), "error"),
   })
 
   if (!isLoading && products.length === 0) {
@@ -184,7 +248,11 @@ export default function PlansPage() {
                         </DataTableCell>
                         <DataTableCell>
                           {supportsActivations ? (
-                            p.max_activations
+                            p.per_seat ? (
+                              t("plans.perSeatValue", { count: p.max_activations })
+                            ) : (
+                              p.max_activations
+                            )
                           ) : (
                             <span className="text-muted-foreground" title={t("plans.notApplicableForType")}>
                               —
@@ -192,7 +260,9 @@ export default function PlansPage() {
                           )}
                         </DataTableCell>
                         <DataTableCell>
-                          {supportsSeats ? (
+                          {p.per_seat && supportsSeats ? (
+                            t("plans.perSeatRange", { min: p.min_quantity ?? 1, max: p.max_quantity ?? 100 })
+                          ) : supportsSeats ? (
                             p.max_seats || 0
                           ) : (
                             <span className="text-muted-foreground" title={t("plans.notApplicableForType")}>
@@ -201,9 +271,12 @@ export default function PlansPage() {
                           )}
                         </DataTableCell>
                         <DataTableCell>
-                          <Badge className={boolColor(p.active)}>
-                            {p.active ? t("common.active") : t("common.inactive")}
-                          </Badge>
+                          <div className="flex flex-wrap gap-1">
+                            <Badge className={boolColor(p.active)}>
+                              {p.active ? t("common.active") : t("common.inactive")}
+                            </Badge>
+                            {p.self_signup && <Badge variant="outline">{t("plans.selfSignup")}</Badge>}
+                          </div>
                         </DataTableCell>
                         <DataTableCell className="text-muted-foreground text-xs">
                           {formatDate(p.created_at)}
@@ -218,13 +291,13 @@ export default function PlansPage() {
                                 onClick={() => {
                                   const url = `${window.location.origin}/pay/${p.checkout_id}`
                                   navigator.clipboard.writeText(url)
-                                  showToast(t("plans.linkCopied"))
+                                  showToast(t("plans.linkCopied"), "success")
                                 }}
                               >
                                 <Copy className="h-4 w-4" />
                               </Button>
                             )}
-                            <Button variant="ghost" size="icon" onClick={() => setEditing(p)}>
+                            <Button variant="ghost" size="icon" onClick={() => openEditor(p)}>
                               <Pencil className="h-4 w-4" />
                             </Button>
                             <Button variant="ghost" size="icon" onClick={() => setDeleting(p)}>
@@ -270,14 +343,39 @@ export default function PlansPage() {
       {editing && (
         <PlanDialog
           open
-          onClose={() => setEditing(null)}
+          onClose={() => openEditor(null)}
           plan={editing}
           products={products}
-          onSubmit={(d) => updateMut.mutate({ id: editing.id, ...d })}
-          loading={updateMut.isPending}
+          onSubmit={(d) => saveEdit(editing, { id: editing.id, ...d })}
+          loading={updateMut.isPending || checkingSeats}
           title={t("plans.editTitle")}
         />
       )}
+
+      {/* Lowering max seats below what some licenses hold */}
+      <AlertDialog open={seatWarningOpen} onOpenChange={setSeatWarningOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("plans.seatsLowerTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("plans.seatsLowerConfirm")
+                .replace("{count}", String(seatWarning?.over ?? 0))
+                .replace("{max}", String(seatWarning?.update.max_seats ?? 0))}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="flex justify-end gap-2">
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (seatWarning) updateMut.mutate(seatWarning.update)
+                setSeatWarningOpen(false)
+              }}
+            >
+              {t("common.save")}
+            </AlertDialogAction>
+          </div>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Delete */}
       <AlertDialog open={!!deleting} onOpenChange={() => setDeleting(null)}>
@@ -342,6 +440,13 @@ function PlanDialog({
     updates_days: plan?.updates_days ?? 0,
     renewal_days: plan?.renewal_days ?? 0,
     stripe_renewal_price_id: plan?.stripe_renewal_price_id || "",
+    self_signup: plan?.self_signup ?? false,
+    signup_daily_cap: plan?.signup_daily_cap ?? 0,
+    signup_consent_text: plan?.signup_consent_text || "",
+    trial_fallback_plan_id: plan?.trial_fallback_plan_id || "",
+    per_seat: plan?.per_seat ?? false,
+    min_quantity: plan?.min_quantity ?? 1,
+    max_quantity: plan?.max_quantity ?? 100,
   })
 
   const set = (key: string, val: string | number | boolean) => setForm((f) => ({ ...f, [key]: val }))
@@ -350,9 +455,19 @@ function PlanDialog({
   // billing interval. The server clears it too; mirror that here so
   // the form doesn't show a period the plan will never bill on.
   const isPerpetual = form.license_type === "perpetual"
+  // Self sign-up hands licences out for free, so the server refuses it
+  // on a plan with a price, an update period or renewals. The option is
+  // only offered where it can be saved.
+  const charges =
+    !!form.stripe_price_id.trim() ||
+    (isPerpetual && (form.updates_days > 0 || form.renewal_days > 0 || !!form.stripe_renewal_price_id.trim()))
   const setLicenseType = (v: string) => {
     setForm((f) => ({ ...f, license_type: v, billing_interval: v === "perpetual" ? "" : f.billing_interval }))
   }
+  // Only subscriptions are sold per seat; the option goes away, and off,
+  // for any other type.
+  const canPerSeat = form.license_type === "subscription"
+  const perSeat = canPerSeat && form.per_seat
 
   // Capability map keyed by the currently-selected product's type.
   // Mirrors backend model.ProductSupports — DO NOT diverge or admins
@@ -368,6 +483,34 @@ function PlanDialog({
     queryFn: () => admin.getProduct(form.product_id),
     enabled: !!form.product_id && !plan?.product,
   })
+  // Plans a trial can fall back to when it ends: free, non-trial plans
+  // of the same product (mirrors model.Plan.TrialFallbackRefusal). The
+  // one already saved stays listed even if it no longer qualifies, so
+  // the form shows what the plan holds rather than silently dropping it,
+  // marked so the admin knows trials will expire instead (the sweep
+  // re-checks the plan and does not move them).
+  const isTrial = form.license_type === "trial"
+  const {
+    data: siblingPlans,
+    isLoading: siblingPlansLoading,
+    isError: siblingPlansFailed,
+  } = useQuery({
+    queryKey: ["admin", "plans", "trial-fallback", form.product_id],
+    queryFn: () => admin.listPlans({ product_id: form.product_id, limit: 100 }),
+    enabled: isTrial && !!form.product_id,
+  })
+  const qualifiesAsFallback = (p: Plan) =>
+    p.id !== plan?.id &&
+    p.license_type !== "trial" &&
+    !p.per_seat &&
+    !p.stripe_price_id &&
+    !p.updates_days &&
+    !p.renewal_days &&
+    !p.stripe_renewal_price_id
+  const fallbackOptions = (siblingPlans?.plans ?? []).filter(
+    (p) => p.id === form.trial_fallback_plan_id || qualifiesAsFallback(p),
+  )
+  const selectedFallback = fallbackOptions.find((p) => p.id === form.trial_fallback_plan_id)
   const selectedProduct = plan?.product || pickedProduct
   const productType = selectedProduct?.type || "hybrid"
   const supports = {
@@ -380,6 +523,15 @@ function PlanDialog({
   // max_activations=3 for a saas product just because the form
   // pre-filled it before the product was selected).
   const handleSubmit = () => {
+    // The range a plan sold per seat is bought in, checked here so the
+    // error is in the admin's language (the server checks it too).
+    if (
+      perSeat &&
+      !(form.min_quantity >= 1 && form.min_quantity <= form.max_quantity && form.max_quantity <= MAX_PLAN_QUANTITY)
+    ) {
+      showToast(t("plans.quantityRangeInvalid", { max: MAX_PLAN_QUANTITY }), "error")
+      return
+    }
     const payload: Partial<Plan> & Record<string, unknown> = { ...form }
     if (!supports.activations) {
       payload.max_activations = 0
@@ -389,6 +541,31 @@ function PlanDialog({
     }
     if (!supports.seats) {
       payload.max_seats = 0
+    }
+    // A plan sold per seat holds the seats bought; the server keeps
+    // max_seats for it. On any other plan the bounds are not used.
+    payload.per_seat = perSeat
+    if (perSeat) {
+      delete payload.max_seats
+    } else {
+      delete payload.min_quantity
+      delete payload.max_quantity
+    }
+    // A price, an update period or renewals set here switch self
+    // sign-up off rather than have the save refused.
+    if (charges) {
+      payload.self_signup = false
+    }
+    // With sign-up off its settings are hidden, so they go back as the
+    // plan had them: a value typed and then hidden must not fail the
+    // save where the operator can no longer see it.
+    if (!payload.self_signup) {
+      payload.signup_daily_cap = plan?.signup_daily_cap ?? 0
+      payload.signup_consent_text = plan?.signup_consent_text ?? ""
+    }
+    // Only a trial plan has trials to end; the server clears it too.
+    if (!isTrial) {
+      payload.trial_fallback_plan_id = ""
     }
     onSubmit(payload)
   }
@@ -418,7 +595,9 @@ function PlanDialog({
                   endpoint takes no product_id. */}
                 <ProductSelect
                   value={form.product_id}
-                  onChange={(v) => set("product_id", v)}
+                  // A fallback belongs to one product: picking another
+                  // product drops it rather than submit a hidden plan.
+                  onChange={(v) => setForm((f) => ({ ...f, product_id: v, trial_fallback_plan_id: "" }))}
                   current={plan?.product}
                   className="w-full"
                   disabled={!!plan}
@@ -476,9 +655,63 @@ function PlanDialog({
                   </SelectContent>
                 </Select>
               </div>
+              {canPerSeat && (
+                <div className="space-y-2 sm:col-span-2">
+                  <div className="flex items-center gap-3">
+                    <input
+                      type="checkbox"
+                      checked={form.per_seat}
+                      // Set when the plan is created (the server refuses a switch).
+                      disabled={!!plan}
+                      onChange={(e) => set("per_seat", e.target.checked)}
+                      className="h-4 w-4 rounded border-input accent-primary"
+                      id="plan-per-seat"
+                    />
+                    <Label htmlFor="plan-per-seat">{t("plans.perSeat")}</Label>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {productType === "desktop"
+                      ? t("plans.perSeatHintDesktop")
+                      : productType === "saas"
+                        ? t("plans.perSeatHintSaas")
+                        : t("plans.perSeatHintHybrid")}
+                  </p>
+                  {plan && <p className="text-xs text-muted-foreground">{t("plans.perSeatLocked")}</p>}
+                </div>
+              )}
+              {perSeat && (
+                <>
+                  <div className="space-y-2">
+                    <Label>{t("plans.minQuantity")}</Label>
+                    <Input
+                      type="number"
+                      min={1}
+                      max={10000}
+                      value={form.min_quantity}
+                      onChange={(e) => set("min_quantity", Number(e.target.value))}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>{t("plans.maxQuantity")}</Label>
+                    <Input
+                      type="number"
+                      min={1}
+                      max={10000}
+                      value={form.max_quantity}
+                      onChange={(e) => set("max_quantity", Number(e.target.value))}
+                    />
+                  </div>
+                </>
+              )}
               {supports.activations && (
                 <div className="space-y-2">
-                  <Label>{t("plans.maxActivations")}</Label>
+                  <Label>
+                    {perSeat
+                      ? form.license_model === "floating"
+                        ? t("plans.sessionsPerSeat")
+                        : t("plans.devicesPerSeat")
+                      : t("plans.maxActivations")}
+                  </Label>
                   <Input
                     type="number"
                     min={1}
@@ -488,13 +721,13 @@ function PlanDialog({
                   />
                 </div>
               )}
-              {supports.seats && (
+              {supports.seats && !perSeat && (
                 <div className="space-y-2">
                   <Label>{t("plans.maxSeats")}</Label>
                   <Input
                     type="number"
                     min={0}
-                    max={100000}
+                    max={100001}
                     value={form.max_seats}
                     onChange={(e) => set("max_seats", Number(e.target.value))}
                   />
@@ -560,6 +793,57 @@ function PlanDialog({
                   onChange={(e) => set("grace_days", Number(e.target.value))}
                 />
               </div>
+              {isTrial && (
+                <div className="space-y-2 sm:col-span-2">
+                  <Label>{t("plans.trialFallback")}</Label>
+                  <Select
+                    value={form.trial_fallback_plan_id || "none"}
+                    onValueChange={(v) => set("trial_fallback_plan_id", v === "none" ? "" : v)}
+                    // Editing, the saved choice stays as it is until its
+                    // options are known, rather than cleared unseen.
+                    disabled={!!plan && (siblingPlansLoading || siblingPlansFailed)}
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="none">{t("plans.trialFallbackNone")}</SelectItem>
+                      {fallbackOptions.map((p) => (
+                        <SelectItem key={p.id} value={p.id}>
+                          {p.name}
+                          {!p.active && ` (${t("common.inactive")})`}
+                          {!qualifiesAsFallback(p) && ` (${t("plans.trialFallbackNoLongerQualifies")})`}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  {siblingPlansLoading ? (
+                    <p className="text-xs text-muted-foreground">{t("common.loading")}</p>
+                  ) : siblingPlansFailed ? (
+                    <p className="text-xs text-destructive">
+                      {t(plan ? "plans.trialFallbackLoadFailed" : "plans.trialFallbackLoadFailedNew")}
+                    </p>
+                  ) : selectedFallback && !qualifiesAsFallback(selectedFallback) ? (
+                    <p className="text-xs text-amber-700 dark:text-amber-400">{t("plans.trialFallbackInvalid")}</p>
+                  ) : siblingPlans && fallbackOptions.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">
+                      {t(plan ? "plans.trialFallbackNoneAvailableEdit" : "plans.trialFallbackNoneAvailable")}
+                    </p>
+                  ) : (
+                    // What applies after the move, for what the product has.
+                    <p className="text-xs text-muted-foreground">
+                      {t("plans.trialFallbackHint", {
+                        devices: !supports.activations
+                          ? ""
+                          : t(
+                              supports.seats ? "plans.trialFallbackHintDevicesSeats" : "plans.trialFallbackHintDevices",
+                            ),
+                        seats: supports.seats ? t("plans.trialFallbackHintSeats") : "",
+                      })}
+                    </p>
+                  )}
+                </div>
+              )}
               <div className="space-y-2 flex items-center gap-3 pt-5">
                 <input
                   type="checkbox"
@@ -578,6 +862,50 @@ function PlanDialog({
                   placeholder="price_..."
                 />
               </div>
+              {/* Self sign-up: free plans only. The /pay link becomes a
+                form where visitors confirm their email to get a key. */}
+              {charges && plan?.self_signup && (
+                <p className="text-xs text-amber-600">{t("plans.selfSignupTurnsOff")}</p>
+              )}
+              {!charges && (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-3">
+                    <input
+                      type="checkbox"
+                      checked={form.self_signup}
+                      onChange={(e) => set("self_signup", e.target.checked)}
+                      className="h-4 w-4 rounded border-input accent-primary"
+                      id="plan-self-signup"
+                    />
+                    <Label htmlFor="plan-self-signup">{t("plans.selfSignup")}</Label>
+                  </div>
+                  <p className="text-xs text-muted-foreground">{t("plans.selfSignupHint")}</p>
+                </div>
+              )}
+              {!charges && form.self_signup && (
+                <>
+                  <div className="space-y-2">
+                    <Label>{t("plans.signupDailyCap")}</Label>
+                    <Input
+                      type="number"
+                      min={0}
+                      max={100000}
+                      value={form.signup_daily_cap}
+                      onChange={(e) => set("signup_daily_cap", Number(e.target.value))}
+                    />
+                    <p className="text-xs text-muted-foreground">{t("plans.signupDailyCapHint")}</p>
+                  </div>
+                  <div className="space-y-2">
+                    <Label>{t("plans.signupConsentText")}</Label>
+                    <Input
+                      value={form.signup_consent_text}
+                      maxLength={500}
+                      onChange={(e) => set("signup_consent_text", e.target.value)}
+                    />
+                    <p className="text-xs text-muted-foreground">{t("plans.signupConsentTextHint")}</p>
+                  </div>
+                </>
+              )}
               {/* Maintenance period: the license never expires, but only
                 releases published before updates_until can be installed.
                 The server clears these on non-perpetual plans. */}

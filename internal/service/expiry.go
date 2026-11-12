@@ -16,6 +16,16 @@ type ExpiryChecker struct {
 	email   *EmailService
 	webhook *WebhookService
 	logger  *slog.Logger
+	// EndPastDueUpgrade, when set, is asked first about a licence the
+	// dunning sweep would expire. It handles one an upgrade moved onto
+	// the subscription (back to its free plan rather than expired) and
+	// reports whether it did. On an error the licence is left past due,
+	// so the next sweep tries again.
+	EndPastDueUpgrade func(ctx context.Context, lic *model.License, threshold time.Time) (bool, error)
+	// EndGraceExpiredUpgrade is the same for the grace sweep, which runs
+	// first and would otherwise expire an upgraded licence on its paid
+	// plan, out of the dunning sweep's reach.
+	EndGraceExpiredUpgrade func(ctx context.Context, lic *model.License, cutoff time.Time) (bool, error)
 }
 
 func NewExpiryChecker(s *store.Store, email *EmailService, wh *WebhookService, logger *slog.Logger) *ExpiryChecker {
@@ -50,6 +60,49 @@ func (c *ExpiryChecker) RunAll(ctx context.Context) {
 	c.SendPaymentFailureReminders(ctx)
 	c.CleanupExpiredActivations(ctx)
 	c.SyncSubscriptionStates(ctx)
+	c.FinishSeatRemovals(ctx)
+}
+
+// FinishSeatRemovals repairs what an older version leaves when it runs
+// beside this one in a rolling upgrade: a member it removed keeps their
+// key and devices (it set removed_at alone), so does one it removed and
+// invited back (pending again), and a seat it invited may carry the
+// admin role this version dropped. The key no longer opens
+// anything, but the devices hold slots; they are removed, and reported
+// as deactivated, as a removal does. Idempotent, and a no-op once no
+// older version runs.
+func (c *ExpiryChecker) FinishSeatRemovals(ctx context.Context) {
+	if n, err := c.store.NormalizeSeatRoles(ctx); err != nil {
+		c.logger.Error("seat role repair failed", "error", err)
+	} else if n > 0 {
+		c.logger.Info("seat roles repaired: admin seats are members", "count", n)
+	}
+	leftovers, err := c.store.FindSeatLeftovers(ctx, 500)
+	if err != nil {
+		c.logger.Error("seat leftover check failed", "error", err)
+		return
+	}
+	for _, seat := range leftovers {
+		devices, done, err := c.store.ClearSeatLeftovers(ctx, seat.ID)
+		if err != nil {
+			c.logger.Error("seat leftover repair failed", "seat_id", seat.ID, "error", err)
+			continue
+		}
+		if !done {
+			continue
+		}
+		for _, a := range devices {
+			c.webhook.Dispatch(ctx, seat.ProductID, "license.deactivated", map[string]any{
+				"license_id": seat.LicenseID, "identifier": a.Identifier,
+			})
+		}
+		c.store.Audit(ctx, &model.AuditLog{
+			Entity: "seat", EntityID: seat.ID, Action: "seat_removal_finished",
+			ActorType: "system", ProductID: seat.ProductID,
+			Changes: map[string]any{"license_id": seat.LicenseID, "email": seat.Email, "devices_removed": len(devices)},
+		})
+		c.logger.Info("seat removal finished", "seat_id", seat.ID, "license_id", seat.LicenseID, "devices_removed", len(devices))
+	}
 }
 
 // ExpireGracePeriodLicenses marks active/past_due licenses as expired
@@ -67,11 +120,21 @@ func (c *ExpiryChecker) ExpireGracePeriodLicenses(ctx context.Context) {
 		}
 		grace := time.Duration(graceDays) * 24 * time.Hour
 		if time.Now().After(lic.ValidUntil.Add(grace)) {
-			// Re-checked in the write itself: an admin may have
-			// extended or reinstated the licence since it was read.
+			// Re-checked in the write itself, against the plan as it
+			// is then: an admin may have extended or reinstated the
+			// licence, or given it more grace, since it was read.
 			cutoff := time.Now().Add(-grace)
-			ok, err := c.store.ExpireLicenseIf(ctx, lic.ID,
-				[]string{model.StatusActive, model.StatusPastDue}, &cutoff)
+			if c.EndGraceExpiredUpgrade != nil {
+				handled, err := c.EndGraceExpiredUpgrade(ctx, lic, cutoff)
+				if err != nil {
+					c.logger.Error("grace upgrade end failed; retried next sweep", "id", lic.ID, "error", err)
+					continue
+				}
+				if handled {
+					continue
+				}
+			}
+			ok, err := c.store.ExpireLicenseAfterGrace(ctx, lic.ID)
 			if err != nil {
 				c.logger.Error("expire license failed", "id", lic.ID, "error", err)
 				continue
@@ -98,7 +161,10 @@ func (c *ExpiryChecker) ExpireGracePeriodLicenses(ctx context.Context) {
 	}
 }
 
-// ExpireTrials marks trialing licenses as expired when trial period ends.
+// ExpireTrials ends trials whose period is over. A trial plan that
+// names a fallback plan (TrialFallbackPlanID) moves the licence onto it
+// instead, so the customer keeps working on, say, the free tier with
+// the same key; any other trial is marked expired.
 func (c *ExpiryChecker) ExpireTrials(ctx context.Context) {
 	licenses, err := c.store.FindExpiredTrials(ctx)
 	if err != nil {
@@ -106,31 +172,64 @@ func (c *ExpiryChecker) ExpireTrials(ctx context.Context) {
 		return
 	}
 	for _, lic := range licenses {
-		now := time.Now()
-		ok, err := c.store.ExpireLicenseIf(ctx, lic.ID, []string{model.StatusTrialing}, &now)
-		if err != nil {
-			c.logger.Error("expire trial failed", "id", lic.ID, "error", err)
-			continue
-		}
-		if !ok {
-			continue // extended or changed since it was read
+		c.endTrial(ctx, lic)
+	}
+}
+
+// endTrial ends one trial the sweep found: moved to its fallback plan,
+// or marked expired. The licence is re-checked in the write, so a stale
+// copy is harmless.
+func (c *ExpiryChecker) endTrial(ctx context.Context, lic *model.License) {
+	// Decided and done under the locks, not on this read: a fallback named
+	// since the sweep read the plan is taken, not expired past.
+	res, err := c.store.MoveEndedTrialToFallback(ctx, lic.ID, time.Now())
+	if err != nil {
+		// Left trialing: the next sweep tries again rather than expiring
+		// a licence that was meant to move.
+		c.logger.Error("trial end failed; retried next sweep", "id", lic.ID, "error", err)
+		return
+	}
+	productName := ""
+	if lic.Product != nil {
+		productName = lic.Product.Name
+	}
+	switch {
+	case res.Moved:
+		c.store.Audit(ctx, &model.AuditLog{
+			Entity: "license", EntityID: lic.ID, Action: "plan_changed",
+			ActorType: "system",
+			Changes: map[string]any{
+				"reason": "trial_ended", "old_plan_id": res.From.ID, "new_plan_id": res.To.ID,
+				"status": model.StatusActive, "valid_until": "cleared",
+			},
+		})
+		c.webhook.Dispatch(ctx, lic.ProductID, model.EventPlanChanged, map[string]any{
+			"license_id": lic.ID, "email": lic.Email, "old_plan_id": res.From.ID, "new_plan_id": res.To.ID, "reason": "trial_ended",
+		})
+		c.email.SendTrialExpired(lic.Email, productName, res.To.Name)
+		c.logger.Info("trial ended; moved to fallback plan", "id", lic.ID, "plan_id", res.To.ID)
+	case res.Expire:
+		changes := map[string]any{"reason": "trial_ended"}
+		if res.Refusal != "" {
+			// The plan named a fallback that no longer qualifies: said
+			// here, where support looks for why a trial expired.
+			changes["fallback_refused"] = res.Refusal
+			c.logger.Warn("trial fallback plan no longer qualifies; the trial expired instead",
+				"id", lic.ID, "fallback_plan_id", res.FallbackPlanID, "reason", res.Refusal)
 		}
 		lic.Status = model.StatusExpired
 		c.store.Audit(ctx, &model.AuditLog{
 			Entity: "license", EntityID: lic.ID, Action: "expired",
 			ActorType: "system",
-			Changes:   map[string]any{"reason": "trial_ended"},
+			Changes:   changes,
 		})
 		c.webhook.Dispatch(ctx, lic.ProductID, "license.expired", map[string]any{
 			"license_id": lic.ID, "email": lic.Email, "reason": "trial_ended",
 		})
-		productName := ""
-		if lic.Product != nil {
-			productName = lic.Product.Name
-		}
-		c.email.SendTrialExpired(lic.Email, productName)
+		c.email.SendTrialExpired(lic.Email, productName, "")
 		c.logger.Info("trial expired", "id", lic.ID)
 	}
+	// Otherwise extended, moved or reinstated since it was read.
 }
 
 // MarkPastDueAsExpired converts long-standing past_due licenses to expired.
@@ -143,6 +242,16 @@ func (c *ExpiryChecker) MarkPastDueAsExpired(ctx context.Context) {
 		return
 	}
 	for _, lic := range licenses {
+		if c.EndPastDueUpgrade != nil {
+			handled, err := c.EndPastDueUpgrade(ctx, lic, threshold)
+			if err != nil {
+				c.logger.Error("past_due upgrade end failed; retried next sweep", "id", lic.ID, "error", err)
+				continue
+			}
+			if handled {
+				continue
+			}
+		}
 		ok, err := c.store.ExpireStalePastDueLicenseIf(ctx, lic.ID, threshold)
 		if err != nil {
 			c.logger.Error("expire past_due failed", "id", lic.ID, "error", err)
@@ -157,6 +266,14 @@ func (c *ExpiryChecker) MarkPastDueAsExpired(ctx context.Context) {
 			ActorType: "system",
 			Changes:   map[string]any{"reason": "past_due_timeout"},
 		})
+		c.webhook.Dispatch(ctx, lic.ProductID, model.EventLicenseExpired, map[string]any{
+			"license_id": lic.ID, "email": lic.Email, "reason": "past_due_timeout",
+		})
+		productName := ""
+		if lic.Product != nil {
+			productName = lic.Product.Name
+		}
+		c.email.SendLicenseExpired(lic.Email, productName)
 		c.logger.Info("past_due expired", "id", lic.ID)
 	}
 }
@@ -169,7 +286,7 @@ func (c *ExpiryChecker) MarkPastDueAsExpired(ctx context.Context) {
 func (c *ExpiryChecker) SendUpdatesEndingReminders(ctx context.Context) {
 	// Turned off: skip without recording anything, so switching it back
 	// on reminds licenses still inside the window.
-	if !c.email.NotifyEnabled("updates_ending") {
+	if !c.canRemind("updates_ending") {
 		return
 	}
 	from := time.Now()
@@ -235,11 +352,15 @@ func (c *ExpiryChecker) CleanupExpiredActivations(ctx context.Context) {
 
 // SendPaymentFailureReminders walks every past_due license up the
 // dunning ladder. Anchored on lic.PastDueAt so unrelated row writes
-// (audit, sync) don't reset the clock. Each step is gated by
-// HasNotification + a unique tag per past_due_at epoch, so:
+// (audit, sync) don't reset the clock. Each step is claimed
+// (ClaimNotification) under a unique tag per past_due_at epoch, and
+// queued, so:
 //
 //   - the same email never fires twice for one episode, even if the
-//     checker runs every hour;
+//     checker runs every hour, and even with every replica running it:
+//     a check-then-record would let two of them mail the same customer;
+//   - an SMTP outage does not lose a step: the queue retries it, and
+//     a mail it gives up on opens the step again for a later run;
 //   - if the checker misses a window (server down) it still fires
 //     the next time it wakes up — there's no narrow `>=N && <N+1`
 //     window that can silently swallow a reminder;
@@ -250,7 +371,7 @@ func (c *ExpiryChecker) SendPaymentFailureReminders(ctx context.Context) {
 	// Switched off: send nothing and record nothing. Each step records
 	// its tag as sent, so recording one that was skipped would leave the
 	// reminder lost for good once the email is switched back on.
-	if c.email == nil || !c.email.NotifyEnabled("payment_failed") {
+	if !c.canRemind("payment_failed") {
 		return
 	}
 	var licenses []*model.License
@@ -265,16 +386,16 @@ func (c *ExpiryChecker) SendPaymentFailureReminders(ctx context.Context) {
 	steps := []struct {
 		minDays int
 		tag     string
-		send    func(to, productName string)
+		render  func(productName string) (subject, body string)
 	}{
 		// Highest threshold first — only one email per check per
 		// license, and the "highest reached" wins. Without that,
 		// a license that's been past_due for 20 days would receive
 		// dunning_first + dunning_second + dunning_final on the
 		// FIRST checker run after install.
-		{14, "dunning_final", c.email.SendDunningFinal},
-		{7, "dunning_second", c.email.SendDunningSecond},
-		{1, "dunning_first", c.email.SendPaymentFailed},
+		{14, "dunning_final", c.email.RenderDunningFinal},
+		{7, "dunning_second", c.email.RenderDunningSecond},
+		{1, "dunning_first", c.email.RenderPaymentFailed},
 	}
 
 	now := time.Now()
@@ -297,14 +418,32 @@ func (c *ExpiryChecker) SendPaymentFailureReminders(ctx context.Context) {
 				continue
 			}
 			tag := step.tag + ":" + strconvI64(episode)
-			if c.store.HasNotification(ctx, lic.ID, tag) {
-				break // already sent the highest-tier; nothing lower will fire
+			token, err := c.store.ClaimNotification(ctx, lic.ID, tag)
+			if err != nil {
+				c.logger.Error("dunning claim failed", "license_id", lic.ID, "tag", step.tag, "error", err)
+				break // the next run tries again
 			}
-			step.send(lic.Email, productName)
-			c.store.RecordNotification(ctx, lic.ID, tag)
-			c.logger.Info("dunning email sent",
-				"license_id", lic.ID, "tag", step.tag,
-				"days_past_due", daysPastDue, "episode", episode)
+			if token == "" {
+				break // already sent the highest-tier, or another pass holds it; nothing lower will fire
+			}
+			// Queuing the mail and closing the claim share one
+			// transaction, as for the other reminders. Failing to queue
+			// hands the claim back for the next run; losing the claim
+			// means another pass already owns it.
+			subject, body := step.render(productName)
+			switch err := c.store.EnqueueEmailAndCloseNotification(ctx, lic.Email, subject, body, token); {
+			case err == nil:
+				c.logger.Info("dunning email queued",
+					"license_id", lic.ID, "tag", step.tag,
+					"days_past_due", daysPastDue, "episode", episode)
+			case errors.Is(err, store.ErrNotificationClaimLost):
+				c.logger.Warn("dunning claim taken over; the other pass sends it", "license_id", lic.ID, "tag", step.tag)
+			default:
+				c.logger.Error("dunning email could not be queued", "license_id", lic.ID, "tag", step.tag, "error", err)
+				if rerr := c.store.ReleaseNotification(ctx, token); rerr != nil {
+					c.logger.Error("dunning claim not released", "license_id", lic.ID, "error", rerr)
+				}
+			}
 			break // only one email per checker run per license
 		}
 	}
@@ -326,7 +465,7 @@ func strconvI64(n int64) string {
 // the email, and every renewal is reminded, not only the first. Queued
 // through the durable mail queue like the other reminders.
 func (c *ExpiryChecker) SendRenewalReminders(ctx context.Context) {
-	if !c.email.NotifyEnabled("renewal_reminder") {
+	if !c.canRemind("renewal_reminder") {
 		return
 	}
 	now := time.Now()
@@ -347,7 +486,7 @@ func (c *ExpiryChecker) SendRenewalReminders(ctx context.Context) {
 		if lic.Product != nil {
 			productName = lic.Product.Name
 		}
-		subject, body := c.email.RenderRenewalReminder(productName, lic.ValidUntil.Format("2006-01-02"))
+		subject, body := c.email.RenderRenewalReminder(productName, utcDate(*lic.ValidUntil))
 		switch err := c.store.EnqueueEmailAndCloseNotification(ctx, lic.Email, subject, body, token); {
 		case err == nil, errors.Is(err, store.ErrNotificationClaimLost):
 		default:

@@ -116,15 +116,6 @@ func (s *Store) FindSubscriptionByExternal(ctx context.Context, provider, extern
 		Where("subscription.payment_provider = ? AND subscription.external_id = ?", provider, externalID).Scan(ctx)
 }
 
-func (s *Store) ListSubscriptionsByUser(ctx context.Context, userID string) ([]*model.Subscription, error) {
-	var out []*model.Subscription
-	err := s.DB.NewSelect().Model(&out).
-		Relation("License").Relation("Plan").Relation("Plan.Product").
-		Where("subscription.user_id = ?", userID).
-		OrderExpr("subscription.created_at DESC").Scan(ctx)
-	return out, err
-}
-
 func (s *Store) UpdateSubscription(ctx context.Context, sub *model.Subscription, cols ...string) error {
 	sub.UpdatedAt = time.Now()
 	cols = append(cols, "updated_at")

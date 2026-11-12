@@ -74,7 +74,7 @@ func (s *EntitlementService) Check(ctx context.Context, in CheckInput) (*CheckRe
 
 	// Plan entitlements with the license's addons merged in. A bare plan
 	// still gets its addons' features.
-	ents, err := licenseFeatures(ctx, s.store, lic)
+	ents, err := LicenseFeatures(ctx, s.store, lic)
 	if err != nil {
 		return nil, err
 	}
@@ -91,8 +91,8 @@ func (s *EntitlementService) Check(ctx context.Context, in CheckInput) (*CheckRe
 		}
 
 		switch e.ValueType {
-		case "bool":
-			fs.Enabled = e.Value == "true"
+		case "bool", "flag":
+			fs.Enabled = featureEnabled(e)
 		case "quota":
 			limit, _ := strconv.ParseInt(e.Value, 10, 64)
 			period := e.QuotaPeriod
@@ -105,10 +105,7 @@ func (s *EntitlementService) Check(ctx context.Context, in CheckInput) (*CheckRe
 			if counter != nil {
 				used = counter.Used
 			}
-			remaining := limit - used
-			if limit == 0 {
-				remaining = -1
-			}
+			remaining := quotaRemaining(limit, used)
 			fs.Used = &used
 			fs.Limit = &limit
 			fs.Remaining = &remaining

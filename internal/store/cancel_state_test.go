@@ -3,6 +3,8 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -144,23 +146,23 @@ func TestTryRecordPastDueNotification(t *testing.T) {
 	}
 	tag := func(at time.Time) string { return "payment_failed:" + at.Format("20060102150405") }
 
-	if !s.TryRecordPastDueNotification(ctx, lic.ID, sub, entered, tag(entered)) {
-		t.Fatal("past_due on its subscription: not recorded")
+	if ok, err := s.TryRecordPastDueNotification(ctx, lic.ID, sub, entered, tag(entered)); !ok || err != nil {
+		t.Fatalf("past_due on its subscription: not recorded (%v)", err)
 	}
-	if s.TryRecordPastDueNotification(ctx, lic.ID, sub, entered, tag(entered)) {
+	if ok, _ := s.TryRecordPastDueNotification(ctx, lic.ID, sub, entered, tag(entered)); ok {
 		t.Fatal("recorded twice")
 	}
 	other := entered.Add(-24 * time.Hour)
-	if s.TryRecordPastDueNotification(ctx, lic.ID, sub, other, tag(other)) {
+	if ok, _ := s.TryRecordPastDueNotification(ctx, lic.ID, sub, other, tag(other)); ok {
 		t.Fatal("recorded for an episode the licence is not in")
 	}
-	if s.TryRecordPastDueNotification(ctx, lic.ID, "sub_other", entered, tag(entered)+":x") {
+	if ok, _ := s.TryRecordPastDueNotification(ctx, lic.ID, "sub_other", entered, tag(entered)+":x"); ok {
 		t.Fatal("recorded for a subscription the licence is not on")
 	}
 	if _, err := s.DB.NewRaw("UPDATE licenses SET status = 'active', past_due_at = NULL WHERE id = ?", lic.ID).Exec(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if s.TryRecordPastDueNotification(ctx, lic.ID, sub, entered, tag(entered)+":y") {
+	if ok, _ := s.TryRecordPastDueNotification(ctx, lic.ID, sub, entered, tag(entered)+":y"); ok {
 		t.Fatal("recorded after the licence recovered")
 	}
 }
@@ -266,5 +268,98 @@ func TestStripeWritesRespectLicenceState(t *testing.T) {
 	}
 	if st, _, _ := state(canceled); st != model.StatusActive {
 		t.Fatalf("current read did not restore the unpaid-canceled licence: %s", st)
+	}
+}
+
+// Cancel-at-period-end must not push valid_until out after an immediate
+// cancel already ended the licence: that would restore access until the
+// period end on a canceled row.
+func TestDateOnlyValidUntil_RefusedAfterImmediateCancel(t *testing.T) {
+	s := setupTestDB(t)
+	t.Cleanup(func() { s.Close() })
+	ctx := context.Background()
+
+	until := time.Now().Add(30 * 24 * time.Hour).Truncate(time.Second)
+	lic := newLicenseOn(t, s, ctx, "subscription", model.StatusActive, &until)
+	sub := "sub_capend_" + lic.ID
+	linkSubscription(t, s, ctx, lic.ID, sub)
+
+	endedAt := time.Now().Truncate(time.Second)
+	stamp, err := s.StripeReadStamp(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateLicenseFromSubscriptionEnded(ctx, &model.License{
+		ID: lic.ID, StripeSubscriptionID: sub, Status: model.StatusCanceled,
+		CanceledAt: &endedAt, ValidUntil: &endedAt,
+	}, stamp, "status", "canceled_at", "valid_until"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A later period-end stamp must still not extend the paid-through date.
+	later, err := s.StripeReadStamp(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	periodEnd := time.Now().Add(20 * 24 * time.Hour).Truncate(time.Second)
+	err = s.UpdateLicenseFromSubscriptionRead(ctx, &model.License{
+		ID: lic.ID, StripeSubscriptionID: sub, Status: model.StatusActive, ValidUntil: &periodEnd,
+	}, later, "valid_until")
+	if !errors.Is(err, store.ErrLicenseRestricted) {
+		t.Fatalf("period-end after immediate cancel: err=%v, want ErrLicenseRestricted", err)
+	}
+	var got time.Time
+	var st string
+	if err := s.DB.NewRaw("SELECT status, valid_until FROM licenses WHERE id = ?", lic.ID).Scan(ctx, &st, &got); err != nil {
+		t.Fatal(err)
+	}
+	if st != model.StatusCanceled || !got.Equal(endedAt) {
+		t.Fatalf("after refused period-end: %s until %v, want canceled until %v", st, got, endedAt)
+	}
+
+	// An active licence still accepts a stamped period-end date.
+	active := newLicenseOn(t, s, ctx, "subscription", model.StatusActive, &until)
+	asub := "sub_capend_ok_" + active.ID
+	linkSubscription(t, s, ctx, active.ID, asub)
+	okStamp, err := s.StripeReadStamp(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateLicenseFromSubscriptionRead(ctx, &model.License{
+		ID: active.ID, StripeSubscriptionID: asub, Status: model.StatusActive, ValidUntil: &periodEnd,
+	}, okStamp, "valid_until"); err != nil {
+		t.Fatalf("period-end on an active licence: %v", err)
+	}
+	if err := s.DB.NewRaw("SELECT valid_until FROM licenses WHERE id = ?", active.ID).Scan(ctx, &got); err != nil || !got.Equal(periodEnd) {
+		t.Fatalf("active period-end valid_until=%v (err %v), want %v", got, err, periodEnd)
+	}
+}
+
+// A failed update of the subscription row fails the write: the transaction
+// is aborted, so the licence update is rolled back with it.
+func TestUpdateLicenseFromSubscriptionEnded_FailedSubscriptionSync(t *testing.T) {
+	s := setupTestDB(t)
+	t.Cleanup(func() { s.Close() })
+	ctx := context.Background()
+	lic := newLicenseOn(t, s, ctx, "subscription", model.StatusActive, nil)
+	sub := "sub_end_" + lic.ID
+	linkSubscription(t, s, ctx, lic.ID, sub)
+
+	fn := "fail_sub_" + strings.ReplaceAll(lic.ID, "-", "")
+	if _, err := s.DB.ExecContext(ctx, fmt.Sprintf(`CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN RAISE EXCEPTION 'database unavailable'; END $$`, fn)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = s.DB.ExecContext(context.Background(), fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON subscriptions", fn))
+		_, _ = s.DB.ExecContext(context.Background(), fmt.Sprintf("DROP FUNCTION IF EXISTS %s()", fn))
+	})
+	if _, err := s.DB.ExecContext(ctx, fmt.Sprintf(`CREATE TRIGGER %s BEFORE UPDATE ON subscriptions FOR EACH ROW
+		WHEN (NEW.license_id = '%s') EXECUTE FUNCTION %s()`, fn, lic.ID, fn)); err != nil {
+		t.Fatal(err)
+	}
+	err := s.UpdateLicenseFromSubscriptionEnded(ctx, &model.License{ID: lic.ID, StripeSubscriptionID: sub, Status: model.StatusCanceled}, time.Now(), "status")
+	if st, _ := licenseState(t, s, ctx, lic.ID); !strings.Contains(fmt.Sprint(err), "database unavailable") || st != model.StatusActive {
+		t.Fatalf("subscription update failed: err=%v, licence %s; want the trigger's error and the licence still active", err, st)
 	}
 }

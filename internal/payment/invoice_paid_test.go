@@ -108,7 +108,7 @@ func TestPaymentFailedReportsEachEpisodeOnce(t *testing.T) {
 		return lic
 	}
 	fail := func(lic *model.License) {
-		h.onPaymentFailed(ctx, []byte(fmt.Sprintf(`{"subscription":%q,"status":"open"}`, lic.StripeSubscriptionID)))
+		_ = h.onPaymentFailed(ctx, []byte(fmt.Sprintf(`{"subscription":%q,"status":"open"}`, lic.StripeSubscriptionID)))
 	}
 	// Audit lines are written in the background.
 	audits := func(lic *model.License, want int) int {
@@ -231,9 +231,10 @@ func TestInvoicePaidFollowsTheCurrentSubscription(t *testing.T) {
 		t.Fatalf("unpaid subscription paid up: %s %v, want active until the period end", st, vu)
 	}
 
+	// Ended in Stripe: the licence ends now, not at a date still ahead.
 	paid(ended)
-	if st, vu := state(ended); st != model.StatusCanceled || !vu.Equal(until) {
-		t.Fatalf("ended subscription: %s %v, want canceled and the date untouched", st, vu)
+	if st, vu := state(ended); st != model.StatusCanceled || vu.After(time.Now()) {
+		t.Fatalf("ended subscription: %s %v, want canceled and no longer valid", st, vu)
 	}
 
 	paid(trial)
@@ -242,7 +243,10 @@ func TestInvoicePaidFollowsTheCurrentSubscription(t *testing.T) {
 	}
 
 	resume := func(lic *model.License) {
-		h.onSubscriptionResumed(ctx, []byte(fmt.Sprintf(`{"id":%q}`, lic.StripeSubscriptionID)))
+		// customer.subscription.resumed is read and applied like an update.
+		if err := h.onSubscriptionUpdated(ctx, []byte(fmt.Sprintf(`{"id":%q}`, lic.StripeSubscriptionID))); err != nil {
+			t.Fatal(err)
+		}
 	}
 	resume(adminSuspended)
 	if st, _ := state(adminSuspended); st != model.StatusSuspended {

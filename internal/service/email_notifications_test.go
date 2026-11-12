@@ -9,6 +9,7 @@ import (
 
 	"github.com/tabloy/keygate/internal/model"
 	"github.com/tabloy/keygate/internal/store"
+	"github.com/tabloy/keygate/internal/testsupport"
 )
 
 func openNotifyStore(t *testing.T) *store.Store {
@@ -28,20 +29,14 @@ func openNotifyStore(t *testing.T) *store.Store {
 	return s
 }
 
-// setNotify writes (or with value "" removes) an email switch and puts
-// the original state back when the test ends: the settings are global.
+// setNotify writes (or with value "" removes) an email switch. The
+// settings lock puts the original state back when the test ends: the
+// settings are global.
 func setNotify(t *testing.T, s *store.Store, kind, value string) {
 	t.Helper()
+	testsupport.LockSettings(t, s.DB)
 	ctx := context.Background()
 	key := NotifySettingKey(kind)
-	prev, prevErr := s.GetSetting(ctx, key)
-	t.Cleanup(func() {
-		if prevErr != nil {
-			_ = s.DeleteSetting(ctx, key)
-		} else {
-			_ = s.SetSetting(ctx, key, prev)
-		}
-	})
 	if value == "" {
 		_ = s.DeleteSetting(ctx, key)
 		return
@@ -92,7 +87,7 @@ func TestUpdatesEndingReminderRespectsTheSwitch(t *testing.T) {
 	if err := s.CreateLicense(ctx, lic); err != nil {
 		t.Fatal(err)
 	}
-	c := NewExpiryChecker(s, NewEmailService("", "", "", "", "", slog.Default(), s), nil, slog.Default())
+	c := NewExpiryChecker(s, NewEmailService("127.0.0.1", "1", "", "", "keygate@test.local", slog.Default(), s), nil, slog.Default())
 
 	setNotify(t, s, "updates_ending", "false")
 	c.SendUpdatesEndingReminders(ctx)
@@ -129,7 +124,7 @@ func TestDunningRespectsTheSwitch(t *testing.T) {
 		_, _ = s.DB.NewRaw("UPDATE licenses SET status = 'expired' WHERE id = ?", lic.ID).Exec(context.Background())
 		_, _ = s.DB.NewRaw("DELETE FROM email_queue WHERE to_addr = ?", email).Exec(context.Background())
 	})
-	c := NewExpiryChecker(s, NewEmailService("", "", "", "", "", slog.Default(), s), nil, slog.Default())
+	c := NewExpiryChecker(s, NewEmailService("127.0.0.1", "1", "", "", "keygate@test.local", slog.Default(), s), nil, slog.Default())
 	recorded := func() int {
 		t.Helper()
 		var n int

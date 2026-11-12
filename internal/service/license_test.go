@@ -203,7 +203,7 @@ func TestEntitlements(t *testing.T) {
 		},
 	}
 
-	ents, err := licenseFeatures(context.Background(), nil, lic)
+	ents, err := LicenseFeatures(context.Background(), nil, lic)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +222,7 @@ func TestEntitlements(t *testing.T) {
 		t.Errorf("sla should be '99.9%%', got %v", features["sla"])
 	}
 
-	nilEnts, _ := licenseFeatures(context.Background(), nil, &model.License{})
+	nilEnts, _ := LicenseFeatures(context.Background(), nil, &model.License{})
 	emptyFeatures := featureValues(nilEnts)
 	if len(emptyFeatures) != 0 {
 		t.Error("nil plan should return empty features")
@@ -347,7 +347,7 @@ func TestEffectiveGraceDays(t *testing.T) {
 	plan := &model.Plan{GraceDays: 7}
 
 	for _, status := range []string{model.StatusActive, model.StatusTrialing, model.StatusPastDue} {
-		lic := &model.License{Status: status, Plan: plan}
+		lic := &model.License{Status: status, Plan: plan, StripeSubscriptionID: "sub_test"}
 		if got := svc.effectiveGraceDays(lic); got != 7 {
 			t.Errorf("%s: grace = %d, want the plan's 7", status, got)
 		}
@@ -358,6 +358,11 @@ func TestEffectiveGraceDays(t *testing.T) {
 	lic := &model.License{Status: model.StatusCanceled, Plan: plan}
 	if got := svc.effectiveGraceDays(lic); got != 0 {
 		t.Errorf("canceled: grace = %d, want 0", got)
+	}
+
+	lic = &model.License{Status: model.StatusTrialing, Plan: plan}
+	if got := svc.effectiveGraceDays(lic); got != 0 {
+		t.Errorf("trialing, not billed by Stripe: grace = %d, want 0", got)
 	}
 }
 

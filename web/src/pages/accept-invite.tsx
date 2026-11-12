@@ -4,19 +4,28 @@ import { useEffect, useRef } from "react"
 import { Link, useSearchParams } from "react-router-dom"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { useAuth } from "@/hooks/use-auth"
 import { useSiteConfig } from "@/hooks/use-site-config"
 import { useI18n } from "@/i18n"
-import { invites } from "@/lib/api"
+import { errorCode, invites } from "@/lib/api"
 
 export default function AcceptInvitePage() {
   const { t } = useI18n()
+  const { refetch } = useAuth()
   const [params] = useSearchParams()
   const token = params.get("token") || ""
 
-  // Backend collapses bad/expired/already-accepted into one error
-  // shape so we don't try to distinguish the failure reason here.
+  // Backend collapses bad/expired/already-accepted into one error, so
+  // the page tells apart only "no seat is free", whose invitation still
+  // stands. It shows the failure itself; the global toast stays out.
+  // AcceptInvite also issues a session cookie (see AuthHandler.AcceptInvite);
+  // refetch so "Open portal" sees the invitee, same as signup/login.
   const acceptMut = useMutation({
     mutationFn: () => invites.accept(token),
+    meta: { ownErrors: true },
+    onSuccess: async () => {
+      await refetch()
+    },
   })
 
   // Fire exactly once per distinct token. StrictMode double-invokes
@@ -64,15 +73,17 @@ export default function AcceptInvitePage() {
   }
 
   if (acceptMut.isError) {
+    // Every seat taken: the invitation itself still stands.
+    const noSeat = errorCode(acceptMut.error) === "SEAT_LIMIT"
     return (
       <Shell>
         <Card className="max-w-md">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <XCircle className="h-5 w-5 text-destructive" />
-              {t("acceptInvite.invalidTitle")}
+              {t(noSeat ? "acceptInvite.noSeatTitle" : "acceptInvite.invalidTitle")}
             </CardTitle>
-            <CardDescription>{t("acceptInvite.invalidDesc")}</CardDescription>
+            <CardDescription>{t(noSeat ? "acceptInvite.noSeatDesc" : "acceptInvite.invalidDesc")}</CardDescription>
           </CardHeader>
           <CardContent>
             <Button asChild variant="outline">
@@ -85,8 +96,6 @@ export default function AcceptInvitePage() {
   }
 
   const data = acceptMut.data!
-  const productName = data.product_name || "the team"
-  const roleLabel = data.role === "admin" ? t("portal.roleAdmin") : t("portal.roleMember")
 
   return (
     <Shell>
@@ -94,9 +103,11 @@ export default function AcceptInvitePage() {
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <CheckCircle2 className="h-5 w-5 text-emerald-600" />
-            {t("acceptInvite.acceptedTitle").replace("{product}", productName)}
+            {data.product_name
+              ? t("acceptInvite.acceptedTitle").replace("{product}", data.product_name)
+              : t("acceptInvite.acceptedTitleNoProduct")}
           </CardTitle>
-          <CardDescription>{t("acceptInvite.acceptedDesc").replace("{role}", roleLabel)}</CardDescription>
+          <CardDescription>{t("acceptInvite.acceptedDesc")}</CardDescription>
         </CardHeader>
         <CardContent>
           <Button asChild>

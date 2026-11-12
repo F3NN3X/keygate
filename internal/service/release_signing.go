@@ -88,7 +88,9 @@ func NewReleaseSigningService(c ReleaseSigningServiceConfig) *ReleaseSigningServ
 // ─── Sentinel errors ───
 
 var (
-	ErrSigningDisabled        = errors.New("release signing is not configured: it needs RELEASE_KEY_ENCRYPTION_KEY and object storage (STORAGE_BUCKET, STORAGE_ACCESS_KEY, STORAGE_SECRET_KEY)")
+	// Signing is wired only when both the master key and release storage
+	// are configured (see main.go), so the message names both.
+	ErrSigningDisabled        = errors.New("release signing is not configured: it needs RELEASE_KEY_ENCRYPTION_KEY and release storage (STORAGE_BUCKET, STORAGE_ACCESS_KEY, STORAGE_SECRET_KEY)")
 	ErrArtifactTooLargeToSign = errors.New("artifact exceeds the configured signing size limit")
 	ErrSigningKeyMissing      = errors.New("product has no active signing key — generate one before signing")
 	ErrArtifactNotInStorage   = errors.New("artifact bytes not found in storage; upload may not be finalized")
@@ -239,9 +241,9 @@ func (s *ReleaseSigningService) ExportPublicKeyTauri(ctx context.Context, produc
 //
 // Format:
 //
-//	-----BEGIN PUBLIC KEY-----
+//	-----BEGIN ED25519 PUBLIC KEY-----
 //	<base64 of raw 32-byte key>
-//	-----END PUBLIC KEY-----
+//	-----END ED25519 PUBLIC KEY-----
 //
 // We use a custom block type rather than SPKI because Sparkle's edSignature
 // docs recommend the raw 32-byte key, not the X.509 envelope.

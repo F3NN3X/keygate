@@ -67,9 +67,13 @@ type Config struct {
 
 	// Brute-force protection on /license/* — caps repeated bad license
 	// keys per IP. In tests these defaults are too tight, so they're
-	// configurable via env: BF_MAX_FAILS=5 / BF_LOCKOUT=30s / etc.
+	// configurable via env: BF_MAX_FAILS=5 / BF_LOCKOUT_SECONDS=30.
 	BFMaxFails       int
 	BFLockoutSeconds int
+
+	// TrustedProxies is TRUSTED_PROXIES as written: the proxies whose
+	// X-Forwarded-For is believed (see cmd/server/trusted_proxies.go).
+	TrustedProxies string
 
 	AdminEmails []string
 
@@ -144,6 +148,7 @@ func Load() (*Config, error) {
 	cfg.RateLimitOTPSend = envIntOr("RATE_LIMIT_OTP_SEND", 30)
 	cfg.BFMaxFails = envIntOr("BF_MAX_FAILS", 5)
 	cfg.BFLockoutSeconds = envIntOr("BF_LOCKOUT_SECONDS", 30)
+	cfg.TrustedProxies = os.Getenv("TRUSTED_PROXIES")
 
 	cfg.WebhookMaxAttempts = envIntOr("WEBHOOK_MAX_ATTEMPTS", 5)
 	cfg.WebhookRetryInterval = envOr("WEBHOOK_RETRY_INTERVAL", "30s")
@@ -208,7 +213,14 @@ func isLoopbackURL(raw string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func (c *Config) IsDevLoginAllowed() bool { return c.normalizedEnv() == "development" }
+// IsDevLoginAllowed reports whether this server offers dev-login:
+// ENVIRONMENT=development with a BASE_URL on this machine. The host is
+// parsed, so a public name that merely contains "localhost"
+// (https://localhost.example.com) does not pass. The handler further
+// takes only a caller on this machine (see AuthHandler.devLoginOpen).
+func (c *Config) IsDevLoginAllowed() bool {
+	return c.normalizedEnv() == "development" && isLoopbackURL(c.BaseURL)
+}
 
 // IsAdminEmail checks if an email is in the ADMIN_EMAILS list.
 // Used for backward compatibility and initial setup bootstrap.

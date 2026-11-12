@@ -7,13 +7,14 @@ import (
 	"github.com/tabloy/keygate/internal/store"
 )
 
-// licenseFeatures returns the features a license actually has: its
+// LicenseFeatures returns the features a license actually has: its
 // plan's entitlements, with each enabled addon adding a feature or
 // replacing the plan's value for a feature of the same name. An addon
 // replaces the limit, never the plan's billing (its Stripe meter). Verify,
-// the offline token, the entitlements endpoint and usage limits all
-// read this, so a license cannot have a feature in one and not another.
-func licenseFeatures(ctx context.Context, st *store.Store, lic *model.License) ([]*model.Entitlement, error) {
+// the offline token, the entitlements endpoint, usage limits and the
+// customer portal all read this, so a license cannot have a feature in
+// one and not another.
+func LicenseFeatures(ctx context.Context, st *store.Store, lic *model.License) ([]*model.Entitlement, error) {
 	var out []*model.Entitlement
 	index := map[string]int{}
 	if lic.Plan != nil {
@@ -30,7 +31,9 @@ func licenseFeatures(ctx context.Context, st *store.Store, lic *model.License) (
 		return nil, err
 	}
 	for _, la := range addons {
-		if la.Addon == nil {
+		// An addon of another product grants nothing here. Attaching
+		// one is refused now, but it once went through.
+		if la.Addon == nil || la.Addon.ProductID != lic.ProductID {
 			continue
 		}
 		a := la.Addon
@@ -58,15 +61,26 @@ func licenseFeatures(ctx context.Context, st *store.Store, lic *model.License) (
 }
 
 // featureValues is the feature map sent in verify answers and tokens:
-// booleans as true/false, everything else as its string value.
+// bool and flag features as true/false, everything else as its string value.
 func featureValues(ents []*model.Entitlement) map[string]any {
 	m := make(map[string]any, len(ents))
 	for _, e := range ents {
-		if e.ValueType == "bool" {
-			m[e.Feature] = e.Value == "true"
+		if e.ValueType == "bool" || e.ValueType == "flag" {
+			m[e.Feature] = featureEnabled(e)
 		} else {
 			m[e.Feature] = e.Value
 		}
 	}
 	return m
+}
+
+// featureEnabled reads a bool or flag feature. A bool has always needed
+// "true". A flag was stored unchecked before v0.1.10 and granted the
+// feature whatever it held, so only an explicit "false" turns one off:
+// an older "1" or "yes" keeps working after an upgrade.
+func featureEnabled(e *model.Entitlement) bool {
+	if e.ValueType == "flag" {
+		return e.Value != "false"
+	}
+	return e.Value == "true"
 }

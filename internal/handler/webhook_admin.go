@@ -1,8 +1,12 @@
 package handler
 
 import (
+	"database/sql"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -23,18 +27,9 @@ func NewWebhookAdminHandler(s *store.Store, wh *service.WebhookService) *Webhook
 }
 
 func (h *WebhookAdminHandler) ListWebhooks(c *gin.Context) {
-	productID := c.Query("product_id")
-	// Auto-narrow for product-scoped api keys (same pattern as
-	// ListLicenses / Release.List).
-	if v, ok := c.Get("api_key"); ok {
-		if ak, ok := v.(*model.APIKey); ok && ak != nil && ak.ProductID != "" {
-			if productID != "" && productID != ak.ProductID {
-				response.Err(c, 403, "PRODUCT_SCOPE_MISMATCH",
-					"api_key is bound to a different product")
-				return
-			}
-			productID = ak.ProductID
-		}
+	productID, ok := keyProductFilter(c, c.Query("product_id"))
+	if !ok {
+		return
 	}
 	page := listPage(c)
 	webhooks, total, err := h.Store.ListWebhooks(c, productID, c.Query("search"), page)
@@ -64,14 +59,21 @@ func (h *WebhookAdminHandler) CreateWebhook(c *gin.Context) {
 		response.BadRequest(c, err.Error())
 		return
 	}
-	if len(req.Events) == 0 {
-		response.BadRequest(c, "at least one event type is required")
+	if !validWebhookEvents(c, req.Events) {
 		return
 	}
 	if req.Secret == "" {
 		req.Secret = service.GenerateWebhookSecret()
 	}
 	if !requireKeyProductScope(c, req.ProductID) {
+		return
+	}
+	if _, err := h.Store.FindProductByID(c, req.ProductID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			response.NotFound(c, "product not found")
+			return
+		}
+		response.Internal(c, err)
 		return
 	}
 
@@ -83,9 +85,21 @@ func (h *WebhookAdminHandler) CreateWebhook(c *gin.Context) {
 		Active:    true,
 	}
 	if err := h.Store.CreateWebhook(c, w); err != nil {
+		if store.IsForeignKeyViolation(err) {
+			// The product was deleted after it was checked.
+			response.NotFound(c, "product not found")
+			return
+		}
 		response.Internal(c, err)
 		return
 	}
+	// Where licence events are sent is worth a record; the secret is not
+	// written down, nor the URL's path and query, which may carry a token.
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "webhook", EntityID: w.ID, Action: "created",
+		ActorType: "admin", ActorID: adminID(c), IPAddress: c.ClientIP(), ProductID: w.ProductID,
+		Changes: map[string]any{"target": webhookTarget(w.URL), "events": w.Events},
+	})
 
 	response.Created(c, gin.H{
 		"id":         w.ID,
@@ -124,35 +138,62 @@ func (h *WebhookAdminHandler) UpdateWebhook(c *gin.Context) {
 		}
 		w.URL = *req.URL
 	}
+	var columns []string
+	if req.URL != nil {
+		columns = append(columns, "url")
+	}
 	if req.Events != nil {
-		// Same rule as creation: a webhook subscribed to nothing is a
-		// row that will never fire, and an empty array reads on the
-		// dashboard exactly like a working endpoint.
-		if len(req.Events) == 0 {
-			response.BadRequest(c, "at least one event type is required")
+		if !validWebhookEvents(c, req.Events) {
 			return
 		}
 		w.Events = req.Events
+		columns = append(columns, "events")
 	}
 	if req.Active != nil {
 		w.Active = *req.Active
+		columns = append(columns, "active")
 	}
-	if err := h.Store.UpdateWebhook(c, w); err != nil {
+	if err := h.Store.UpdateWebhook(c, w, columns...); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			response.NotFound(c, "webhook not found")
+			return
+		}
 		response.Internal(c, err)
 		return
 	}
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "webhook", EntityID: w.ID, Action: "updated",
+		ActorType: "admin", ActorID: adminID(c), IPAddress: c.ClientIP(), ProductID: w.ProductID,
+		Changes: map[string]any{"target": webhookTarget(w.URL), "events": w.Events, "active": w.Active},
+	})
 	response.OK(c, w)
 }
 
 func (h *WebhookAdminHandler) DeleteWebhook(c *gin.Context) {
-	if _, ok := h.checkWebhookScope(c, c.Param("id")); !ok {
+	w, ok := h.checkWebhookScope(c, c.Param("id"))
+	if !ok {
 		return
 	}
 	if err := h.Store.DeleteWebhook(c, c.Param("id")); err != nil {
 		response.Internal(c, err)
 		return
 	}
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "webhook", EntityID: w.ID, Action: "deleted",
+		ActorType: "admin", ActorID: adminID(c), IPAddress: c.ClientIP(), ProductID: w.ProductID,
+		Changes: map[string]any{"target": webhookTarget(w.URL)},
+	})
 	response.NoContent(c)
+}
+
+// webhookTarget is a webhook URL as an audit line keeps it: scheme and
+// host only.
+func webhookTarget(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // checkWebhookScope blocks a product-scoped api_key from reaching
@@ -250,7 +291,9 @@ func (h *WebhookAdminHandler) ResendDelivery(c *gin.Context) {
 	}
 	fresh, err := h.Webhook.Redispatch(c, deliveryID)
 	if err != nil {
-		if err == service.ErrWebhookDeliveryNotResendable {
+		// Deleted between the check in Redispatch and the new delivery's
+		// insert: the same answer as deleted before it.
+		if err == service.ErrWebhookDeliveryNotResendable || store.IsForeignKeyViolation(err) {
 			response.Err(c, 409, "NOT_RESENDABLE",
 				"webhook is deleted or inactive — re-enable it before resending")
 			return
@@ -281,6 +324,11 @@ func (h *WebhookAdminHandler) TestWebhook(c *gin.Context) {
 			response.Err(c, http.StatusConflict, "WEBHOOK_INACTIVE", "enable the webhook before testing it")
 			return
 		}
+		if store.IsForeignKeyViolation(err) {
+			// Deleted while the test was being sent.
+			response.NotFound(c, "webhook not found")
+			return
+		}
 		response.Internal(c, err)
 		return
 	}
@@ -290,4 +338,22 @@ func (h *WebhookAdminHandler) TestWebhook(c *gin.Context) {
 		"response_code": d.ResponseCode,
 		"response_body": d.ResponseBody,
 	})
+}
+
+// validWebhookEvents checks a subscription list, writing a 400 and
+// returning false when it is unusable. A webhook subscribed to nothing,
+// or only to names nothing sends, is a row that never fires and reads
+// on the dashboard exactly like a working endpoint.
+func validWebhookEvents(c *gin.Context, events []string) bool {
+	if len(events) == 0 {
+		response.BadRequest(c, "at least one event type is required")
+		return false
+	}
+	for _, e := range events {
+		if !model.IsValidWebhookEvent(e) {
+			response.BadRequest(c, fmt.Sprintf("unknown event %q (valid: %s)", e, strings.Join(model.WebhookEvents, ", ")))
+			return false
+		}
+	}
+	return true
 }

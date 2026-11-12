@@ -10,6 +10,7 @@ import (
 	"html/template"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/mail"
 	"net/smtp"
@@ -270,7 +271,12 @@ func (s *EmailService) sendResolved(cfg resolvedConfig, to, subject, htmlBody st
 // the resolved config names. This is the single point every provider
 // goes through, so retry, logging and the attribution footer above are
 // shared and provider-agnostic.
+//
+// The subject is built from settings and names (site, product), so a
+// line break in one must not start a header of its own; and a header
+// carries only ASCII, so the rest is encoded (RFC 2047).
 func (s *EmailService) deliver(cfg resolvedConfig, to, subject, htmlBody string) error {
+	subject = subjectLine.Replace(subject)
 	switch cfg.provider {
 	case "cloudflare":
 		ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
@@ -280,7 +286,7 @@ func (s *EmailService) deliver(cfg resolvedConfig, to, subject, htmlBody string)
 		msg := []byte(strings.Join([]string{
 			"From: " + cfg.from,
 			"To: " + to,
-			"Subject: " + subject,
+			"Subject: " + mime.QEncoding.Encode("utf-8", subject),
 			"MIME-Version: 1.0",
 			"Content-Type: text/html; charset=UTF-8",
 			"",
@@ -402,11 +408,13 @@ func (s *EmailService) sendSMTP(cfg resolvedConfig, addr, to string, msg []byte)
 
 	// STARTTLS upgrade if the server advertises it. (Client.StartTLS
 	// internally re-EHLOs so post-TLS extensions land in c.Extension.)
-	// Already encrypted on an implicit-TLS port, where the server does
-	// not advertise the extension at all.
-	if ok, _ := c.Extension("STARTTLS"); ok {
-		if err := c.StartTLS(tlsCfg); err != nil {
-			return smtpErr("starttls", err, false)
+	// Implicit-TLS connections are already encrypted, even if the server
+	// still advertises STARTTLS.
+	if !cfg.implicitTLS() {
+		if ok, _ := c.Extension("STARTTLS"); ok {
+			if err := c.StartTLS(tlsCfg); err != nil {
+				return smtpErr("starttls", err, false)
+			}
 		}
 	}
 
@@ -636,6 +644,9 @@ func parseEnvelopeAddress(from string) (string, error) {
 	return a.Address, nil
 }
 
+// subjectLine keeps a subject on one line.
+var subjectLine = strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ")
+
 // validateSMTPLine rejects strings containing CR or LF so callers
 // can't smuggle additional SMTP commands through a header value.
 func validateSMTPLine(s string) error {
@@ -678,13 +689,19 @@ func (s *EmailService) SendLicenseCreated(to, productName, planName, licenseKey,
 // out in daysLeft days, on expiresAt. The reminder job queues it (see
 // ExpiryChecker.remindExpiring) rather than sending it, for the reasons
 // RenderUpdatesEnding gives.
-func (s *EmailService) RenderLicenseExpiring(productName, licenseKey, expiresAt string, daysLeft int, trial bool) (subject, body string) {
+//
+// fallbackPlan is the plan a trial moves to when it ends (the trial
+// plan's TrialFallbackPlanID), or "" when it simply expires: the
+// reminder must not tell a customer they will lose access when they
+// will in fact carry on, on that plan.
+func (s *EmailService) RenderLicenseExpiring(productName, licenseKey, expiresAt string, daysLeft int, trial bool, fallbackPlan string) (subject, body string) {
 	body = s.renderEmail("license_expiring", tmplLicenseExpiring, s.templateData(map[string]any{
-		"Product":    productName,
-		"LicenseKey": licenseKey,
-		"ExpiresAt":  expiresAt,
-		"DaysLeft":   daysLeft,
-		"IsTrial":    trial,
+		"Product":      productName,
+		"LicenseKey":   licenseKey,
+		"ExpiresAt":    expiresAt,
+		"DaysLeft":     daysLeft,
+		"IsTrial":      trial,
+		"FallbackPlan": fallbackPlan,
 	}))
 	subject = productName + " license expiring soon"
 	if trial {
@@ -747,7 +764,7 @@ func (s *EmailService) SendSeatInvite(to, productName, inviterName, acceptURL, d
 	// contain the claim URL (custom template missed the placeholder),
 	// append it so the recipient still has a way in.
 	if acceptURL != "" && !strings.Contains(body, acceptURL) {
-		body += `<p style="margin-top:24px;font-size:13px;color:#555;">Accept the invitation: <a href="` + acceptURL + `">` + acceptURL + `</a></p>`
+		body += `<p style="margin-top:24px;font-size:13px;color:#555;">Accept the invitation: <a href="` + html.EscapeString(acceptURL) + `">` + html.EscapeString(acceptURL) + `</a></p>`
 	}
 	go func() {
 		if err := s.Send(to, "You've been invited to "+productName, body); err != nil {
@@ -770,12 +787,19 @@ func (s *EmailService) SendLicenseExpired(to, productName string) {
 	}()
 }
 
-func (s *EmailService) SendTrialExpired(to, productName string) {
+// SendTrialExpired tells a customer their trial has ended. fallbackPlan
+// is the plan the licence moved to (the trial plan's
+// TrialFallbackPlanID), or "" when it expired: one email for the end of
+// a trial either way, so the customer reads what happened to it rather
+// than a bare change of plan names, and the operator writes it once in
+// the template editor.
+func (s *EmailService) SendTrialExpired(to, productName, fallbackPlan string) {
 	if s.skipDisabled("trial_expired", to) {
 		return
 	}
 	body := s.renderEmail("trial_expired", tmplTrialExpired, s.templateData(map[string]any{
-		"Product": productName,
+		"Product":      productName,
+		"FallbackPlan": fallbackPlan,
 	}))
 	go func() {
 		if err := s.Send(to, productName+" trial has ended", body); err != nil {
@@ -808,14 +832,14 @@ func (s *EmailService) SendSubscriptionCanceled(to, productName string, immediat
 		tmpl = `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
 <h2>Subscription Canceled</h2>
-<p>Your <strong>` + productName + `</strong> subscription has been canceled immediately.</p>
+<p>Your <strong>` + html.EscapeString(productName) + `</strong> subscription has been canceled immediately.</p>
 <p>Your access has ended. Thank you for being a customer.</p>
 </body></html>`
 	} else {
 		tmpl = `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
 <h2>Subscription Will Be Canceled</h2>
-<p>Your <strong>` + productName + `</strong> subscription will be canceled at the end of the current billing period.</p>
+<p>Your <strong>` + html.EscapeString(productName) + `</strong> subscription will be canceled at the end of the current billing period.</p>
 <p>You can continue using the service until then.</p>
 </body></html>`
 	}
@@ -826,53 +850,54 @@ func (s *EmailService) SendSubscriptionCanceled(to, productName string, immediat
 	}()
 }
 
-func (s *EmailService) SendPaymentFailed(to, productName string) {
-	if s.skipDisabled("payment_failed", to) {
-		return
-	}
-	body := s.renderEmail("payment_failed", tmplPaymentFailed, s.templateData(map[string]any{
+// RenderPaymentFailed builds the first step of the dunning ladder, a
+// day into a past-due episode. Like the other dunning steps, the
+// reminder job queues it rather than sending it: a mail sent from the
+// loop and lost to an SMTP outage would leave the customer untold
+// until the license expires, and the queue retries it.
+func (s *EmailService) RenderPaymentFailed(productName string) (subject, body string) {
+	body = s.renderEmail("payment_failed", tmplPaymentFailed, s.templateData(map[string]any{
 		"Product": productName,
 	}))
-	go func() {
-		if err := s.Send(to, productName+" payment failed", body); err != nil {
-			s.logger.Error("email delivery failed", "to", to, "subject", productName+" payment failed", "error", err)
-		}
-	}()
+	return productName + " payment failed", body
 }
 
-func (s *EmailService) SendDunningSecond(to, productName string) {
-	if s.skipDisabled("payment_failed", to) {
-		return
-	}
-	body := `<!DOCTYPE html>
+// RenderDunningSecond builds the dunning step sent a week into a
+// past-due episode. The reminder job queues it.
+func (s *EmailService) RenderDunningSecond(productName string) (subject, body string) {
+	body = `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
 <h2 style="color: #d97706;">Payment Still Outstanding</h2>
-<p>We've been unable to process your payment for <strong>` + productName + `</strong> for over a week.</p>
+<p>We've been unable to process your payment for <strong>` + html.EscapeString(productName) + `</strong> for over a week.</p>
 <p>Please update your payment method to avoid losing access.</p>
 </body></html>`
-	go func() {
-		if err := s.Send(to, productName+" — payment still outstanding", body); err != nil {
-			s.logger.Error("email delivery failed", "to", to, "error", err)
-		}
-	}()
+	return productName + " — payment still outstanding", body
 }
 
-func (s *EmailService) SendDunningFinal(to, productName string) {
-	if s.skipDisabled("payment_failed", to) {
-		return
-	}
-	body := `<!DOCTYPE html>
+// RenderDunningFinal builds the last dunning step, two weeks into a
+// past-due episode. The reminder job queues it.
+func (s *EmailService) RenderDunningFinal(productName string) (subject, body string) {
+	body = `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
 <h2 style="color: #dc2626;">Final Notice — Access Will Be Suspended</h2>
-<p>Your <strong>` + productName + `</strong> payment has been overdue for 14 days.</p>
+<p>Your <strong>` + html.EscapeString(productName) + `</strong> payment has been overdue for 14 days.</p>
 <p>Your access will be suspended soon if payment is not received.</p>
 <p>Please update your payment method immediately.</p>
 </body></html>`
-	go func() {
-		if err := s.Send(to, productName+" — final payment notice", body); err != nil {
-			s.logger.Error("email delivery failed", "to", to, "error", err)
-		}
-	}()
+	return productName + " — final payment notice", body
+}
+
+// RenderAdminInvite builds the admin invite. The login link comes from
+// BASE_URL, like every other link Keygate mails: the request that made
+// the invite says nothing reliable about the public address, and behind
+// a proxy it read as http://127.0.0.1:9000.
+func (s *EmailService) RenderAdminInvite(siteName, inviterName, role string) (subject, body string) {
+	return "You've been added to " + siteName, s.renderEmail("admin_invite", tmplAdminInvite, map[string]string{
+		"SiteName": siteName,
+		"Inviter":  inviterName,
+		"Role":     role,
+		"LoginURL": s.baseURL + "/login",
+	})
 }
 
 // SendAdminInvite notifies a Keygate platform operator that they
@@ -884,15 +909,9 @@ func (s *EmailService) SendDunningFinal(to, productName string) {
 // Best-effort: a delivery failure does NOT roll back the role
 // grant on the InviteTeamMember handler. The recipient can still
 // learn out-of-band that they're admin.
-func (s *EmailService) SendAdminInvite(to, siteName, inviterName, role, loginURL string) {
-	body := s.renderEmail("admin_invite", tmplAdminInvite, map[string]string{
-		"SiteName": siteName,
-		"Inviter":  inviterName,
-		"Role":     role,
-		"LoginURL": loginURL,
-	})
+func (s *EmailService) SendAdminInvite(to, siteName, inviterName, role string) {
+	subj, body := s.RenderAdminInvite(siteName, inviterName, role)
 	go func() {
-		subj := "You've been added to " + siteName
 		if err := s.Send(to, subj, body); err != nil {
 			s.logger.Error("email delivery failed", "to", to, "subject", subj, "error", err)
 		}
@@ -910,7 +929,7 @@ func (s *EmailService) SendPaymentRecovered(to, productName string) {
 	body := `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
 <h2 style="color: #059669;">Payment Recovered — Thanks!</h2>
-<p>Your payment for <strong>` + productName + `</strong> went through. Your subscription is active again, and access is fully restored.</p>
+<p>Your payment for <strong>` + html.EscapeString(productName) + `</strong> went through. Your subscription is active again, and access is fully restored.</p>
 <p>No further action required.</p>
 </body></html>`
 	go func() {
@@ -924,14 +943,20 @@ func (s *EmailService) SendWelcome(to, name string) {
 	if s.skipDisabled("welcome", to) {
 		return
 	}
-	body := `<!DOCTYPE html>
-<html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-<h2>Welcome to Keygate!</h2>
-<p>Hi ` + name + `, your account has been created.</p>
-<p>You can manage your licenses and subscriptions from your portal.</p>
-</body></html>`
+	// Self-hosted installs set site_name; stock Keygate keeps the
+	// project name so an empty setting still greets as Keygate.
+	data := s.templateData(map[string]any{"Name": name})
+	site, _ := data["SiteName"].(string)
+	site = strings.TrimSpace(site)
+	data["SiteName"] = site
+	if site == "" {
+		site = branding.Project
+		data["SiteName"] = site
+	}
+	body := s.renderEmail("welcome", tmplWelcome, data)
+	subject := "Welcome to " + site
 	go func() {
-		if err := s.Send(to, "Welcome to Keygate", body); err != nil {
+		if err := s.Send(to, subject, body); err != nil {
 			s.logger.Error("email delivery failed", "to", to, "error", err)
 		}
 	}()
@@ -959,7 +984,7 @@ func (s *EmailService) SendPlanChanged(to, productName, oldPlan, newPlan string)
 	body := `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
 <h2>Plan Changed</h2>
-<p>Your <strong>` + productName + `</strong> plan has been changed from <strong>` + oldPlan + `</strong> to <strong>` + newPlan + `</strong>.</p>
+<p>Your <strong>` + html.EscapeString(productName) + `</strong> plan has been changed from <strong>` + html.EscapeString(oldPlan) + `</strong> to <strong>` + html.EscapeString(newPlan) + `</strong>.</p>
 </body></html>`
 	go func() {
 		if err := s.Send(to, productName+" plan changed", body); err != nil {
@@ -987,8 +1012,8 @@ func (s *EmailService) SendPaymentActionRequired(to, productName, invoiceURL str
 	body := `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
 <h2 style="color: #d97706;">Payment Authentication Required</h2>
-<p>Your payment for <strong>` + productName + `</strong> requires additional authentication.</p>
-<p><a href="` + invoiceURL + `" style="display:inline-block;background:#2563eb;color:white;padding:10px 24px;border-radius:6px;text-decoration:none;">Complete Payment</a></p>
+<p>Your payment for <strong>` + html.EscapeString(productName) + `</strong> requires additional authentication.</p>
+<p><a href="` + html.EscapeString(invoiceURL) + `" style="display:inline-block;background:#2563eb;color:white;padding:10px 24px;border-radius:6px;text-decoration:none;">Complete Payment</a></p>
 <p style="color:#666;font-size:14px;">If you don't complete this step, your subscription may be interrupted.</p>
 </body></html>`
 	go func() {
@@ -1005,7 +1030,7 @@ func (s *EmailService) SendTrialEnding(to, productName, trialEnd string) {
 	body := `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
 <h2>Your Trial is Ending Soon</h2>
-<p>Your <strong>` + productName + `</strong> trial ends on <strong>` + trialEnd + `</strong>.</p>
+<p>Your <strong>` + html.EscapeString(productName) + `</strong> trial ends on <strong>` + html.EscapeString(trialEnd) + `</strong>.</p>
 <p>After the trial, your subscription will begin automatically. No action needed if you'd like to continue.</p>
 <p style="color:#666;font-size:14px;">If you'd like to cancel, you can do so from your account portal before the trial ends.</p>
 </body></html>`
@@ -1075,6 +1100,17 @@ func (s *EmailService) processQueue(ctx context.Context, db *store.Store) {
 		if err != nil || e == nil {
 			return
 		}
+		outdated, err := db.IsOutdatedDunningEmail(ctx, e.ID)
+		if err != nil {
+			// Unknown whether the customer has paid. Nothing is lost by
+			// waiting: the claim lapses and the mail comes round again.
+			s.logger.Warn("email queue: could not check a dunning notice; leaving it for later", "email_id", e.ID, "error", err)
+			continue
+		}
+		if outdated {
+			db.MarkEmailFailedPermanent(ctx, e.ID, e.ClaimToken, "license is no longer in this past-due episode")
+			continue
+		}
 		if err := s.sendResolved(cfg, e.ToAddr, e.Subject, e.Body); err != nil {
 			switch {
 			case isPermanent(err):
@@ -1134,7 +1170,7 @@ var templateSample = map[string]any{
 	"Product": "Product", "Plan": "Pro", "LicenseKey": "KEY", "ExpiresAt": "2026-01-01",
 	"UpdatesUntil": "2026-01-01", "Feature": "api_calls", "Used": int64(80), "Limit": int64(100),
 	"Pct": 80, "Inviter": "a@example.com", "InviteURL": "https://example.com/i", "Reason": "reason",
-	"DaysLeft": 3, "IsTrial": true, "DownloadURL": "https://example.com/d", "SiteName": "Site",
+	"DaysLeft": 3, "IsTrial": true, "FallbackPlan": "Free", "DownloadURL": "https://example.com/d", "SiteName": "Site",
 	"PortalURL": "https://example.com/portal", "Role": "admin", "LoginURL": "https://example.com/login",
 }
 
@@ -1166,6 +1202,13 @@ func renderTemplate(tmplStr string, data any) string {
 	return buf.String()
 }
 
+const tmplWelcome = `<!DOCTYPE html>
+<html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+<h2>Welcome to {{.SiteName}}!</h2>
+<p>Hi {{.Name}}, your account has been created.</p>
+<p>You can manage your licenses and subscriptions from your portal.</p>
+</body></html>`
+
 const tmplLicenseCreated = `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
 <h2 style="color: #111;">Your {{.Product}} License</h2>
@@ -1181,10 +1224,11 @@ const tmplLicenseCreated = `<!DOCTYPE html>
 
 const tmplLicenseExpiring = `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-<h2 style="color: #111;">{{if .IsTrial}}Trial{{else}}License{{end}} Expiring Soon</h2>
-<p>Your <strong>{{.Product}}</strong> {{if .IsTrial}}trial{{else}}license{{end}} expires on <strong>{{.ExpiresAt}}</strong> (days remaining: {{.DaysLeft}}).</p>
+<h2 style="color: #111;">{{if .IsTrial}}Trial Ending Soon{{else}}License Expiring Soon{{end}}</h2>
+<p>Your <strong>{{.Product}}</strong> {{if .IsTrial}}trial ends{{else}}license expires{{end}} on <strong>{{.ExpiresAt}}</strong> (days remaining: {{.DaysLeft}}).</p>
 <p>License key: <code>{{.LicenseKey}}</code></p>
-<p>{{if .IsTrial}}Choose a plan before then to keep using it.{{else}}Please renew to avoid service interruption.{{end}}</p>
+<p>{{if .IsTrial}}{{if .FallbackPlan}}After that your license moves to the <strong>{{.FallbackPlan}}</strong> plan, with the same key, within that plan's limits. To keep more than it offers, choose a plan before then.{{else}}Choose a plan before then to keep using it.{{end}}{{else}}Please renew to avoid service interruption.{{end}}</p>
+{{if and .IsTrial .PortalURL}}<p><a href="{{.PortalURL}}">Open your account</a></p>{{end}}
 </body></html>`
 
 const tmplUpdatesEnding = `<!DOCTYPE html>
@@ -1251,5 +1295,6 @@ const tmplTrialExpired = `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
 <h2 style="color: #d97706;">Trial Period Ended</h2>
 <p>Your <strong>{{.Product}}</strong> trial has ended.</p>
-<p>Subscribe to a paid plan to continue using all features.</p>
+<p>{{if .FallbackPlan}}Your license carries on with the <strong>{{.FallbackPlan}}</strong> plan, with the same key, and that plan's limits now apply. Choose a paid plan from your account to get more.{{else}}Subscribe to a paid plan to continue using all features.{{end}}</p>
+{{if .PortalURL}}<p><a href="{{.PortalURL}}">Open your account</a></p>{{end}}
 </body></html>`

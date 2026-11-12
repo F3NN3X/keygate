@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -33,6 +35,8 @@ type Store struct {
 	// feedTTL is how long this install signs the presigned links
 	// inside a public feed for; see SetFeedURLTTL.
 	feedTTL time.Duration
+	// dsn opens the pool RunMigrations uses; see migrationDB.
+	dsn string
 }
 
 func New(dsn string) (*Store, error) {
@@ -46,10 +50,62 @@ func New(dsn string) (*Store, error) {
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("ping: %w", err)
 	}
-	return &Store{DB: db}, nil
+	return &Store{DB: db, dsn: dsn}, nil
 }
 
 func (s *Store) Close() error { return s.DB.Close() }
+
+const (
+	// migrationLockWait is how long RunMigrations waits for another
+	// instance to finish its migrations before giving up.
+	migrationLockWait = 10 * time.Minute
+	// migrationTimeout bounds each statement of a migration, and with
+	// migrationGrace the whole of one migration file.
+	migrationTimeout = 5 * time.Minute
+	// migrationGrace is how much longer the client waits than the server
+	// is told to, so the server's own timeout ends a statement or a lock
+	// wait first. A client deadline does not end it: the driver only
+	// closes its socket, and the backend runs on, or stays queued for the
+	// lock, after the client has given up.
+	migrationGrace = 30 * time.Second
+)
+
+// migrationTableLockWait bounds how long one migration waits for a lock
+// on a table it changes. While it waits, every query on that table
+// queues behind it, and so does every query on the tables it has
+// already locked, so a migration stuck behind a long transaction (an
+// export, a session idle in a transaction) would hold up all that
+// traffic for as long as it waited. Instead it gives up quickly, rolls
+// back, and is tried again after migrationLockBackoff; each file runs in
+// one transaction, so a retry starts clean. A deadlock the server breaks
+// against the migration is retried the same way. Variables so tests can
+// shorten them.
+var (
+	migrationTableLockWait = 2 * time.Second
+	migrationLockBackoff   = func(attempt int) time.Duration { return time.Duration(min(attempt, 5)) * time.Second }
+	// migrationLockAttempts is how many times one migration is tried
+	// before RunMigrations gives up: about four and a half minutes with
+	// the above.
+	migrationLockAttempts = 40
+)
+
+// migrationDB opens the connection RunMigrations holds its lock and
+// applies migrations on. The driver bounds every read, at 10 seconds by
+// default, deadline or not, which the store's pool keeps for ordinary
+// queries; here it would fail any migration longer than that, an index
+// on a large table say, and any wait for another instance's run. This
+// one waits as long as the longest of those, so that a read that never
+// returns, a COMMIT say, still ends; lock_timeout, statement_timeout and
+// the contexts RunMigrations sets are what end the rest.
+func (s *Store) migrationDB() (*bun.DB, error) {
+	if s.dsn == "" {
+		return nil, errors.New("run migrations: store not opened with New")
+	}
+	sqldb := sql.OpenDB(pgdriver.NewConnector(pgdriver.WithDSN(s.dsn),
+		pgdriver.WithReadTimeout(migrationLockWait+migrationGrace)))
+	sqldb.SetMaxOpenConns(1)
+	return bun.NewDB(sqldb, pgdialect.New()), nil
+}
 
 // RunMigrations executes all .up.sql files from the migrations directory in order.
 // Guarantees:
@@ -78,11 +134,52 @@ func (s *Store) RunMigrations(dir string) error {
 
 	// Acquire advisory lock to prevent concurrent migration across instances.
 	// Lock ID 7367616 = crc32("keygate_migrations") — unique per application.
-	if _, err := s.DB.ExecContext(ctx, "SELECT pg_advisory_lock(7367616)"); err != nil {
+	// The lock belongs to a session, so it is taken, held and released on
+	// one pinned connection, and the migrations run on that connection
+	// too. Through the pool, the lock lived on whichever connection ran
+	// the statement: the pool closes a connection that outlives
+	// ConnMaxLifetime, which dropped the lock partway through a long run,
+	// and an unlock could land on another connection, leaving the lock
+	// held by an idle one. Running the migrations on the lock's session
+	// means the lock cannot end while one still runs: a session the
+	// server ends (idle_session_timeout, a dropped connection) ends the
+	// migration with it, and a migration whose client gave up keeps the
+	// lock until its backend has finished.
+	mdb, err := s.migrationDB()
+	if err != nil {
+		return err
+	}
+	defer mdb.Close()
+	// The context covers connecting too, which the pool leaves unbounded.
+	lockCtx, cancelLock := context.WithTimeout(ctx, migrationLockWait+migrationGrace)
+	defer cancelLock()
+	lockConn, err := mdb.Conn(lockCtx)
+	if err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	defer lockConn.Close()
+	// lock_timeout alone bounds the wait: a statement_timeout set for the
+	// role or database would otherwise cut it short.
+	if _, err := lockConn.ExecContext(lockCtx, fmt.Sprintf("SET lock_timeout = %d; SET statement_timeout = 0", migrationLockWait.Milliseconds())); err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	if _, err := lockConn.ExecContext(lockCtx, "SELECT pg_advisory_lock(7367616)"); err != nil {
+		if isLockTimeout(err) {
+			return fmt.Errorf("acquire migration lock: another instance has been migrating for over %v: %w", migrationLockWait, err)
+		}
 		return fmt.Errorf("acquire migration lock: %w", err)
 	}
 	defer func() {
-		_, _ = s.DB.ExecContext(ctx, "SELECT pg_advisory_unlock(7367616)")
+		unlockCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		var released bool
+		if err := lockConn.NewRaw("SELECT pg_advisory_unlock(7367616)").Scan(unlockCtx, &released); err != nil {
+			slog.Warn("release migration lock", "error", err)
+		} else if !released {
+			// Another session answered, as behind a pooler in transaction
+			// mode, which session locks do not survive.
+			slog.Warn("release migration lock: not held by this session")
+		}
 	}()
 
 	// Verify checksums of previously applied migrations
@@ -90,7 +187,11 @@ func (s *Store) RunMigrations(dir string) error {
 		Filename string `bun:"filename"`
 		Checksum string `bun:"checksum"`
 	}
-	_ = s.DB.NewRaw("SELECT filename, checksum FROM schema_migrations ORDER BY filename").Scan(ctx, &existing)
+	// A failed read must not pass for "none applied", which would run
+	// every migration again.
+	if err := s.DB.NewRaw("SELECT filename, checksum FROM schema_migrations ORDER BY filename").Scan(ctx, &existing); err != nil {
+		return fmt.Errorf("read applied migrations: %w", err)
+	}
 	checksumMap := make(map[string]string, len(existing))
 	for _, e := range existing {
 		checksumMap[e.Filename] = e.Checksum
@@ -121,15 +222,20 @@ func (s *Store) RunMigrations(dir string) error {
 		}
 
 		// Apply migration: SQL execution + tracking record in ONE transaction
-		migCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		applyOnce := func() error {
+			migCtx, cancel := context.WithTimeout(ctx, migrationTimeout+migrationGrace)
+			defer cancel()
 
-		tx, err := s.DB.BeginTx(migCtx, nil)
-		if err != nil {
-			cancel()
-			return fmt.Errorf("begin tx for %s: %w", entry.Name(), err)
-		}
+			tx, err := lockConn.BeginTx(migCtx, nil)
+			if err != nil {
+				return fmt.Errorf("begin tx for %s: %w", entry.Name(), err)
+			}
+			if _, err := tx.ExecContext(migCtx, fmt.Sprintf("SET LOCAL statement_timeout = %d; SET LOCAL lock_timeout = %d",
+				migrationTimeout.Milliseconds(), migrationTableLockWait.Milliseconds())); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("begin tx for %s: %w", entry.Name(), err)
+			}
 
-		execErr := func() error {
 			if _, err := tx.ExecContext(migCtx, string(data)); err != nil {
 				errMsg := err.Error()
 				// Handle pre-existing objects (from before migration tracking was added)
@@ -160,11 +266,25 @@ func (s *Store) RunMigrations(dir string) error {
 				return fmt.Errorf("commit %s: %w", entry.Name(), err)
 			}
 			return nil
-		}()
+		}
 
-		cancel()
-
+		var execErr error
+		for attempt := 1; ; attempt++ {
+			execErr = applyOnce()
+			if execErr == nil || !(isLockTimeout(execErr) || isDeadlock(execErr)) || attempt == migrationLockAttempts {
+				break
+			}
+			wait := migrationLockBackoff(attempt)
+			slog.Warn("migration could not lock a table in time; retrying",
+				"file", entry.Name(), "attempt", attempt, "lock_wait", migrationTableLockWait, "retry_in", wait,
+				"error", execErr, "long_transactions", s.longTransactions(ctx, lockConn))
+			time.Sleep(wait)
+		}
 		if execErr != nil {
+			if isLockTimeout(execErr) || isDeadlock(execErr) {
+				return fmt.Errorf("%w (a long transaction kept a table locked through %d attempts; end it and restart: %s)",
+					execErr, migrationLockAttempts, s.longTransactions(ctx, lockConn))
+			}
 			return execErr
 		}
 
@@ -176,6 +296,35 @@ func (s *Store) RunMigrations(dir string) error {
 		slog.Info("migrations complete", "applied", applied)
 	}
 	return nil
+}
+
+// longTransactions describes the oldest transactions open on this
+// database, for the log when a migration cannot get its locks: one of
+// them is likely what holds the table.
+func (s *Store) longTransactions(ctx context.Context, conn bun.Conn) string {
+	qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var rows []struct {
+		PID   int    `bun:"pid"`
+		State string `bun:"state"`
+		Age   string `bun:"age"`
+		Query string `bun:"query"`
+	}
+	if err := conn.NewRaw(`SELECT pid, coalesce(state, '') AS state,
+		date_trunc('second', now() - xact_start)::text AS age, left(coalesce(query, ''), 120) AS query
+		FROM pg_stat_activity
+		WHERE datname = current_database() AND pid <> pg_backend_pid() AND xact_start < now() - interval '1 second'
+		ORDER BY xact_start LIMIT 5`).Scan(qctx, &rows); err != nil {
+		return "unknown (" + err.Error() + ")"
+	}
+	if len(rows) == 0 {
+		return "none open now"
+	}
+	parts := make([]string, len(rows))
+	for i, r := range rows {
+		parts[i] = fmt.Sprintf("pid %d %s for %s: %s", r.PID, r.State, r.Age, r.Query)
+	}
+	return strings.Join(parts, "; ")
 }
 
 func checksumBytes(data []byte) string {
@@ -566,6 +715,17 @@ func (s *Store) prepareLicenseForInsert(l *model.License) error {
 	return nil
 }
 
+// NewLicenseKey generates a key for a license of the product, with the
+// prefix that product has now.
+func (s *Store) NewLicenseKey(ctx context.Context, productID string) (string, error) {
+	var prefix string
+	if err := s.DB.NewSelect().Table("products").Column("license_prefix").
+		Where("id = ?", productID).Scan(ctx, &prefix); err != nil {
+		return "", fmt.Errorf("license prefix of product %s: %w", productID, err)
+	}
+	return license.GenerateKey(prefix), nil
+}
+
 func (s *Store) CreateLicense(ctx context.Context, l *model.License) error {
 	if err := s.prepareLicenseForInsert(l); err != nil {
 		return err
@@ -577,6 +737,15 @@ func (s *Store) CreateLicense(ctx context.Context, l *model.License) error {
 // CreateLicenseWithSubscription creates a license and, for subscription/trial plans,
 // a subscription record in a single transaction to prevent orphan records.
 func (s *Store) CreateLicenseWithSubscription(ctx context.Context, l *model.License, plan *model.Plan) error {
+	return s.createLicenseWithSubscription(ctx, l, plan, nil)
+}
+
+// createLicenseWithSubscription is CreateLicenseWithSubscription with
+// an optional guard, run on the transaction once the plan and product
+// rows are locked and before anything is written; an error from it
+// rolls the whole write back.
+func (s *Store) createLicenseWithSubscription(ctx context.Context, l *model.License, plan *model.Plan,
+	guard func(ctx context.Context, tx bun.Tx) error) error {
 	if err := s.prepareLicenseForInsert(l); err != nil {
 		return err
 	}
@@ -592,6 +761,11 @@ func (s *Store) CreateLicenseWithSubscription(ctx context.Context, l *model.Lice
 	// edit. Locking them also pins the plan for the checks below.
 	if err := LockReferencedRowsIn(ctx, tx, l.PlanID, l.ProductID); err != nil {
 		return err
+	}
+	if guard != nil {
+		if err := guard(ctx, tx); err != nil {
+			return err
+		}
 	}
 
 	// The plan the caller read may have been retyped since — a
@@ -693,29 +867,53 @@ func (s *Store) CreateLicenseWithSubscription(ctx context.Context, l *model.Lice
 	return tx.Commit()
 }
 
+// FindLicenseByKey finds the licence a key opens: the licence's own key,
+// or a team member's (see Store.MemberKey), which opens the licence the
+// member belongs to and sets KeySeat to their seat. A removed member's
+// key is cleared, so it opens nothing; nor does a member's key while the
+// product has no seats (its type changed), when the team cannot be
+// managed and so a member could not be removed.
 func (s *Store) FindLicenseByKey(ctx context.Context, key string) (*model.License, error) {
 	keyHash := license.HashKey(key)
+	l, err := s.findLicenseWhere(ctx, "license.key_hash = ?", keyHash)
+	if err == nil || !errors.Is(err, sql.ErrNoRows) {
+		return l, err
+	}
+	seat := new(model.Seat)
+	err = s.DB.NewSelect().Model(seat).
+		Where("member_key_hash = ? AND removed_at IS NULL AND accepted_at IS NOT NULL", keyHash).
+		Scan(ctx)
+	if err == nil {
+		l, err := s.findLicenseWhere(ctx, "license.id = ?", seat.LicenseID)
+		if err != nil {
+			return l, err
+		}
+		if l.Product == nil || !model.ProductSupports(l.Product.Type, model.CapSeats) {
+			return nil, sql.ErrNoRows
+		}
+		if l.KeySeatPaused, err = s.SeatPaused(ctx, seat.ID); err != nil {
+			return nil, err
+		}
+		l.KeySeat = seat
+		return l, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	// Fallback to plaintext for un-migrated keys.
+	return s.findLicenseWhere(ctx, "license.license_key = ?", key)
+}
+
+func (s *Store) findLicenseWhere(ctx context.Context, where string, arg any) (*model.License, error) {
+	// A fresh model each time, so a failed lookup leaves nothing behind.
 	l := new(model.License)
-	err := s.DB.NewSelect().Model(l).
+	return l, s.DB.NewSelect().Model(l).
 		Relation("Product").
 		Relation("Plan").
 		Relation("Plan.Entitlements").
 		Relation("Activations").
-		Where("license.key_hash = ?", keyHash).
+		Where(where, arg).
 		Scan(ctx)
-	if err != nil {
-		// Fallback to plaintext for un-migrated keys — use fresh model
-		// to avoid mixing partial state from the failed hash lookup.
-		l = new(model.License)
-		return l, s.DB.NewSelect().Model(l).
-			Relation("Product").
-			Relation("Plan").
-			Relation("Plan.Entitlements").
-			Relation("Activations").
-			Where("license.license_key = ?", key).
-			Scan(ctx)
-	}
-	return l, nil
 }
 
 func (s *Store) FindLicenseByStripeSubscription(ctx context.Context, subID string) (*model.License, error) {
@@ -794,8 +992,9 @@ func (s *Store) UpdateLicenseFromSubscription(ctx context.Context, lic *model.Li
 
 // ErrLicenseRestricted reports that a Stripe-driven write was refused
 // because the licence's own state forbids it: revoked, suspended by an
-// operator, or canceled with nothing but an event payload (no current
-// read of Stripe) saying otherwise. Nothing was written — no status, no
+// operator, canceled with nothing but an event payload (no current read
+// of Stripe) saying otherwise, or a pause meeting a licence an operator
+// suspended or that ended. Nothing was written — no status, no
 // dates — and the caller must not announce the change.
 var ErrLicenseRestricted = errors.New("license state does not allow this subscription change")
 
@@ -814,6 +1013,150 @@ var ErrStaleSubscriptionRead = errors.New("a newer read of this subscription is 
 // state.
 func (s *Store) UpdateLicenseFromSubscriptionRead(ctx context.Context, lic *model.License, asOf time.Time, cols ...string) error {
 	return s.updateLicenseAndSubscription(ctx, lic, true, &asOf, cols...)
+}
+
+// LicenseTerms are what a licence is paid for: its plan and how many
+// seats.
+type LicenseTerms struct {
+	PlanID   string `bun:"plan_id"`
+	Quantity int    `bun:"quantity"`
+}
+
+// UpdateLicenseFromSubscriptionReadTerms is UpdateLicenseFromSubscriptionRead
+// for a write that may move the licence's plan or quantity. It returns
+// them as they stood under the row lock just before the write, so the
+// caller announces a change only when this write is the one that made
+// it: two deliveries of the same change both find the old values in
+// their own copy of the licence, and only the first finds them here.
+//
+// A licence an operator suspended refuses the write (ErrLicenseRestricted)
+// but still takes the plan and seats Stripe bills, so it does not come
+// back from the suspension with seats nobody pays for. written says the
+// terms were written, either way: not while a downgrade holds them (see
+// LowerLicenseTerms) and this read still shows the old ones.
+func (s *Store) UpdateLicenseFromSubscriptionReadTerms(ctx context.Context, lic *model.License, asOf time.Time, cols ...string) (before LicenseTerms, written bool, err error) {
+	restricted, held := false, false
+	err = RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		var row struct {
+			LicenseTerms
+			Held bool `bun:"held"`
+		}
+		if err := tx.NewRaw(`SELECT plan_id, quantity, COALESCE(terms_held_until > clock_timestamp(), false) AS held
+			FROM licenses WHERE id = ? FOR UPDATE`, lic.ID).Scan(ctx, &row); errors.Is(err, sql.ErrNoRows) {
+			return ErrSubscriptionUnlinked // a licence that is gone is unlinked too
+		} else if err != nil {
+			return err
+		}
+		before = row.LicenseTerms
+		// While a downgrade may still be with Stripe (see
+		// LowerLicenseTerms) the plan and seats stay as it set them, unless
+		// this read shows them: then Stripe has made it, and the hold goes.
+		shows := lic.Quantity == before.Quantity && (!slices.Contains(cols, "plan_id") || lic.PlanID == before.PlanID)
+		if row.Held && !shows {
+			cols = slices.DeleteFunc(slices.Clone(cols), func(c string) bool { return c == "plan_id" || c == "quantity" })
+			held = true
+		}
+		written = !row.Held || shows
+		err := updateLicenseAndSubscriptionIn(ctx, tx, lic, true, &asOf, cols...)
+		// A hold the read shows the change for ends; so does one whose
+		// time is up, once terms are written over it.
+		if err == nil && slices.Contains(cols, "quantity") {
+			if _, err := tx.NewRaw("UPDATE licenses SET terms_held_until = NULL, terms_check_after = NULL WHERE id = ? AND terms_held_until IS NOT NULL", lic.ID).Exec(ctx); err != nil {
+				return err
+			}
+		}
+		if errors.Is(err, ErrLicenseRestricted) && slices.Contains(cols, "quantity") {
+			planID := before.PlanID
+			if slices.Contains(cols, "plan_id") {
+				planID = lic.PlanID
+			}
+			res, qerr := tx.NewRaw(`UPDATE licenses SET quantity = ?, plan_id = ?, stripe_synced_at = ?, updated_at = now()
+				WHERE id = ? AND stripe_subscription_id = ? AND (stripe_synced_at IS NULL OR stripe_synced_at <= ?)`,
+				lic.Quantity, planID, asOf, lic.ID, lic.StripeSubscriptionID, asOf).Exec(ctx)
+			if qerr != nil {
+				return qerr
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				return err
+			}
+			// The subscription row names the plan too.
+			if _, qerr := tx.NewRaw(`UPDATE subscriptions SET plan_id = ?, updated_at = now()
+				WHERE license_id = ? AND plan_id <> ?`, planID, lic.ID, planID).Exec(ctx); qerr != nil {
+				return qerr
+			}
+			restricted = true
+			return nil
+		}
+		return err
+	})
+	if err != nil {
+		return before, false, err
+	}
+	if restricted {
+		return before, written, ErrLicenseRestricted
+	}
+	if held {
+		return before, written, ErrTermsHeld
+	}
+	return before, written, nil
+}
+
+// ErrTermsHeld: the read was written but for the plan and seats, which a
+// downgrade holds (see LowerLicenseTerms) and the read did not show. A
+// caller that can be asked again later (a webhook) is, once the hold is
+// over.
+var ErrTermsHeld = errors.New("license terms are held by a downgrade")
+
+// LicenseTermsHeld reports whether a downgrade holds the licence's terms
+// now (see LowerLicenseTerms).
+func (s *Store) LicenseTermsHeld(ctx context.Context, licenseID string) (bool, error) {
+	var held bool
+	err := s.DB.NewRaw("SELECT COALESCE(terms_held_until > clock_timestamp(), false) FROM licenses WHERE id = ?", licenseID).Scan(ctx, &held)
+	return held, err
+}
+
+// FindLapsedTermHolds lists licences whose downgrade hold ran out with
+// no read since to settle it: the change's outcome was never known, and
+// no event may come to say. One whose last check could not finish waits
+// until its next check is due, behind the others. limit caps the batch.
+func (s *Store) FindLapsedTermHolds(ctx context.Context, limit int) ([]LapsedTermHold, error) {
+	var holds []LapsedTermHold
+	err := s.DB.NewRaw(`SELECT id, terms_held_until FROM licenses
+		WHERE terms_held_until IS NOT NULL AND terms_held_until <= clock_timestamp()
+		AND (terms_check_after IS NULL OR terms_check_after <= clock_timestamp())
+		ORDER BY terms_check_after NULLS FIRST, terms_held_until LIMIT ?`, limit).Scan(ctx, &holds)
+	return holds, err
+}
+
+// LapsedTermHold is a hold FindLapsedTermHolds found: the licence, and
+// the hold's end, which names it (a downgrade since holds until later).
+type LapsedTermHold struct {
+	LicenseID string    `bun:"id"`
+	Until     time.Time `bun:"terms_held_until"`
+}
+
+// PostponeTermsCheck puts off the next check of a lapsed hold by after,
+// keeping its record: the check could not finish, and is tried again
+// then. A hold placed since is another downgrade's, and is left alone.
+func (s *Store) PostponeTermsCheck(ctx context.Context, h LapsedTermHold, after time.Duration) error {
+	_, err := s.DB.NewRaw(`UPDATE licenses SET terms_check_after = clock_timestamp() + make_interval(secs => ?)
+		WHERE id = ? AND terms_held_until = ?`, after.Seconds(), h.LicenseID, h.Until).Exec(ctx)
+	return err
+}
+
+// SettleLapsedHold ends a lapsed hold once a check settled it. A hold
+// placed since is another downgrade's, and stays.
+func (s *Store) SettleLapsedHold(ctx context.Context, h LapsedTermHold) error {
+	_, err := s.DB.NewRaw(`UPDATE licenses SET terms_held_until = NULL, terms_check_after = NULL
+		WHERE id = ? AND terms_held_until = ?`, h.LicenseID, h.Until).Exec(ctx)
+	return err
+}
+
+// ReleaseLicenseTerms ends a downgrade's hold, once Stripe is known to
+// have made it: the next read sets the terms as Stripe has them.
+func (s *Store) ReleaseLicenseTerms(ctx context.Context, licenseID string) error {
+	_, err := s.DB.NewRaw("UPDATE licenses SET terms_held_until = NULL, terms_check_after = NULL WHERE id = ?", licenseID).Exec(ctx)
+	return err
 }
 
 // UpdateLicenseFromSubscriptionEnded is the write for a subscription that
@@ -844,8 +1187,43 @@ func (s *Store) updateLicenseAndSubscription(ctx context.Context, lic *model.Lic
 }
 
 func updateLicenseAndSubscriptionIn(ctx context.Context, tx bun.Tx, lic *model.License, stillLinked bool, asOf *time.Time, cols ...string) error {
+	// The row as this write finds it, under the lock the write keeps
+	// until commit: whether it ends a Stripe pause is told once, however
+	// many events race to apply the same resume.
+	var prior struct {
+		Status      string     `bun:"status"`
+		By          string     `bun:"by"`
+		PastDueAt   *time.Time `bun:"past_due_at"`
+		SuspendedAt *time.Time `bun:"suspended_at"`
+	}
+	if err := tx.NewRaw(`SELECT status, COALESCE(suspended_by, '') AS by, past_due_at, suspended_at FROM licenses WHERE id = ? FOR UPDATE`, lic.ID).
+		Scan(ctx, &prior); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	lic.WasStripePaused = prior.Status == model.StatusSuspended && prior.By == model.SuspendedByStripe
+	lic.WasCanceled = prior.Status == model.StatusCanceled
+	lic.WasExpired = prior.Status == model.StatusExpired
+	lic.WasRevoked = prior.Status == model.StatusRevoked
+	lic.WasPastDue, lic.PriorPastDueAt = prior.Status == model.StatusPastDue, prior.PastDueAt
+	// A licence already past due keeps the moment its episode began: two
+	// events entering it at once would each stamp their own, and the
+	// later one would restart the dunning ladder and the episode's notice.
+	if lic.Status == model.StatusPastDue && prior.Status == model.StatusPastDue && prior.PastDueAt != nil && slices.Contains(cols, "past_due_at") {
+		lic.PastDueAt = prior.PastDueAt
+	}
+	// Likewise a pause Stripe already made keeps its start when a later
+	// read shows it again.
+	if lic.Status == model.StatusSuspended && lic.WasStripePaused && prior.SuspendedAt != nil && slices.Contains(cols, "suspended_at") {
+		lic.SuspendedAt = prior.SuspendedAt
+	}
 	lic.UpdatedAt = time.Now()
 	allCols := append(append([]string{}, cols...), "updated_at")
+	// A subscription that ends ends a pause Stripe made with it; an
+	// operator's suspension stays on record.
+	if lic.Status == model.StatusCanceled && lic.WasStripePaused && !slices.Contains(cols, "suspended_by") {
+		lic.SuspendedAt, lic.SuspendedBy = nil, ""
+		allCols = append(allCols, "suspended_at", "suspended_by")
+	}
 	if asOf != nil {
 		lic.StripeSyncedAt = asOf
 		allCols = append(allCols, "stripe_synced_at")
@@ -865,10 +1243,21 @@ func updateLicenseAndSubscriptionIn(ctx context.Context, tx bun.Tx, lic *model.L
 	// took, nor revive a subscription that ended.
 	if stillLinked {
 		q = q.Where("status <> ?", model.StatusRevoked)
+		// A date-only write must not push valid_until out on a licence
+		// that already ended: cancel-at-period-end racing an immediate
+		// cancel would restore access until the period end.
+		if slices.Contains(cols, "valid_until") && !slices.Contains(cols, "status") {
+			q = q.Where("status NOT IN (?, ?, ?)",
+				model.StatusCanceled, model.StatusExpired, model.StatusRevoked)
+		}
 		switch lic.Status {
 		case model.StatusActive, model.StatusTrialing, model.StatusPastDue:
 			q = q.Where("NOT (status = ? AND COALESCE(suspended_by, ?) <> ?)",
 				model.StatusSuspended, model.SuspendedByAdmin, model.SuspendedByStripe)
+			// Nor an operator's suspension that non-payment then ended:
+			// canceled, the suspension still on record.
+			q = q.Where("NOT (status = ? AND COALESCE(suspended_by, '') = ?)",
+				model.StatusCanceled, model.SuspendedByAdmin)
 			// Stripe never brings a canceled subscription back, so only a
 			// current read saying it is live (a canceled licence that was
 			// "unpaid", now paid) may revive one — an event payload is
@@ -876,24 +1265,50 @@ func updateLicenseAndSubscriptionIn(ctx context.Context, tx bun.Tx, lic *model.L
 			if asOf == nil {
 				q = q.Where("status <> ?", model.StatusCanceled)
 			}
+			// Still unpaid is no reason to bring back a licence that
+			// expired for want of payment (past due first, as the sweep
+			// leaves it): only payment does. One that expired at the end
+			// of its grace may still go into dunning.
+			if lic.Status == model.StatusPastDue {
+				q = q.Where("NOT (status = ? AND past_due_at IS NOT NULL)", model.StatusExpired)
+			}
 		case model.StatusSuspended:
-			// A pause must not replace a suspension already in place: it
-			// would turn an operator's into one a resume lifts.
-			q = q.Where("status <> ?", model.StatusSuspended)
+			// A pause must not replace an operator's suspension: it would
+			// turn it into one a resume lifts. Nor does it reach a licence
+			// whose subscription ended. A pause Stripe already made is
+			// written again: it changes nothing, but records this read, so
+			// an older one (a resume read before the pause) is refused.
+			q = q.Where("status <> ?", model.StatusCanceled).
+				Where("NOT (status = ? AND COALESCE(suspended_by, ?) <> ?)",
+					model.StatusSuspended, model.SuspendedByAdmin, model.SuspendedByStripe)
 		}
 	}
 	res, err := q.Exec(ctx)
 	if err != nil {
 		return err
 	}
+	// Paused, expired or revoked by Stripe: its floating sessions end as
+	// an operator's suspension ends them, so a resume brings back the
+	// licence and not the leases it held.
+	if n, err := res.RowsAffected(); err == nil && n > 0 && slices.Contains(cols, "status") {
+		if err := endFloatingSessionsIfStoppedIn(ctx, tx, lic.ID, lic.Status); err != nil {
+			return err
+		}
+	}
 	if n, err := res.RowsAffected(); err == nil && n == 0 && (guarded || asOf != nil || stillLinked) {
 		var now struct {
 			Linked bool       `bun:"linked"`
 			Synced *time.Time `bun:"synced"`
 		}
-		if err := tx.NewRaw("SELECT COALESCE(stripe_subscription_id, '') = ? AS linked, stripe_synced_at AS synced FROM licenses WHERE id = ?",
-			lic.StripeSubscriptionID, lic.ID).Scan(ctx, &now); err != nil || !now.Linked {
+		// A licence that is gone is unlinked too; a read that failed is
+		// a failure, which the caller retries rather than ignores.
+		err := tx.NewRaw("SELECT COALESCE(stripe_subscription_id, '') = ? AS linked, stripe_synced_at AS synced FROM licenses WHERE id = ?",
+			lic.StripeSubscriptionID, lic.ID).Scan(ctx, &now)
+		if errors.Is(err, sql.ErrNoRows) || (err == nil && !now.Linked) {
 			return ErrSubscriptionUnlinked
+		}
+		if err != nil {
+			return err
 		}
 		if asOf != nil && now.Synced != nil && now.Synced.After(*asOf) {
 			return ErrStaleSubscriptionRead
@@ -901,20 +1316,29 @@ func updateLicenseAndSubscriptionIn(ctx context.Context, tx bun.Tx, lic *model.L
 		return ErrLicenseRestricted
 	}
 
-	// Sync subscription status if one exists
-	if _, err := tx.NewRaw(`
-		UPDATE subscriptions SET status = ?, updated_at = now()
-		WHERE license_id = ? AND status != ?
-	`, lic.Status, lic.ID, lic.Status).Exec(ctx); err != nil {
-		// Non-fatal: subscription may not exist
-		slog.Warn("sync subscription status failed", "license_id", lic.ID, "error", err)
+	// The subscription row follows the status this write set. A write
+	// that left the status alone (an invoice moving only the date) syncs
+	// nothing: its copy may predate a status written since.
+	if slices.Contains(cols, "status") {
+		if err := syncSubscriptionStatus(ctx, tx, lic.ID, lic.Status); err != nil {
+			return err
+		}
+	}
+	// The subscription row names the plan too; a plan the licence moved
+	// to in Stripe moves it with the licence, or the two disagree.
+	if slices.Contains(cols, "plan_id") {
+		if _, err := tx.NewRaw(`UPDATE subscriptions SET plan_id = ?, updated_at = now()
+			WHERE license_id = ? AND plan_id <> ?`, lic.PlanID, lic.ID, lic.PlanID).Exec(ctx); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 func (s *Store) ListLicensesByEmail(ctx context.Context, email string) ([]*model.License, error) {
 	var out []*model.License
-	// Include licenses owned by email OR where user has a seat. Matched
+	// Include licenses owned by email OR where user has a seat they have
+	// accepted: an invite not yet taken up shows nothing. Matched
 	// case-insensitively: a licence keeps the address as it was typed,
 	// and the portal session carries the lower-cased sign-in address.
 	e := normalizeEmail(email)
@@ -927,7 +1351,7 @@ func (s *Store) ListLicensesByEmail(ctx context.Context, email string) ([]*model
 		Where(`license.id IN (
 			SELECT id FROM licenses WHERE lower(email) = ?
 			UNION ALL
-			SELECT license_id FROM seats WHERE lower(email) = ? AND removed_at IS NULL)`, e, e).
+			SELECT license_id FROM seats WHERE lower(email) = ? AND removed_at IS NULL AND accepted_at IS NOT NULL)`, e, e).
 		OrderExpr("license.created_at DESC, license.id DESC").Scan(ctx)
 	if err != nil {
 		return nil, err
@@ -1003,6 +1427,12 @@ type LicenseListFilter struct {
 	Limit int
 }
 
+// escapeLike makes a search term match literally in LIKE / ILIKE ...
+// ESCAPE '\': its %, _ and \ stand for themselves.
+func escapeLike(term string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(term)
+}
+
 func (s *Store) ListLicenses(ctx context.Context, f LicenseListFilter) ([]*model.License, int, error) {
 	sort := f.Sort
 	if sort.Expr == "" {
@@ -1023,9 +1453,17 @@ func (s *Store) ListLicenses(ctx context.Context, f LicenseListFilter) ([]*model
 	if f.ExternalWorkspaceID != "" {
 		q = q.Where("license.external_workspace_id = ?", f.ExternalWorkspaceID)
 	}
-	if f.Search != "" {
-		// Only search by email and key prefix — never expose full key via wildcard search.
-		q = q.Where("(license.email ILIKE ? OR license.license_key LIKE ?)", "%"+f.Search+"%", f.Search+"%")
+	if search := strings.TrimSpace(f.Search); search != "" {
+		// An address matches in part, literally (% and _ are not
+		// wildcards); a key only whole, by its hash, the licence's or a
+		// member's. A match on part of a key would let a search guess
+		// one a character at a time, around the audited reveal.
+		term := "%" + escapeLike(search) + "%"
+		hash := license.HashKey(search)
+		q = q.Where(`(license.email ILIKE ? ESCAPE '\' OR license.key_hash = ?
+			OR EXISTS (SELECT 1 FROM seats s WHERE s.license_id = license.id AND s.removed_at IS NULL
+				AND (s.email ILIKE ? ESCAPE '\' OR s.member_key_hash = ?)))`,
+			term, hash, term, hash)
 	}
 	total, err := q.Count(ctx)
 	if err != nil {
@@ -1175,9 +1613,11 @@ func (s *Store) TouchActivation(ctx context.Context, id string) error {
 	return err
 }
 
+// DeleteActivation removes one activation: sql.ErrNoRows when it is
+// already gone, so of two releasing the same device only one goes on
+// to audit it and fire license.deactivated.
 func (s *Store) DeleteActivation(ctx context.Context, id string) error {
-	_, err := s.DB.NewDelete().Model((*model.Activation)(nil)).Where("id = ?", id).Exec(ctx)
-	return err
+	return deletedOne(s.DB.NewDelete().Model((*model.Activation)(nil)).Where("id = ?", id).Exec(ctx))
 }
 
 func (s *Store) CountActivations(ctx context.Context, licenseID string) (int, error) {
@@ -1206,10 +1646,14 @@ func (s *Store) Audit(ctx context.Context, log *model.AuditLog) {
 	if log.ID == "" {
 		log.ID = newID()
 	}
+	entry := *log
 	go func() {
 		auditCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if _, err := s.DB.NewInsert().Model(log).Exec(auditCtx); err != nil {
+		if entry.ProductID == "" {
+			entry.ProductID = s.ProductOfAudited(auditCtx, entry.Entity, entry.EntityID)
+		}
+		if _, err := s.DB.NewInsert().Model(&entry).Exec(auditCtx); err != nil {
 			slog.Error("audit log write failed", "entity", log.Entity, "entity_id", log.EntityID, "action", log.Action, "error", err)
 		}
 	}()
@@ -1228,13 +1672,26 @@ func (s *Store) FindLicensesForGraceExpiry(ctx context.Context) ([]*model.Licens
 }
 
 // FindExpiredTrials returns trialing licenses that have passed valid_until.
+//
+// A trial a Stripe subscription bills is Stripe's to end: at its end
+// Stripe charges and turns it active, or past due, and says so by
+// webhook, which may come some time after valid_until. Expiring it first
+// would tell a customer who is paying that their trial ended, and clear
+// their devices. It is left to Stripe for the plan's grace days, and only
+// past them, with nothing heard, expired as a trial (webhooks lost for
+// good). At least a day, whatever the grace days: Stripe's charge and
+// webhook take that much. (Whether the key works meanwhile is the grace
+// days' own rule, see assertUsable; with none it stops at valid_until.)
 func (s *Store) FindExpiredTrials(ctx context.Context) ([]*model.License, error) {
 	var out []*model.License
+	now := time.Now()
 	err := s.DB.NewSelect().Model(&out).
 		Relation("Product").Relation("Plan").
 		Where("license.status = 'trialing'").
 		Where("license.valid_until IS NOT NULL").
-		Where("license.valid_until < ?", time.Now()).
+		Where("license.valid_until < ?", now).
+		Where(`(COALESCE(license.stripe_subscription_id, '') = ''
+			OR license.valid_until < ?::timestamptz - make_interval(days => GREATEST(COALESCE("plan"."grace_days", 7), 1)))`, now).
 		Scan(ctx)
 	return out, err
 }
@@ -1246,8 +1703,9 @@ func (s *Store) FindExpiredTrials(ctx context.Context) ([]*model.License, error)
 func (s *Store) FindStalePastDueLicenses(ctx context.Context, before time.Time) ([]*model.License, error) {
 	var out []*model.License
 	err := s.DB.NewSelect().Model(&out).
-		Where("status = 'past_due'").
-		Where("COALESCE(past_due_at, updated_at) < ?", before).
+		Relation("Product").
+		Where("license.status = 'past_due'").
+		Where("COALESCE(license.past_due_at, license.updated_at) < ?", before).
 		Scan(ctx)
 	return out, err
 }
@@ -1346,6 +1804,30 @@ func (s *Store) StripeReadStamp(ctx context.Context) (time.Time, error) {
 // the final state.
 func (s *Store) SetSubscriptionCancelScheduled(ctx context.Context, licenseID string, scheduled bool, asOf time.Time) error {
 	return s.setCancelState(ctx, licenseID, scheduled, asOf, false)
+}
+
+// CancelScheduledLicenses reports which of the licences have a
+// subscription set to end at its period end rather than renew, as last
+// recorded from Stripe (SetSubscriptionCancelScheduled).
+func (s *Store) CancelScheduledLicenses(ctx context.Context, licenseIDs []string) (map[string]bool, error) {
+	out := make(map[string]bool, len(licenseIDs))
+	if len(licenseIDs) == 0 {
+		return out, nil
+	}
+	// As the reminders read it (cancelStateSQL): the newest recorded
+	// state, for a licence a Stripe subscription still bills and that
+	// is still running. One unlinked or ended has nothing left to end.
+	var ids []string
+	if err := s.DB.NewRaw(`SELECT license.id FROM licenses license
+		WHERE license.id IN (?) AND COALESCE(license.stripe_subscription_id, '') <> ''
+			AND license.status IN (?) AND `+cancelStateSQL+` IS TRUE`,
+		bun.In(licenseIDs), bun.In([]string{model.StatusActive, model.StatusTrialing, model.StatusPastDue})).Scan(ctx, &ids); err != nil {
+		return nil, err
+	}
+	for _, id := range ids {
+		out[id] = true
+	}
+	return out, nil
 }
 
 // RecordSubscriptionCancelStateIfUnknown records the state only while
@@ -1491,12 +1973,19 @@ func (s *Store) HasNotification(ctx context.Context, licenseID, tag string) bool
 	return exists
 }
 
-// RecordNotification records that a notification was sent for a license.
-func (s *Store) RecordNotification(ctx context.Context, licenseID, tag string) {
-	_, _ = s.DB.NewRaw(
+// TryRecordNotification records tag for a licence and reports whether
+// this call recorded it: of several concurrent callers exactly one goes
+// on to send.
+func (s *Store) TryRecordNotification(ctx context.Context, licenseID, tag string) (bool, error) {
+	res, err := s.DB.NewRaw(
 		"INSERT INTO notifications (id, license_id, tag) VALUES (?, ?, ?) ON CONFLICT (license_id, tag) DO NOTHING",
 		newID(), licenseID, tag,
 	).Exec(ctx)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 // TryRecordPastDueNotification records tag for a licence only while it
@@ -1504,9 +1993,9 @@ func (s *Store) RecordNotification(ctx context.Context, licenseID, tag string) {
 // pastDueAt (to the second), and reports whether this call recorded it:
 // of several concurrent callers exactly one goes on to send, and none
 // does once the licence has recovered, been unlinked or begun another
-// episode. A database error reports false — better a missed notice
-// than a duplicate or a stale one.
-func (s *Store) TryRecordPastDueNotification(ctx context.Context, licenseID, subscriptionID string, pastDueAt time.Time, tag string) bool {
+// episode. A database error is returned, for the caller to retry: a
+// guess either way would send a duplicate or miss the notice.
+func (s *Store) TryRecordPastDueNotification(ctx context.Context, licenseID, subscriptionID string, pastDueAt time.Time, tag string) (bool, error) {
 	res, err := s.DB.NewRaw(`INSERT INTO notifications (id, license_id, tag)
 		SELECT ?, l.id, ? FROM licenses l
 		WHERE l.id = ? AND l.stripe_subscription_id = ? AND l.status = 'past_due'
@@ -1514,10 +2003,10 @@ func (s *Store) TryRecordPastDueNotification(ctx context.Context, licenseID, sub
 		ON CONFLICT (license_id, tag) DO NOTHING`,
 		newID(), tag, licenseID, subscriptionID, pastDueAt.Unix()).Exec(ctx)
 	if err != nil {
-		return false
+		return false, err
 	}
-	n, _ := res.RowsAffected()
-	return n == 1
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 // notificationLease is how long a reminder claim may stay unsent
@@ -1525,6 +2014,44 @@ func (s *Store) TryRecordPastDueNotification(ctx context.Context, licenseID, sub
 // restarted between claiming and sending. SMTP sessions are bounded
 // well inside it (service.smtpSessionTimeout).
 const notificationLease = 10 * time.Minute
+
+// dunningRetryHold is how long a dunning notice waits after the queue
+// gave up on its mail. The license can stay past due for weeks with the
+// mailbox full, and the sweep runs hourly, so without it each sweep would
+// start another round of delivery attempts to the same address. Only
+// dunning is held: other reminders can have a deadline, and one held past
+// it would never be sent.
+const dunningRetryHold = 6 * time.Hour
+
+// IsOutdatedDunningEmail reports whether a queued mail is a dunning notice
+// that no longer applies: the license has left that past-due episode, or
+// the ladder has moved on to a higher step of it. A notice can sit in the
+// queue for days while the mail server is down or its credentials are
+// wrong. A customer who has paid in the meantime must not be told their
+// access is ending, and one still past due should get the notice they are
+// on now, not every notice they missed.
+func (s *Store) IsOutdatedDunningEmail(ctx context.Context, emailID string) (bool, error) {
+	var outdated bool
+	err := s.DB.NewRaw(`
+		SELECT EXISTS (
+			SELECT 1 FROM email_queue q
+			  JOIN notifications n ON n.id = q.notification_id
+			  JOIN licenses l ON l.id = n.license_id
+			 WHERE q.id = ?
+			   AND n.tag LIKE 'dunning\_%'
+			   AND (l.status <> 'past_due' OR l.past_due_at IS NULL
+			        OR floor(extract(epoch FROM l.past_due_at))::bigint::text <> split_part(n.tag, ':', 2)
+			        OR EXISTS (
+			            SELECT 1 FROM notifications h
+			             WHERE h.license_id = n.license_id
+			               AND h.sent_at IS NOT NULL -- set in the transaction that queues it; a bare claim may still fail
+			               AND split_part(h.tag, ':', 2) = split_part(n.tag, ':', 2)
+			               AND array_position(ARRAY['dunning_first', 'dunning_second', 'dunning_final'], split_part(h.tag, ':', 1))
+			                 > array_position(ARRAY['dunning_first', 'dunning_second', 'dunning_final'], split_part(n.tag, ':', 1))
+			        ))
+		)`, emailID).Scan(ctx, &outdated)
+	return outdated, err
+}
 
 // ClaimNotification takes the lease on the (license, tag) pair before
 // anything is sent. It returns a token identifying this claim; empty
@@ -1789,27 +2316,53 @@ func (s *Store) FindLatestValidOTPCode(ctx context.Context, email string) (*mode
 		Where("email = ?", email).
 		Where("used = false").
 		Where("expires_at > now()").
-		Where("attempts < 5").
+		Where("attempts < ?", MaxOTPAttempts).
 		OrderExpr("created_at DESC").
 		Limit(1).
 		Scan(ctx)
 	return otp, err
 }
 
-func (s *Store) IncrementOTPAttempts(ctx context.Context, id string) error {
-	_, err := s.DB.NewUpdate().Model((*model.OTPCode)(nil)).
-		Set("attempts = attempts + 1").
-		Where("id = ?", id).
-		Exec(ctx)
-	return err
+// MaxOTPAttempts is how many guesses one login code allows.
+const MaxOTPAttempts = 5
+
+// ClaimOTPAttempt takes one of the code's attempts and returns how many
+// it has used now. ok is false when none was left, or the code was used
+// or expired meanwhile: the guess must then not be compared at all.
+//
+// The attempt is taken before the compare, in one statement. Read
+// first and counted after, a burst of parallel guesses all saw a count
+// under the limit and were all compared.
+func (s *Store) ClaimOTPAttempt(ctx context.Context, id string) (attempts int, ok bool, err error) {
+	err = s.DB.NewRaw(`UPDATE otp_codes SET attempts = attempts + 1
+		WHERE id = ? AND attempts < ? AND used = false AND expires_at > now()
+		RETURNING attempts`, id, MaxOTPAttempts).Scan(ctx, &attempts)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return attempts, true, nil
 }
 
-func (s *Store) MarkOTPUsed(ctx context.Context, id string) error {
-	_, err := s.DB.NewUpdate().Model((*model.OTPCode)(nil)).
+// ConsumeOTPCode marks an unused code used and reports whether this
+// call was the one that did it. Two requests presenting the same code
+// at once both pass the hash check; only one of them gets true here.
+func (s *Store) ConsumeOTPCode(ctx context.Context, id string) (bool, error) {
+	res, err := s.DB.NewUpdate().Model((*model.OTPCode)(nil)).
 		Set("used = true").
 		Where("id = ?", id).
+		Where("used = false").
 		Exec(ctx)
-	return err
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
 }
 
 func (s *Store) CleanExpiredOTPs(ctx context.Context) {
@@ -1883,7 +2436,7 @@ func (s *Store) WithXactLock(ctx context.Context, key int64, fn func(ctx context
 	if err := fn(ctx, tx); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return commitTx(ctx, tx)
 }
 
 // DeleteProcessedEvent forgets a recorded event.
@@ -2002,11 +2555,246 @@ func (s *Store) ClaimProcessedEvent(ctx context.Context, provider, eventID strin
 
 // ─── Transactional Activation ───
 
+// lockLicenseLimitsIn takes the licence row lock every "count, then take
+// a slot" check serialises on, and reads the limits the licence holds
+// under it (see model.Plan.Limits). The caller's limit came from a read
+// made before the lock, and a subscription read can lower the licence's
+// seats in between; checking against the stricter of the two keeps a
+// slot from being taken on a limit that is already gone. known is false
+// when the licence or its plan is not there to read, and the caller's
+// limit stands alone.
+func lockLicenseLimitsIn(ctx context.Context, tx bun.Tx, licenseID string) (seats, activations int, known bool, err error) {
+	if err := lockLicenseRowIn(ctx, tx, licenseID); err != nil {
+		return 0, 0, false, err
+	}
+	var rows []struct {
+		Quantity       int   `bun:"quantity"`
+		PerSeat        *bool `bun:"per_seat"`
+		MaxSeats       *int  `bun:"max_seats"`
+		MaxActivations *int  `bun:"max_activations"`
+	}
+	if err := tx.NewRaw(`SELECT l.quantity, p.per_seat, p.max_seats, p.max_activations
+		FROM licenses l LEFT JOIN plans p ON p.id = l.plan_id
+		WHERE l.id = ? FOR UPDATE OF l`, licenseID).Scan(ctx, &rows); err != nil {
+		return 0, 0, false, err
+	}
+	if len(rows) == 0 || rows[0].PerSeat == nil || rows[0].MaxSeats == nil || rows[0].MaxActivations == nil {
+		return 0, 0, false, nil
+	}
+	r := rows[0]
+	plan := model.Plan{PerSeat: *r.PerSeat, MaxSeats: *r.MaxSeats, MaxActivations: *r.MaxActivations}
+	seats, activations = plan.Limits(r.Quantity)
+	return seats, activations, true, nil
+}
+
+// lockLicenseRowIn takes the licence row lock in a statement of its own,
+// for a caller that then reads the licence with its plan. A statement
+// that locks the licence while joining its plan reads the plan as it was
+// before the lock was waited for: when a plan change commits meanwhile,
+// Postgres checks only the locked row again, the old plan no longer joins
+// it, and the plan reads as missing. Read in a later statement, under the
+// lock, the plan is the one the licence has now.
+func lockLicenseRowIn(ctx context.Context, tx bun.Tx, licenseID string) error {
+	_, err := tx.NewRaw("SELECT 1 FROM licenses WHERE id = ? FOR UPDATE", licenseID).Exec(ctx)
+	return err
+}
+
+// licenseChangeLock is the advisory lock class a change to a licence's
+// subscription takes, keyed by the licence (see LockLicenseChange).
+const licenseChangeLock = 41041
+
+// ErrChangeInProgress: another change to the licence's subscription is
+// with Stripe right now.
+var ErrChangeInProgress = errors.New("a change to this license is being made")
+
+// LockLicenseChange takes the licence's change lock: one change to its
+// subscription at a time. It waits up to wait for a change already under
+// way, then gives up with ErrChangeInProgress; nothing else waits for it.
+// Unlock gives it back; should the process stop first, the database
+// gives it back with the connection.
+func (s *Store) LockLicenseChange(ctx context.Context, licenseID string, wait time.Duration) (*ChangeLock, error) {
+	conn, err := s.DB.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		var got bool
+		if err := conn.QueryRowContext(ctx, "SELECT pg_try_advisory_lock(?, hashtext(?))", licenseChangeLock, licenseID).Scan(&got); err != nil {
+			// The lock may have been taken all the same: the connection
+			// is dropped rather than handed back holding it.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+			_ = conn.Close()
+			return nil, err
+		}
+		if got {
+			return &ChangeLock{conn: conn, licenseID: licenseID}, nil
+		}
+		if time.Now().After(deadline) {
+			_ = conn.Close()
+			return nil, ErrChangeInProgress
+		}
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// ChangeLock is a licence's change lock, on a connection of its own.
+type ChangeLock struct {
+	conn      bun.Conn
+	licenseID string
+}
+
+// Unlock gives the change lock back.
+func (l *ChangeLock) Unlock() {
+	l.exec("SELECT pg_advisory_unlock_all()")
+	_ = l.conn.Close()
+}
+
+// exec runs an unlock with a context of its own: the request's may be
+// over, and no lock may outlive it on a pooled connection.
+func (l *ChangeLock) exec(query string, args ...any) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := l.conn.ExecContext(ctx, query, args...); err != nil {
+		// Handed back to the pool, a connection whose unlock failed would
+		// still hold the lock: it is dropped instead.
+		_ = l.conn.Raw(func(any) error { return driver.ErrBadConn })
+	}
+}
+
+// InUse is what a licence uses of its limits: its people (the owner
+// included), activations, and floating sessions running now.
+type InUse struct {
+	People, Activations, Sessions int
+}
+
+// CountInUse counts what a licence uses of its limits.
+func (s *Store) CountInUse(ctx context.Context, licenseID string) (InUse, error) {
+	return countInUse(ctx, s.DB, licenseID)
+}
+
+// CountInUseIn is CountInUse on a caller's transaction.
+func CountInUseIn(ctx context.Context, db bun.IDB, licenseID string) (InUse, error) {
+	return countInUse(ctx, db, licenseID)
+}
+
+func countInUse(ctx context.Context, db bun.IDB, licenseID string) (InUse, error) {
+	var u InUse
+	if err := db.NewRaw(memberSeatsSQL, licenseID).Scan(ctx, &u.People); err != nil {
+		return u, err
+	}
+	u.People++
+	if err := db.NewRaw("SELECT COUNT(*) FROM activations WHERE license_id = ?", licenseID).Scan(ctx, &u.Activations); err != nil {
+		return u, err
+	}
+	if err := db.NewRaw("SELECT COUNT(*) FROM floating_sessions WHERE license_id = ? AND expires_at > now()", licenseID).Scan(ctx, &u.Sessions); err != nil {
+		return u, err
+	}
+	return u, nil
+}
+
+// LowerLicenseTerms moves a licence to lower terms ahead of the change
+// to its subscription that makes them, so nothing is taken meanwhile on
+// limits about to go: under the licence row lock (the one every slot is
+// taken under), what is in use is counted, check may refuse (its error
+// is returned as is, and nothing changes), and the terms are written.
+// The read stamp moves to now, so a read of the subscription from before
+// cannot put the old terms back; and the terms are held for hold, so no
+// read until then that still shows the old ones can either, whatever
+// becomes of the request that lowered them (a lost answer, a restart).
+// A read that shows the new terms ends the hold, as do
+// ReleaseLicenseTerms and RestoreLicenseTerms. It returns the terms
+// the licence had, for RestoreLicenseTerms should Stripe not make the
+// change.
+func (s *Store) LowerLicenseTerms(ctx context.Context, licenseID string, to LicenseTerms, hold time.Duration, check func(InUse) error) (prev LicenseTerms, err error) {
+	err = RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		if err := tx.NewRaw("SELECT plan_id, quantity FROM licenses WHERE id = ? FOR UPDATE", licenseID).Scan(ctx, &prev); err != nil {
+			return err
+		}
+		u, err := countInUse(ctx, tx, licenseID)
+		if err != nil {
+			return err
+		}
+		if err := check(u); err != nil {
+			return err
+		}
+		if _, err := tx.NewRaw(`UPDATE licenses SET plan_id = ?, quantity = ?, stripe_synced_at = clock_timestamp(),
+			terms_held_until = clock_timestamp() + make_interval(secs => ?), terms_check_after = NULL, updated_at = now()
+			WHERE id = ?`, to.PlanID, to.Quantity, hold.Seconds(), licenseID).Exec(ctx); err != nil {
+			return err
+		}
+		return syncSubscriptionPlanIn(ctx, tx, licenseID, to.PlanID)
+	})
+	return prev, err
+}
+
+// syncSubscriptionPlanIn moves the licence's subscription row to the plan
+// the licence is now on. The row names the plan by a foreign key: one
+// left on a plan the licence has left keeps that plan from being
+// deleted, with nothing on it the admin could see or move.
+func syncSubscriptionPlanIn(ctx context.Context, db bun.IDB, licenseID, planID string) error {
+	_, err := db.NewRaw(`UPDATE subscriptions SET plan_id = ?, updated_at = now()
+		WHERE license_id = ? AND plan_id <> ?`, planID, licenseID, planID).Exec(ctx)
+	return err
+}
+
+// MarkLicenseRead moves the licence's read stamp to now: every read of
+// its subscription that began before is out of date. A downgrade Stripe
+// may have made marks it so before its hold can end, so that no read
+// from before the change can put the old terms back.
+func (s *Store) MarkLicenseRead(ctx context.Context, licenseID string) error {
+	_, err := s.DB.NewRaw(`UPDATE licenses SET stripe_synced_at = GREATEST(stripe_synced_at, clock_timestamp()) WHERE id = ?`, licenseID).Exec(ctx)
+	return err
+}
+
+// RestoreLicenseTerms puts back the terms LowerLicenseTerms replaced,
+// for a change Stripe did not make, unless something has moved them
+// since.
+func (s *Store) RestoreLicenseTerms(ctx context.Context, licenseID string, lowered, prev LicenseTerms) error {
+	return RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		res, err := tx.NewRaw(`UPDATE licenses SET plan_id = ?, quantity = ?, stripe_synced_at = clock_timestamp(),
+			terms_held_until = NULL, terms_check_after = NULL, updated_at = now()
+			WHERE id = ? AND plan_id = ? AND quantity = ?`, prev.PlanID, prev.Quantity, licenseID, lowered.PlanID, lowered.Quantity).Exec(ctx)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return nil // moved since; its subscription row moved with it
+		}
+		return syncSubscriptionPlanIn(ctx, tx, licenseID, prev.PlanID)
+	})
+}
+
+// stricterSeatLimit is the lower of two seat limits, where 0 means no
+// limit at all.
+func stricterSeatLimit(a, b int) int {
+	switch {
+	case a <= 0:
+		return b
+	case b <= 0:
+		return a
+	}
+	return min(a, b)
+}
+
 // ActivateWithinLimit atomically creates an activation only if the limit hasn't been reached.
 // Locks the license row (not activation rows) to serialize concurrent activations.
 // ErrAlreadyActivated reports that this machine already holds an
 // activation on this license, so nothing was taken from the limit.
 var ErrAlreadyActivated = errors.New("identifier is already activated")
+
+// ErrDeviceMoved is ErrAlreadyActivated for a device ActivateForKey has
+// just moved from the licence's key to the member's.
+var ErrDeviceMoved = fmt.Errorf("%w: moved to the member's key", ErrAlreadyActivated)
+
+// ErrDeviceHeld is returned by ActivateForKey when the machine is the
+// device of another key on the licence.
+var ErrDeviceHeld = errors.New("device held by another key on the licence")
 
 // ActivateWithinLimit takes one activation slot for a machine, or says
 // why it could not.
@@ -2022,7 +2810,35 @@ var ErrAlreadyActivated = errors.New("identifier is already activated")
 // insert hit the unique index on (license_id, identifier), which
 // surfaced as a 500. A client retrying a timed-out activation, or an
 // app opened twice, met one or the other.
+//
+// It checks no key. Every path a client reaches goes through
+// ActivateForKey, which re-checks the key it was given under the same
+// lock; this one is for callers that hold none, such as tests.
 func (s *Store) ActivateWithinLimit(ctx context.Context, act *model.Activation, maxActivations int) error {
+	return s.activateWithinLimit(ctx, act, maxActivations, "")
+}
+
+// ActivateForKey is ActivateWithinLimit for a client presenting key, the
+// member's key when act.SeatID is set, else the licence's own (see
+// FindLicenseByKey). A key that stopped opening the licence since it was
+// looked up (its member removed or their accept rolled back, the
+// licence's key changed, the product's seats gone) is refused with
+// ErrKeyRevoked: each of those takes the licence row lock this decides
+// under, or is re-checked under it, so no device is left on a key that
+// no longer works. A machine already
+// activated stays whoever's activated it: another key holder's key is
+// refused with ErrDeviceHeld, as for a floating session, while the
+// licence's own key, which manages every device, finds it activated.
+// The one move is a device activated with the licence's key before
+// members had keys of their own (PredatesMemberKeys), when members
+// used that key: it moves, once, to the member whose key activates it,
+// so a member who used the shared key carries their machine onto their
+// own and a change of the licence's key later leaves it alone.
+func (s *Store) ActivateForKey(ctx context.Context, act *model.Activation, maxActivations int, key string) error {
+	return s.activateWithinLimit(ctx, act, maxActivations, key)
+}
+
+func (s *Store) activateWithinLimit(ctx context.Context, act *model.Activation, maxActivations int, key string) error {
 	if act.ID == "" {
 		act.ID = newID()
 	}
@@ -2033,24 +2849,68 @@ func (s *Store) ActivateWithinLimit(ctx context.Context, act *model.Activation, 
 	}
 	defer tx.Rollback()
 
-	// Lock the license row to serialize concurrent activations
-	_, err = tx.NewRaw("SELECT id FROM licenses WHERE id = ? FOR UPDATE", act.LicenseID).Exec(ctx)
+	// Lock the license row to serialize concurrent activations, and
+	// hold the activation to the limit the licence has now: its seats
+	// may have gone down since the caller read it.
+	_, held, known, err := lockLicenseLimitsIn(ctx, tx, act.LicenseID)
 	if err != nil {
 		return err
+	}
+	if known {
+		maxActivations = min(maxActivations, held)
+	}
+
+	if key != "" {
+		held, err := keyHeldIn(ctx, tx, act.LicenseID, act.SeatID, key)
+		if err != nil {
+			return err
+		}
+		if !held {
+			return ErrKeyRevoked
+		}
 	}
 
 	// This machine may already hold a slot, in which case it is not
 	// competing for one.
-	var existingID string
-	switch err := tx.NewRaw(
-		"SELECT id FROM activations WHERE license_id = ? AND identifier = ?",
+	var existing []struct {
+		ID                 string         `bun:"id"`
+		SeatID             sql.NullString `bun:"seat_id"`
+		PredatesMemberKeys bool           `bun:"predates_member_keys"`
+	}
+	// FOR UPDATE: a release of the device, which takes no licence lock,
+	// waits for this decision rather than slipping in between the read
+	// and a move.
+	if err := tx.NewRaw(
+		"SELECT id, seat_id, predates_member_keys FROM activations WHERE license_id = ? AND identifier = ? FOR UPDATE",
 		act.LicenseID, act.Identifier,
-	).Scan(ctx, &existingID); {
-	case err == nil && existingID != "":
-		act.ID = existingID
-		return ErrAlreadyActivated
-	case err != nil && !errors.Is(err, sql.ErrNoRows):
+	).Scan(ctx, &existing); err != nil {
 		return err
+	}
+	if len(existing) > 0 {
+		act.ID = existing[0].ID
+		holder := existing[0].SeatID
+		switch {
+		case key == "" || act.SeatID == "" || holder.String == act.SeatID:
+			return ErrAlreadyActivated
+		case holder.Valid || !existing[0].PredatesMemberKeys:
+			return ErrDeviceHeld
+		}
+		res, err := tx.NewRaw(`UPDATE activations SET seat_id = ?, predates_member_keys = false
+			WHERE id = ? AND seat_id IS NULL AND predates_member_keys`, act.SeatID, act.ID).Exec(ctx)
+		if err != nil {
+			return err
+		}
+		moved, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		if moved != 1 {
+			return ErrAlreadyActivated
+		}
+		return ErrDeviceMoved
 	}
 
 	// Now safely count existing activations
@@ -2232,10 +3092,15 @@ func (s *Store) MarkEmailFailed(ctx context.Context, id, token, errMsg string) {
 		// The mail is given up on, so the reminder it carried was
 		// never delivered: the claim that was closed when it was
 		// queued is opened again, and a later pass sends it once the
-		// mail server is back. A claim taken over meanwhile has a
-		// different id and is left alone.
-		_, err = tx.NewRaw(
-			"UPDATE notifications SET sent_at = NULL, claimed_at = to_timestamp(0) WHERE id = ?", notificationID,
+		// mail server is back. A dunning notice is dated forward, so its
+		// pass comes after dunningRetryHold rather than at the next
+		// sweep. A claim taken over meanwhile has a different id and is
+		// left alone.
+		_, err = tx.NewRaw(`
+			UPDATE notifications SET sent_at = NULL,
+				claimed_at = CASE WHEN tag LIKE 'dunning\_%' THEN now() + ?::interval ELSE to_timestamp(0) END
+			WHERE id = ?`,
+			dunningRetryHold.String(), notificationID,
 		).Exec(ctx)
 		return err
 	})
@@ -2279,7 +3144,7 @@ func (s *Store) MarkEmailFailedPermanent(ctx context.Context, id, token, errMsg 
 // which is why every licence without a subscription holds NULL.
 func (s *Store) ClearStripeSubscription(ctx context.Context, licenseID, expectedSubID string) (bool, error) {
 	res, err := s.DB.NewRaw(
-		"UPDATE licenses SET stripe_subscription_id = NULL, updated_at = now() WHERE id = ? AND stripe_subscription_id = ?",
+		"UPDATE licenses SET stripe_subscription_id = NULL, stripe_pending_update_expires_at = NULL, terms_held_until = NULL, terms_check_after = NULL, updated_at = now() WHERE id = ? AND stripe_subscription_id = ?",
 		licenseID, expectedSubID,
 	).Exec(ctx)
 	if err != nil {
@@ -2293,12 +3158,13 @@ func (s *Store) ClearStripeSubscription(ctx context.Context, licenseID, expected
 }
 
 // UpdateLicenseEmailByStripeCustomer updates email on all licenses for a Stripe customer.
-func (s *Store) UpdateLicenseEmailByStripeCustomer(ctx context.Context, customerID, email string) {
-	_, _ = s.DB.NewUpdate().Model((*model.License)(nil)).
+func (s *Store) UpdateLicenseEmailByStripeCustomer(ctx context.Context, customerID, email string) error {
+	_, err := s.DB.NewUpdate().Model((*model.License)(nil)).
 		Set("email = ?", email).
 		Set("updated_at = now()").
 		Where("stripe_customer_id = ?", customerID).
 		Exec(ctx)
+	return err
 }
 
 // FindAllLicensesByStripeCustomer returns all licenses for a Stripe customer.
@@ -2422,16 +3288,31 @@ func (s *Store) BackfillLicenseKeyEncrypted(ctx context.Context, logger *slog.Lo
 			break
 		}
 	}
-	return total, nil
+	// Members' keys, made before encryption was turned on.
+	members, memberFailures, err := s.backfillMemberKeysEncrypted(ctx, logger)
+	total += members
+	if members > 0 || memberFailures > 0 {
+		logger.Info("member key backfill", "encrypted", members, "failed", memberFailures)
+	}
+	if remaining, err := s.countLicenseKeysUnencrypted(ctx); err == nil {
+		LicenseKeysUnencrypted.Set(float64(remaining))
+	}
+	return total, err
 }
 
-// countLicenseKeysUnencrypted returns how many rows still need backfill.
-// Used to drive the LicenseKeysUnencrypted gauge — Phase B should not
-// flip the read path until this metric is 0 for sustained time.
+// countLicenseKeysUnencrypted returns how many rows still need backfill,
+// members' keys included. Used to drive the LicenseKeysUnencrypted
+// gauge — Phase B should not flip the read path until this metric is 0
+// for sustained time.
 func (s *Store) countLicenseKeysUnencrypted(ctx context.Context) (int, error) {
-	return s.DB.NewSelect().Model((*model.License)(nil)).
+	licences, err := s.DB.NewSelect().Model((*model.License)(nil)).
 		Where("license_key_encrypted IS NULL AND license_key <> ''").
 		Count(ctx)
+	if err != nil {
+		return 0, err
+	}
+	members, err := s.DB.NewSelect().Model((*model.Seat)(nil)).Where(unencryptedMemberKeys).Count(ctx)
+	return licences + members, err
 }
 
 // ─── License Renewals (maintenance period) ───
@@ -2499,6 +3380,18 @@ func RunInTx(ctx context.Context, db *bun.DB, fn func(ctx context.Context, tx bu
 	defer tx.Rollback()
 	if err := fn(ctx, tx); err != nil {
 		return err
+	}
+	return commitTx(ctx, tx)
+}
+
+// commitTx commits, first making sure the transaction can still commit.
+// pgdriver answers nil to a COMMIT that Postgres turned into a rollback,
+// so a failed statement whose error was dropped would read as a write
+// that landed. Any statement on an aborted transaction fails (25P02);
+// this one costs a round trip and nothing else.
+func commitTx(ctx context.Context, tx bun.Tx) error {
+	if _, err := tx.ExecContext(ctx, "SELECT 1"); err != nil {
+		return fmt.Errorf("transaction cannot commit: %w", err)
 	}
 	return tx.Commit()
 }
@@ -2726,6 +3619,12 @@ func RevertLicenseRenewalIn(ctx context.Context, tx bun.IDB, r *model.LicenseRen
 	if r.RefundedAt != nil {
 		return nil
 	}
+	// On the ledger's clock, as created_at is: the replay compares a
+	// refund with the purchases after it.
+	now, err := ledgerStamp(ctx, tx)
+	if err != nil {
+		return err
+	}
 	// Only the current period's ledger: renewals from before a reset
 	// are recorded as refunded but move nothing.
 	var ledger []*model.LicenseRenewal
@@ -2733,7 +3632,6 @@ func RevertLicenseRenewalIn(ctx context.Context, tx bun.IDB, r *model.LicenseRen
 		OrderExpr("created_at ASC, id ASC").Scan(ctx); err != nil {
 		return err
 	}
-	now := time.Now()
 	if lic.UpdatesUntil != nil && r.UpdatesUntil != nil && r.SupersededAt == nil {
 		predicted := model.ReplayRenewals(ledger)
 		for _, row := range ledger {
